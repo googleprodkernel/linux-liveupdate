@@ -299,6 +299,12 @@ enum rdma_nldev_command {
 
 	RDMA_NLDEV_CMD_STAT_GET_STATUS,
 
+	/* 25 is RDMA_NLDEV_CMD_RES_SRQ_GET_RAW but not supported */
+
+	RDMA_NLDEV_CMD_NEWDEV = 26,
+
+	RDMA_NLDEV_CMD_DELDEV,
+
 	RDMA_NLDEV_NUM_OPS
 };
 
@@ -553,6 +559,12 @@ enum rdma_nldev_attr {
 
 	RDMA_NLDEV_ATTR_STAT_HWCOUNTER_INDEX,	/* u32 */
 	RDMA_NLDEV_ATTR_STAT_HWCOUNTER_DYNAMIC, /* u8 */
+
+	/* 98 is RDMA_NLDEV_SYS_ATTR_PRIVILEGED_QKEY_MODE but not supported */
+	/* 99 is RDMA_NLDEV_ATTR_DRIVER_DETAILS but not supported */
+	/* 100 is RDMA_NLDEV_ATTR_RES_SUBTYPE but not supported */
+
+	RDMA_NLDEV_ATTR_DEV_TYPE = 101,		/* u8 */
 
 	/*
 	 * Always the end
