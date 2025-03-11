@@ -1,0 +1,51 @@
+What:		/sys/kernel/liveupdate/
+Date:		March 2025
+KernelVersion:	6.14.0
+Contact:	pasha.tatashin@soleen.com
+Description:	Interface to control and query live update orchestrator. Live
+		update is a feature that allows to reboot kernel without
+		resetting selected devices. This is needed, for example,  in
+		order to do a quick hypervisor update without terminating
+		virtual machines.
+
+What:		/sys/kernel/liveupdate/state
+Date:		March 2025
+KernelVersion:	6.14.0
+Contact:	pasha.tatashin@soleen.com
+Description:	Read only file that contains the current live update state.
+
+		The state can be one of the following:
+
+		normal: no live update in progress.
+		prepared: live update is prepared for reboot.
+		updated: rebooted to a new kernel, live update can be finished
+		by echoing 1 into finish file.
+
+What:		/sys/kernel/liveupdate/prepare
+Date:		March 2025
+KernelVersion:	6.14.0
+Contact:	pasha.tatashin@soleen.com
+Description:	Is a write-only file that notifies the devices about upcoming
+		live update reboot or cancels it.
+		Writing '1' to this file changes the live update state from
+		"normal" to "prepared".
+		Internally, all drivers that implement liveupdate callback are
+		notified by calling this function with LIVEUPDATE_PREPARE
+		parameter. If any liveupdate() callback fails, the state is not
+		changed, and all already notiified subsystems are notified via
+		liveupdate(LIVEUPDATE_CANCEL) prior to returning to usersapce.
+		Writing '0' to this file change the live update state from
+		"prepared" back to "normal" state by notifying all registered
+		subsystems via liveupdate(LIVEUPDATE_CANCEL) callback..
+
+What:		/sys/kernel/liveupdate/finish
+Date:		March 2025
+KernelVersion:	6.14.0
+Contact:	pasha.tatashin@soleen.com
+Description:	Is a write-only file that notifies the devices that live update
+		has been completed.
+		Writing '1' to this file changes the live update state from
+		"updated" to "normal" state.
+		Internally, all drivers that implement liveupdate callback are
+		notified by calling this function with LIVEUPDATE_FINISH
+		parameter.

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Live update configs
+#
+
+config ARCH_SUPPORTS_LIVEUPDATE
+	bool
+
+config LIVEUPDATE
+	bool "Enable kernel live update"
+	depends on ARCH_SUPPORTS_LIVEUPDATE
+	depends on KEXEC_HANDOVER
+	help
+	  Enables support for Live Update, a feature that allows to
+	  keep devices alive across the transition from the old kernel
+	  to the new kernel. Live Update designed to minimize downtime
+	  during kernel updates
+
+	  If unsure, say N.
