@@ -1683,6 +1683,38 @@ static const struct cpumask *pci_device_irq_get_affinity(struct device *dev,
 	return pci_irq_get_affinity(to_pci_dev(dev), irq_vec);
 }
 
+#ifdef CONFIG_LIVEUPDATE
+static int pci_liveupdate_prepare(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static int pci_liveupdate_reboot(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static void pci_liveupdate_finish(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static void pci_liveupdate_cancel(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static struct dev_liveupdate_cbs liveupdate_cbs = {
+	.prepare = pci_liveupdate_prepare,
+	.reboot = pci_liveupdate_reboot,
+	.finish = pci_liveupdate_finish,
+	.cancel = pci_liveupdate_cancel,
+};
+
+#endif /* CONFIG_LIVEUPDATE */
+
 const struct bus_type pci_bus_type = {
 	.name		= "pci",
 	.match		= pci_bus_match,
@@ -1690,6 +1722,7 @@ const struct bus_type pci_bus_type = {
 	.probe		= pci_device_probe,
 	.remove		= pci_device_remove,
 	.shutdown	= pci_device_shutdown,
+	.liveupdate	= &liveupdate_cbs,
 	.irq_get_affinity = pci_device_irq_get_affinity,
 	.dev_groups	= pci_dev_groups,
 	.bus_groups	= pci_bus_groups,

@@ -7052,6 +7052,39 @@ static __maybe_unused int virtnet_restore(struct virtio_device *vdev)
 	return 0;
 }
 
+#ifdef CONFIG_LIVEUPDATE
+
+static int virtio_net_liveupdate_prepare(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static int virtio_net_liveupdate_reboot(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static void virtio_net_liveupdate_finish(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static void virtio_net_liveupdate_cancel(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static struct dev_liveupdate_cbs liveupdate_cbs = {
+	.prepare = virtio_net_liveupdate_prepare,
+	.reboot = virtio_net_liveupdate_reboot,
+	.finish = virtio_net_liveupdate_finish,
+	.cancel = virtio_net_liveupdate_cancel,
+};
+
+#endif /* CONFIG_LIVEUPDATE */
+
 static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_NET, VIRTIO_DEV_ANY_ID },
 	{ 0 },
@@ -7098,6 +7131,9 @@ static struct virtio_driver virtio_net_driver = {
 #ifdef CONFIG_PM_SLEEP
 	.freeze =	virtnet_freeze,
 	.restore =	virtnet_restore,
+#endif
+#ifdef CONFIG_LIVEUPDATE
+	.driver.liveupdate = &liveupdate_cbs,
 #endif
 };
 

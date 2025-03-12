@@ -786,6 +786,38 @@ static const struct pci_error_handlers pcie_portdrv_err_handler = {
 	.mmio_enabled = pcie_portdrv_mmio_enabled,
 };
 
+#ifdef CONFIG_LIVEUPDATE
+static int pcie_portdrv_liveupdate_prepare(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static int pcie_portdrv_liveupdate_reboot(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static void pcie_portdrv_liveupdate_finish(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+
+static void pcie_portdrv_liveupdate_cancel(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static struct dev_liveupdate_cbs liveupdate_cbs = {
+	.prepare = pcie_portdrv_liveupdate_prepare,
+	.reboot = pcie_portdrv_liveupdate_reboot,
+	.finish = pcie_portdrv_liveupdate_finish,
+	.cancel = pcie_portdrv_liveupdate_cancel,
+};
+#endif /* CONFIG_LIVEUPDATE */
+
 static struct pci_driver pcie_portdriver = {
 	.name		= "pcieport",
 	.id_table	= port_pci_ids,
@@ -799,6 +831,7 @@ static struct pci_driver pcie_portdriver = {
 	.driver_managed_dma = true,
 
 	.driver.pm	= PCIE_PORTDRV_PM_OPS,
+	.driver.liveupdate = &liveupdate_cbs,
 };
 
 static int __init dmi_pcie_pme_disable_msi(const struct dmi_system_id *d)

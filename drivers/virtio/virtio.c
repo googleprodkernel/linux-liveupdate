@@ -395,6 +395,37 @@ static const struct cpumask *virtio_irq_get_affinity(struct device *_d,
 	return dev->config->get_vq_affinity(dev, irq_vec);
 }
 
+#ifdef CONFIG_LIVEUPDATE
+static int virtio_liveupdate_prepare(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static int virtio_liveupdate_reboot(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static void virtio_liveupdate_finish(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static void virtio_liveupdate_cancel(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static struct dev_liveupdate_cbs liveupdate_cbs = {
+	.prepare = virtio_liveupdate_prepare,
+	.reboot = virtio_liveupdate_reboot,
+	.finish = virtio_liveupdate_finish,
+	.cancel = virtio_liveupdate_cancel,
+};
+#endif /* CONFIG_LIVEUPDATE */
+
 static const struct bus_type virtio_bus = {
 	.name  = "virtio",
 	.match = virtio_dev_match,
@@ -402,6 +433,9 @@ static const struct bus_type virtio_bus = {
 	.uevent = virtio_uevent,
 	.probe = virtio_dev_probe,
 	.remove = virtio_dev_remove,
+#ifdef CONFIG_LIVEUPDATE
+	.liveupdate = &liveupdate_cbs,
+#endif
 	.irq_get_affinity = virtio_irq_get_affinity,
 };
 

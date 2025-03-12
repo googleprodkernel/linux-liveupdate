@@ -811,6 +811,37 @@ static void virtio_pci_reset_prepare(struct pci_dev *pci_dev)
 		pci_disable_device(pci_dev);
 }
 
+#ifdef CONFIG_LIVEUPDATE
+static int virtio_pci_liveupdate_prepare(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static int virtio_pci_liveupdate_reboot(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+	return 0;
+}
+
+static void virtio_pci_liveupdate_finish(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static void virtio_pci_liveupdate_cancel(struct device *dev)
+{
+	pr_err("%s\n", __func__);
+}
+
+static struct dev_liveupdate_cbs liveupdate_cbs = {
+	.prepare = virtio_pci_liveupdate_prepare,
+	.reboot = virtio_pci_liveupdate_reboot,
+	.finish = virtio_pci_liveupdate_finish,
+	.cancel = virtio_pci_liveupdate_cancel,
+};
+#endif /* CONFIG_LIVEUPDATE */
+
 static void virtio_pci_reset_done(struct pci_dev *pci_dev)
 {
 	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
@@ -844,6 +875,9 @@ static struct pci_driver virtio_pci_driver = {
 #endif
 	.sriov_configure = virtio_pci_sriov_configure,
 	.err_handler	= &virtio_pci_err_handler,
+#ifdef CONFIG_LIVEUPDATE
+	.driver.liveupdate = &liveupdate_cbs,
+#endif
 };
 
 struct virtio_device *virtio_pci_vf_get_pf_dev(struct pci_dev *pdev)
