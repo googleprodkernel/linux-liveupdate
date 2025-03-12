@@ -25,6 +25,7 @@ of interest to most developers working on device drivers.
    infrastructure
    ioctl
    pm/index
+   liveupdate
 
 Useful support libraries
 ========================

@@ -21,6 +21,7 @@
 #include <linux/lockdep.h>
 #include <linux/compiler.h>
 #include <linux/types.h>
+#include <linux/dev_liveupdate.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/atomic.h>
@@ -663,6 +664,7 @@ struct device_physical_location {
  * @pm_domain:	Provide callbacks that are executed during system suspend,
  * 		hibernation, system resume and during runtime PM transitions
  * 		along with subsystem-level and driver-level callbacks.
+ * @lu:		Live update state.
  * @em_pd:	device's energy model performance domain
  * @pins:	For device pin management.
  *		See Documentation/driver-api/pin-control.rst for details.
@@ -757,6 +759,10 @@ struct device {
 	struct dev_links_info	links;
 	struct dev_pm_info	power;
 	struct dev_pm_domain	*pm_domain;
+
+#ifdef CONFIG_LIVEUPDATE
+	struct dev_liveupdate	lu;
+#endif
 
 #ifdef CONFIG_ENERGY_MODEL
 	struct em_perf_domain	*em_pd;

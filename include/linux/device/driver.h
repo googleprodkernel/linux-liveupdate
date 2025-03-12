@@ -19,6 +19,7 @@
 #include <linux/pm.h>
 #include <linux/device/bus.h>
 #include <linux/module.h>
+#include <linux/dev_liveupdate.h>
 
 /**
  * enum probe_type - device driver probe type to try
@@ -80,6 +81,8 @@ enum probe_type {
  *		it is bound to the driver.
  * @pm:		Power management operations of the device which matched
  *		this driver.
+ * @liveupdate:	Live update callbacks, notify device of the live
+ *		update state, and allow preseve device across reboot.
  * @coredump:	Called when sysfs entry is written to. The device driver
  *		is expected to call the dev_coredump API resulting in a
  *		uevent.
@@ -116,6 +119,7 @@ struct device_driver {
 	const struct attribute_group **dev_groups;
 
 	const struct dev_pm_ops *pm;
+	const struct dev_liveupdate_cbs *liveupdate;
 	void (*coredump) (struct device *dev);
 
 	struct driver_private *p;

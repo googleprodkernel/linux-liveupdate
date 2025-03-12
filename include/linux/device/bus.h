@@ -17,6 +17,7 @@
 #include <linux/kobject.h>
 #include <linux/klist.h>
 #include <linux/pm.h>
+#include <linux/dev_liveupdate.h>
 
 struct device_driver;
 struct fwnode_handle;
@@ -63,6 +64,8 @@ struct fwnode_handle;
  *			this bus.
  * @pm:		Power management operations of this bus, callback the specific
  *		device driver's pm-ops.
+ * @liveupdate:	Live update callbacks, notify bus of the live update state, and
+ *		allow preseve device across reboot.
  * @need_parent_lock:	When probing or removing a device on this bus, the
  *			device core should lock the device's parent.
  *
@@ -103,6 +106,7 @@ struct bus_type {
 	void (*dma_cleanup)(struct device *dev);
 
 	const struct dev_pm_ops *pm;
+	const struct dev_liveupdate_cbs *liveupdate;
 
 	bool need_parent_lock;
 };

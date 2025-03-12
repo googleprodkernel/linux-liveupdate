@@ -13487,6 +13487,9 @@ L:	linux-kernel@vger.kernel.org
 S:	Maintained
 F:	Documentation/ABI/testing/sysfs-kernel-liveupdate
 F:	Documentation/admin-guide/liveupdate.rst
+F:	Documentation/driver-api/liveupdate.rst
+F:	drivers/base/dev_liveupdate.c
+F:	include/linux/dev_liveupdate.h
 F:	include/linux/liveupdate.h
 F:	kernel/Kconfig.liveupdate
 F:	kernel/liveupdate.c

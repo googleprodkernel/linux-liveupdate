@@ -3151,6 +3151,7 @@ void device_initialize(struct device *dev)
 	dev->dma_coherent = dma_default_coherent;
 #endif
 	swiotlb_dev_init(dev);
+	dev_liveupdate_init(dev);
 }
 EXPORT_SYMBOL_GPL(device_initialize);
 
@@ -3627,6 +3628,7 @@ int device_add(struct device *dev)
 	if (error)
 		goto DPMError;
 	device_pm_add(dev);
+	dev_liveupdate_add_device(dev);
 
 	if (MAJOR(dev->devt)) {
 		error = device_create_file(dev, &dev_attr_dev);
@@ -4740,6 +4742,10 @@ int device_change_owner(struct device *dev, kuid_t kuid, kgid_t kgid)
 	if (error)
 		goto out;
 
+	error = dev_liveupdate_sysfs_change_owner(dev, kuid, kgid);
+	if (error)
+		goto out;
+
 	/*
 	 * Change the owner of the symlink located in the class directory of
 	 * the device class associated with @dev which points to the actual
@@ -4810,14 +4816,17 @@ void device_shutdown(void)
 				dev_info(dev, "shutdown_pre\n");
 			dev->class->shutdown_pre(dev);
 		}
-		if (dev->bus && dev->bus->shutdown) {
-			if (initcall_debug)
-				dev_info(dev, "shutdown\n");
-			dev->bus->shutdown(dev);
-		} else if (dev->driver && dev->driver->shutdown) {
-			if (initcall_debug)
-				dev_info(dev, "shutdown\n");
-			dev->driver->shutdown(dev);
+
+		if (!dev_liveupdate_preserved(dev)) {
+			if (dev->bus && dev->bus->shutdown) {
+				if (initcall_debug)
+					dev_info(dev, "shutdown\n");
+				dev->bus->shutdown(dev);
+			} else if (dev->driver && dev->driver->shutdown) {
+				if (initcall_debug)
+					dev_info(dev, "shutdown\n");
+				dev->driver->shutdown(dev);
+			}
 		}
 
 		device_unlock(dev);
