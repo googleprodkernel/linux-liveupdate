@@ -3,9 +3,6 @@
 #define LINUX_KEXEC_HANDOVER_H
 
 #include <linux/types.h>
-#include <linux/hashtable.h>
-#include <linux/notifier.h>
-#include <linux/mm_types.h>
 
 struct kho_scratch {
 	phys_addr_t addr;
@@ -17,6 +14,15 @@ enum kho_event {
 	KEXEC_KHO_FINALIZE = 0,
 	KEXEC_KHO_UNFREEZE = 1,
 };
+
+#ifdef _SETUP
+struct notifier_block;
+struct kho_node;
+struct folio;
+#else
+#include <linux/notifier.h>
+#include <linux/hashtable.h>
+#include <linux/mm_types.h>
 
 #define KHO_HASHTABLE_BITS 3
 #define KHO_NODE_INIT                                        \
@@ -35,6 +41,7 @@ struct kho_node {
 	struct list_head list;
 	bool visited;
 };
+#endif /* _SETUP */
 
 struct kho_in_node {
 	int offset;
