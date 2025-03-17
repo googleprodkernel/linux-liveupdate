@@ -17,6 +17,10 @@
 #include <linux/seq_file.h>
 #include <linux/memblock.h>
 
+#ifdef CONFIG_KEXEC_HANDOVER
+#include <linux/kexec_handover.h>
+#endif /* CONFIG_KEXEC_HANDOVER */
+
 #include <asm/sections.h>
 #include <linux/io.h>
 
@@ -2431,6 +2435,176 @@ int reserve_mem_find_by_name(const char *name, phys_addr_t *start, phys_addr_t *
 }
 EXPORT_SYMBOL_GPL(reserve_mem_find_by_name);
 
+#ifdef CONFIG_KEXEC_HANDOVER
+#define MEMBLOCK_KHO_NODE "memblock"
+#define MEMBLOCK_KHO_NODE_COMPATIBLE "memblock-v1"
+#define RESERVE_MEM_KHO_NODE_COMPATIBLE "reserve-mem-v1"
+
+static struct kho_node memblock_kho_node = KHO_NODE_INIT;
+
+static void reserve_mem_kho_reset(void)
+{
+	int i;
+	struct kho_node *node;
+
+	kho_remove_node(NULL, MEMBLOCK_KHO_NODE);
+	kho_remove_prop(&memblock_kho_node, "compatible", NULL);
+
+	for (i = 0; i < reserved_mem_count; i++) {
+		struct reserve_mem_table *map = &reserved_mem_table[i];
+
+		node = kho_remove_node(&memblock_kho_node, map->name);
+		if (IS_ERR(node))
+			continue;
+
+		kho_unpreserve_phys(map->start, map->size);
+
+		kho_remove_prop(node, "compatible", NULL);
+		kho_remove_prop(node, "start", NULL);
+		kho_remove_prop(node, "size", NULL);
+
+		kfree(node);
+	}
+}
+
+static int reserve_mem_kho_finalize(void)
+{
+	int i, err = 0;
+	struct kho_node *node;
+
+	if (!reserved_mem_count)
+		return NOTIFY_DONE;
+
+	err = kho_add_node(NULL, MEMBLOCK_KHO_NODE, &memblock_kho_node);
+	if (err == 1)
+		return NOTIFY_DONE;
+
+	err |= kho_add_string_prop(&memblock_kho_node, "compatible",
+				   MEMBLOCK_KHO_NODE_COMPATIBLE);
+
+	for (i = 0; i < reserved_mem_count; i++) {
+		struct reserve_mem_table *map = &reserved_mem_table[i];
+
+		node = kmalloc(sizeof(*node), GFP_KERNEL);
+		if (!node) {
+			err = -ENOMEM;
+			break;
+		}
+
+		err |= kho_preserve_phys(map->start, map->size);
+
+		kho_init_node(node);
+		err |= kho_add_string_prop(node, "compatible",
+					   RESERVE_MEM_KHO_NODE_COMPATIBLE);
+		err |= kho_add_prop(node, "start", &map->start,
+				    sizeof(map->start));
+		err |= kho_add_prop(node, "size", &map->size,
+				    sizeof(map->size));
+		err |= kho_add_node(&memblock_kho_node, map->name, node);
+
+		if (err)
+			break;
+	}
+
+	if (err) {
+		pr_err("failed to save reserve_mem to KHO: %d\n", err);
+		reserve_mem_kho_reset();
+		return NOTIFY_STOP;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static int reserve_mem_kho_notifier(struct notifier_block *self,
+				    unsigned long cmd, void *v)
+{
+	switch (cmd) {
+	case KEXEC_KHO_FINALIZE:
+		return reserve_mem_kho_finalize();
+	case KEXEC_KHO_UNFREEZE:
+		return NOTIFY_DONE;
+	default:
+		return NOTIFY_BAD;
+	}
+}
+
+static struct notifier_block reserve_mem_kho_nb = {
+	.notifier_call = reserve_mem_kho_notifier,
+};
+
+static int __init reserve_mem_init(void)
+{
+	if (!kho_is_enabled())
+		return 0;
+
+	return register_kho_notifier(&reserve_mem_kho_nb);
+}
+core_initcall(reserve_mem_init);
+
+static bool __init reserve_mem_kho_revive(const char *name, phys_addr_t size,
+					  phys_addr_t align)
+{
+	int err, len_start, len_size;
+	struct kho_in_node node, child;
+	const phys_addr_t *p_start, *p_size;
+
+	err = kho_get_node(NULL, MEMBLOCK_KHO_NODE, &node);
+	if (err)
+		return false;
+
+	err = kho_node_check_compatible(&node, MEMBLOCK_KHO_NODE_COMPATIBLE);
+	if (err) {
+		pr_warn("Node '%s' is incompatible with %s: %d\n",
+			MEMBLOCK_KHO_NODE, MEMBLOCK_KHO_NODE_COMPATIBLE, err);
+		return false;
+	}
+
+	err = kho_get_node(&node, name, &child);
+	if (err) {
+		pr_warn("Node '%s' has no child '%s': %d\n",
+			MEMBLOCK_KHO_NODE, name, err);
+		return false;
+	}
+	err = kho_node_check_compatible(&child, RESERVE_MEM_KHO_NODE_COMPATIBLE);
+	if (err) {
+		pr_warn("Node '%s/%s' is incompatible with %s: %d\n",
+			MEMBLOCK_KHO_NODE, name,
+			RESERVE_MEM_KHO_NODE_COMPATIBLE, err);
+		return false;
+	}
+
+	p_start = kho_get_prop(&child, "start", &len_start);
+	p_size = kho_get_prop(&child, "size", &len_size);
+	if (!p_start || len_start != sizeof(*p_start) || !p_size ||
+	    len_size != sizeof(*p_size)) {
+		return false;
+	}
+
+	if (*p_start & (align - 1)) {
+		pr_warn("KHO reserve-mem '%s' has wrong alignment (0x%lx, 0x%lx)\n",
+			name, (long)align, (long)*p_start);
+		return false;
+	}
+
+	if (*p_size != size) {
+		pr_warn("KHO reserve-mem '%s' has wrong size (0x%lx != 0x%lx)\n",
+			name, (long)*p_size, (long)size);
+		return false;
+	}
+
+	reserved_mem_add(*p_start, size, name);
+	pr_info("Revived memory reservation '%s' from KHO\n", name);
+
+	return true;
+}
+#else
+static bool __init reserve_mem_kho_revive(const char *name, phys_addr_t size,
+					  phys_addr_t align)
+{
+	return false;
+}
+#endif /* CONFIG_KEXEC_HANDOVER */
+
 /*
  * Parse reserve_mem=nn:align:name
  */
@@ -2486,6 +2660,11 @@ static int __init reserve_mem(char *p)
 	if (reserve_mem_find_by_name(name, &start, &tmp))
 		return -EBUSY;
 
+	/* Pick previous allocations up from KHO if available */
+	if (reserve_mem_kho_revive(name, size, align))
+		return 1;
+
+	/* TODO: Allocation must be outside of scratch region */
 	start = memblock_phys_alloc(size, align);
 	if (!start)
 		return -ENOMEM;
