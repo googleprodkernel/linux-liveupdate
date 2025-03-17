@@ -1053,6 +1053,10 @@ int kernel_kexec(void)
 		goto Unlock;
 	}
 
+	error = kho_copy_fdt(kexec_image);
+	if (error)
+		goto Unlock;
+
 #ifdef CONFIG_KEXEC_JUMP
 	if (kexec_image->preserve_context) {
 		/*

@@ -253,6 +253,11 @@ kimage_file_prepare_segments(struct kimage *image, int kernel_fd, int initrd_fd,
 	/* IMA needs to pass the measurement list to the next kernel. */
 	ima_add_kexec_buffer(image);
 
+	/* If KHO is active, add its images to the list */
+	ret = kho_fill_kimage(image);
+	if (ret)
+		goto out;
+
 	/* Call image load handler */
 	ldata = kexec_image_load_default(image);
 
@@ -636,6 +641,14 @@ int kexec_locate_mem_hole(struct kexec_buf *kbuf)
 	if (kbuf->mem != KEXEC_BUF_MEM_UNKNOWN)
 		return 0;
 
+	/*
+	 * If KHO is active, only use KHO scratch memory. All other memory
+	 * could potentially be handed over.
+	 */
+	ret = kho_locate_mem_hole(kbuf, locate_mem_hole_callback);
+	if (ret <= 0)
+		return ret;
+
 	if (!IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
 		ret = kexec_walk_resources(kbuf, locate_mem_hole_callback);
 	else
@@ -763,6 +776,12 @@ static int kexec_calculate_store_digests(struct kimage *image)
 		 */
 		if (ksegment->kbuf == pi->purgatory_buf)
 			continue;
+
+#ifdef CONFIG_KEXEC_HANDOVER
+		/* Skip KHO FDT as its contects are copied in kernel_kexec(). */
+		if (ksegment == image->kho.fdt)
+			continue;
+#endif
 
 		ret = crypto_shash_update(desc, ksegment->kbuf,
 					  ksegment->bufsz);
