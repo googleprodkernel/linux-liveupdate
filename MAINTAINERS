@@ -12828,7 +12828,7 @@ F:	include/linux/kernfs.h
 KEXEC
 L:	kexec@lists.infradead.org
 W:	http://kernel.org/pub/linux/utils/kernel/kexec/
-F:	include/linux/kexec.h
+F:	include/linux/kexec*.h
 F:	include/uapi/linux/kexec.h
 F:	kernel/kexec*
 
