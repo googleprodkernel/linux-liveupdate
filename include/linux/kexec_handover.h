@@ -5,6 +5,7 @@
 #include <linux/types.h>
 #include <linux/hashtable.h>
 #include <linux/notifier.h>
+#include <linux/mm_types.h>
 
 struct kho_scratch {
 	phys_addr_t addr;
@@ -53,6 +54,13 @@ int kho_add_string_prop(struct kho_node *node, const char *key,
 
 int register_kho_notifier(struct notifier_block *nb);
 int unregister_kho_notifier(struct notifier_block *nb);
+
+int kho_preserve_folio(struct folio *folio);
+int kho_unpreserve_folio(struct folio *folio);
+int kho_preserve_phys(phys_addr_t phys, size_t size);
+int kho_unpreserve_phys(phys_addr_t phys, size_t size);
+struct folio *kho_restore_folio(phys_addr_t phys);
+void *kho_restore_phys(phys_addr_t phys, size_t size);
 
 void kho_memory_init(void);
 
@@ -116,6 +124,36 @@ static inline int register_kho_notifier(struct notifier_block *nb)
 static inline int unregister_kho_notifier(struct notifier_block *nb)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int kho_preserve_folio(struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_unpreserve_folio(struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_preserve_phys(phys_addr_t phys, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_unpreserve_phys(phys_addr_t phys, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline struct folio *kho_restore_folio(phys_addr_t phys)
+{
+	return NULL;
+}
+
+static inline void *kho_restore_phys(phys_addr_t phys, size_t size)
+{
+	return NULL;
 }
 
 static inline void kho_memory_init(void)
