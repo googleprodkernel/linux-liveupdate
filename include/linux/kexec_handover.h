@@ -35,6 +35,10 @@ struct kho_node {
 	bool visited;
 };
 
+struct kho_in_node {
+	int offset;
+};
+
 #ifdef CONFIG_KEXEC_HANDOVER
 bool kho_is_enabled(void);
 void kho_init_node(struct kho_node *node);
@@ -51,6 +55,19 @@ int register_kho_notifier(struct notifier_block *nb);
 int unregister_kho_notifier(struct notifier_block *nb);
 
 void kho_memory_init(void);
+
+void kho_populate(phys_addr_t handover_fdt_phys, phys_addr_t scratch_phys,
+		  u64 scratch_len);
+
+int kho_get_node(const struct kho_in_node *parent, const char *name,
+		 struct kho_in_node *child);
+int kho_get_nodes(const struct kho_in_node *parent,
+		  int (*func)(const char *, const struct kho_in_node *, void *),
+		  void *data);
+const void *kho_get_prop(const struct kho_in_node *node, const char *key,
+			 u32 *size);
+int kho_node_check_compatible(const struct kho_in_node *node,
+			      const char *compatible);
 #else
 static inline bool kho_is_enabled(void)
 {
@@ -103,6 +120,37 @@ static inline int unregister_kho_notifier(struct notifier_block *nb)
 
 static inline void kho_memory_init(void)
 {
+}
+
+static inline void kho_populate(phys_addr_t handover_fdt_phys,
+				phys_addr_t scratch_phys, u64 scratch_len)
+{
+}
+
+static inline int kho_get_node(const struct kho_in_node *parent,
+			       const char *name, struct kho_in_node *child)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_get_nodes(const struct kho_in_node *parent,
+				int (*func)(const char *,
+					    const struct kho_in_node *, void *),
+				void *data)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline const void *kho_get_prop(const struct kho_in_node *node,
+				       const char *key, u32 *size)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline int kho_node_check_compatible(const struct kho_in_node *node,
+					    const char *compatible)
+{
+	return -EOPNOTSUPP;
 }
 #endif /* CONFIG_KEXEC_HANDOVER */
 
