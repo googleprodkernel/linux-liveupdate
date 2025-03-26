@@ -1408,6 +1408,9 @@ static __init int kho_init(void)
 	int err;
 	const void *fdt = kho_get_fdt();
 
+	/* JXXX */
+	printk("JXX %s: kho_enable %d\n", __func__, kho_enable); 
+
 	if (!kho_enable)
 		return 0;
 

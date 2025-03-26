@@ -262,8 +262,14 @@ static ssize_t bind_store(struct device_driver *drv, const char *buf,
 	struct device *dev;
 	int err = -ENODEV;
 
+	/* JXX */
+	printk("%s: buf %s\n", __func__, buf);
+
 	dev = bus_find_device_by_name(bus, NULL, buf);
+	/* JXX */
+	printk("%s: dev ptr after bus_find_device_by_name %p\n", __func__, dev);
 	if (dev && driver_match_device(drv, dev)) {
+		printk("%s: driver matched\n", __func__);
 		err = device_driver_attach(drv, dev);
 		if (!err) {
 			/* success */

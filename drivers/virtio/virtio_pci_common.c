@@ -814,7 +814,16 @@ static void virtio_pci_reset_prepare(struct pci_dev *pci_dev)
 #ifdef CONFIG_LIVEUPDATE
 static int virtio_pci_liveupdate_prepare(struct device *dev)
 {
+	struct pci_dev *pf_pci_dev = NULL;
+
 	pr_err("%s\n", __func__);
+
+	/* Prepare the liveupdate for the assicated PF as well */
+	if (to_pci_dev(dev)->is_virtfn) {
+		pf_pci_dev = to_pci_dev(dev)->physfn;
+		pf_pci_dev->driver->driver.liveupdate->prepare(&pf_pci_dev->dev);
+	}
+
 	return 0;
 }
 

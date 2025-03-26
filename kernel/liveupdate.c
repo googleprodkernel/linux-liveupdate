@@ -519,6 +519,9 @@ static int __init luo_startup(void)
 		      sizeof(struct luo_kho_version_prop), len);
 	}
 
+	pr_info("JXX: LUO from live update, version from KHO: %d.%d\n",
+		p->major, p->minor);
+
 	/*
 	 * Panic if feature is disabled or version mismatch, we do not want
 	 * memory corruptions due to DMA or interrupt tables activity.
@@ -587,11 +590,13 @@ int liveupdate_reboot(void)
 	}
 
 	ret = luo_notify(LIVEUPDATE_REBOOT);
+	printk("JXX %s: luo_notify ret %d\n", __func__, ret);
 	if (ret < 0) {
 		luo_set_state(LIVEUPDATE_STATE_NORMAL);
 	} else {
 		/* Add live update orchestrator node to KHO tree */
 		ret = kho_add_node(NULL, LUO_KHO_NODE_NAME, &luo_node);
+		printk("JXX %s: kho_add_node ret %d\n", __func__, ret);
 		if (!ret) {
 			ret = kho_add_prop(&luo_node, LUO_KHO_VERSION_PROP_NAME,
 					   &luo_version, sizeof(luo_version));

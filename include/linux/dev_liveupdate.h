@@ -74,7 +74,7 @@ void dev_liveupdate_set_requested(struct device *dev, bool val);
 
 #else /* CONFIG_LIVEUPDATE */
 
-static inline void dev_liveupdate_init(struct devie *dev);
+static inline void dev_liveupdate_init(struct device *dev);
 static inline void dev_liveupdate_add_device(struct device *dev) { }
 
 static inline int dev_liveupdate_sysfs_change_owner(struct device *dev,
