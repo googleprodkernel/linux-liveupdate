@@ -86,6 +86,55 @@ enum liveupdate_state  {
 	LIVEUPDATE_STATE_UPDATED = 3,
 };
 
+/* Forward declaration needed if definition isn't included */
+struct file;
+
+/**
+ * struct liveupdate_filesystem - Represents a handler for a live-updatable
+ * filesystem/file type.
+ * @prepare:       Optional. Saves state for a specific file instance (@file,
+ *                 @arg) before update, potentially returning value via @data.
+ *                 Returns 0 on success, negative errno on failure.
+ * @freeze:        Optional. Performs final actions just before kernel
+ *                 transition, potentially reading/updating the handle via
+ *                 @data.
+ *                 Returns 0 on success, negative errno on failure.
+ * @cancel:        Optional. Cleans up state/resources if update is aborted
+ *                 after prepare/freeze succeeded, using the @data handle (by
+ *                 value) from the successful prepare. Returns void.
+ * @finish:        Optional. Performs final cleanup in the new kernel using the
+ *                 preserved @data handle (by value). Returns void.
+ * @retrieve:      Retrieve the preserved file. Must be called before finish.
+ * @can_preserve:  callback to determine if @file with associated context (@arg)
+ *                 can be preserved by this handler.
+ *                 Return bool (true if preservable, false otherwise).
+ * @compatible:    The compatibility string (e.g., "memfd-v1", "vfiofd-v1")
+ *                 that uniquely identifies the filesystem or file type this
+ *                 handler supports. This is matched against the compatible
+ *                 string associated with individual &struct liveupdate_file
+ *                 instances.
+ * @arg:           An opaque pointer to implementation-specific context data
+ *                 associated with this filesystem handler registration.
+ * @list:          used for linking this handler instance into a global list of
+ *                 registered filesystem handlers.
+ *
+ * Modules that want to support live update for specific file types should
+ * register an instance of this structure. LUO uses this registration to
+ * determine if a given file can be preserved and to find the appropriate
+ * operations to manage its state across the update.
+ */
+struct liveupdate_filesystem {
+	int (*prepare)(struct file *file, void *arg, u64 *data);
+	int (*freeze)(struct file *file, void *arg, u64 *data);
+	void (*cancel)(struct file *file, void *arg, u64 data);
+	void (*finish)(struct file *file, void *arg, u64 data, bool reclaimed);
+	int (*retrieve)(void *arg, u64 data, struct file **file);
+	bool (*can_preserve)(struct file *file, void *arg);
+	const char *compatible;
+	void *arg;
+	struct list_head list;
+};
+
 /**
  * struct liveupdate_subsystem - Represents a subsystem participating in LUO
  * @prepare:      Optional. Called during LUO prepare phase. Should perform
@@ -142,6 +191,9 @@ int liveupdate_register_subsystem(struct liveupdate_subsystem *h);
 int liveupdate_unregister_subsystem(struct liveupdate_subsystem *h);
 int liveupdate_get_subsystem_data(struct liveupdate_subsystem *h, u64 *data);
 
+int liveupdate_register_filesystem(struct liveupdate_filesystem *h);
+int liveupdate_unregister_filesystem(struct liveupdate_filesystem *h);
+
 #else /* CONFIG_LIVEUPDATE */
 
 static inline int liveupdate_reboot(void)
@@ -178,6 +230,16 @@ static inline int liveupdate_get_subsystem_data(struct liveupdate_subsystem *h,
 						u64 *data)
 {
 	return -ENODATA;
+}
+
+static inline int liveupdate_register_filesystem(struct liveupdate_filesystem *h)
+{
+	return 0;
+}
+
+static inline int liveupdate_unregister_filesystem(struct liveupdate_filesystem *h)
+{
+	return 0;
 }
 
 #endif /* CONFIG_LIVEUPDATE */

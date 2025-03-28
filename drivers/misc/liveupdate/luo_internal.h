@@ -23,6 +23,17 @@ int luo_do_subsystems_freeze_calls(void);
 void luo_do_subsystems_finish_calls(void);
 void luo_do_subsystems_cancel_calls(void);
 
+void luo_files_startup(void *fdt);
+int luo_files_fdt_setup(void *fdt);
+int luo_do_files_prepare_calls(void);
+int luo_do_files_freeze_calls(void);
+void luo_do_files_finish_calls(void);
+void luo_do_files_cancel_calls(void);
+
+int luo_retrieve_file(u64 token, struct file **file);
+int luo_register_file(u64 *token, struct file *file);
+int luo_unregister_file(u64 token);
+
 extern const char *const luo_state_str[];
 
 /* Get the current state as a string */

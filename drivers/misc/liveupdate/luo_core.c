@@ -110,6 +110,10 @@ static int luo_fdt_setup(struct kho_serialization *ser)
 	if (ret)
 		goto exit_free;
 
+	ret = luo_files_fdt_setup(fdt_out);
+	if (ret)
+		goto exit_free;
+
 	ret = luo_subsystems_fdt_setup(fdt_out);
 	if (ret)
 		goto exit_free;
@@ -145,7 +149,13 @@ static int luo_do_prepare_calls(void)
 {
 	int ret;
 
+	ret = luo_do_files_prepare_calls();
+	if (ret)
+		return ret;
+
 	ret = luo_do_subsystems_prepare_calls();
+	if (ret)
+		luo_do_files_cancel_calls();
 
 	return ret;
 }
@@ -154,18 +164,26 @@ static int luo_do_freeze_calls(void)
 {
 	int ret;
 
+	ret = luo_do_files_freeze_calls();
+	if (ret)
+		return ret;
+
 	ret = luo_do_subsystems_freeze_calls();
+	if (ret)
+		luo_do_files_cancel_calls();
 
 	return ret;
 }
 
 static void luo_do_finish_calls(void)
 {
+	luo_do_files_finish_calls();
 	luo_do_subsystems_finish_calls();
 }
 
 static void luo_do_cancel_calls(void)
 {
+	luo_do_files_cancel_calls();
 	luo_do_subsystems_cancel_calls();
 }
 
@@ -436,6 +454,7 @@ static int __init luo_startup(void)
 	}
 
 	__luo_set_state(LIVEUPDATE_STATE_UPDATED);
+	luo_files_startup(luo_fdt_in);
 	luo_subsystems_startup(luo_fdt_in);
 
 	return 0;
