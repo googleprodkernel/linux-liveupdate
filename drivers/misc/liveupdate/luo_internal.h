@@ -34,6 +34,12 @@ int luo_retrieve_file(u64 token, struct file **file);
 int luo_register_file(u64 *token, struct file *file);
 int luo_unregister_file(u64 token);
 
+#ifdef CONFIG_LIVEUPDATE_SYSFS_API
+void luo_sysfs_notify(void);
+#else
+static inline void luo_sysfs_notify(void) {}
+#endif
+
 extern const char *const luo_state_str[];
 
 /* Get the current state as a string */
