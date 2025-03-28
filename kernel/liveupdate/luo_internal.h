@@ -8,6 +8,8 @@
 #ifndef _LINUX_LUO_INTERNAL_H
 #define _LINUX_LUO_INTERNAL_H
 
+#include <linux/liveupdate.h>
+
 /*
  * Handles a deserialization failure: devices and memory is in unpredictable
  * state.
@@ -92,5 +94,17 @@ int luo_do_subsystems_prepare_calls(void);
 int luo_do_subsystems_freeze_calls(void);
 void luo_do_subsystems_finish_calls(void);
 void luo_do_subsystems_cancel_calls(void);
+
+int luo_retrieve_file(struct luo_session *session, u64 token, struct file **filep);
+int luo_preserve_file(struct luo_session *session, u64 token, int fd);
+int luo_unpreserve_file(struct luo_session *session, u64 token);
+void luo_file_unpreserve_all_files(struct luo_session *session);
+void luo_file_unpreserve_unreclaimed_files(struct luo_session *session);
+
+int luo_file_prepare(struct luo_session *session);
+int luo_file_freeze(struct luo_session *session);
+void luo_file_finish(struct luo_session *session);
+void luo_file_cancel(struct luo_session *session);
+void luo_file_deserialize(struct luo_session *session);
 
 #endif /* _LINUX_LUO_INTERNAL_H */
