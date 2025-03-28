@@ -5,6 +5,7 @@
 
 luo-y :=								\
 		luo_core.o						\
+		luo_files.o						\
 		luo_ioctl.o						\
 		luo_subsystems.o
 

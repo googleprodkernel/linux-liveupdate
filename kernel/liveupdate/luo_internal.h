@@ -34,4 +34,8 @@ int luo_do_subsystems_freeze_calls(void);
 void luo_do_subsystems_finish_calls(void);
 void luo_do_subsystems_cancel_calls(void);
 
+int luo_retrieve_file(u64 token, struct file **filep);
+int luo_register_file(u64 token, int fd);
+int luo_unregister_file(u64 token);
+
 #endif /* _LINUX_LUO_INTERNAL_H */
