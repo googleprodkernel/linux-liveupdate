@@ -47,4 +47,10 @@ int luo_file_freeze(u64 token);
 int luo_file_cancel(u64 token);
 int luo_file_finish(u64 token);
 
+#ifdef CONFIG_LIVEUPDATE_SYSFS_API
+void luo_sysfs_notify(void);
+#else
+static inline void luo_sysfs_notify(void) {}
+#endif
+
 #endif /* _LINUX_LUO_INTERNAL_H */
