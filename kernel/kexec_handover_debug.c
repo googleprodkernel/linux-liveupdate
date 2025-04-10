@@ -55,7 +55,7 @@ int kho_debugfs_fdt_add(struct kho_serialization *ser, const char *name,
 				     fdt);
 }
 
-static int kho_out_update_debugfs_fdt(void)
+int kho_out_update_debugfs_fdt(void)
 {
 	int err = 0;
 	struct fdt_debugfs *ff, *tmp;

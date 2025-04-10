@@ -60,6 +60,7 @@ void kho_in_debugfs_init(const void *fdt);
 int kho_out_debugfs_init(void);
 int kho_debugfs_fdt_add(struct kho_serialization *ser, const char *name,
 			const void *fdt);
+int kho_out_update_debugfs_fdt(void);
 #else
 static inline int kho_debugfs_init(void) { return 0; }
 static inline void kho_in_debugfs_init(const void *fdt) { }
@@ -67,6 +68,7 @@ static inline int kho_out_debugfs_init(void) { return 0; }
 static inline int kho_debugfs_fdt_add(struct kho_serialization *ser,
 				      const char *name,
 				      const void *fdt) { return 0; }
+static inline int kho_out_update_debugfs_fdt(void) { return 0; }
 #endif /* CONFIG_KEXEC_HANDOVER_DEBUG */
 
 #endif /* LINUX_KEXEC_HANDOVER_INTERNAL_H */
