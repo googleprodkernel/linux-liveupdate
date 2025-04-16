@@ -32,4 +32,11 @@ void *luo_contig_alloc_preserve(size_t size);
 void luo_contig_free_unpreserve(void *mem, size_t size);
 void luo_contig_free_restore(void *mem, size_t size);
 
+void luo_subsystems_startup(void *fdt);
+int luo_subsystems_fdt_setup(void *fdt);
+int luo_do_subsystems_prepare_calls(void);
+int luo_do_subsystems_freeze_calls(void);
+void luo_do_subsystems_finish_calls(void);
+void luo_do_subsystems_cancel_calls(void);
+
 #endif /* _LINUX_LUO_INTERNAL_H */
