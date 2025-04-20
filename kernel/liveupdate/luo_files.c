@@ -326,32 +326,190 @@ exit_cleanup:
 	return ret;
 }
 
+static int luo_files_prepare_one(struct luo_file *h)
+{
+	int ret = 0;
+
+	guard(mutex)(&h->mutex);
+	if (h->state == LIVEUPDATE_STATE_NORMAL) {
+		if (h->fh->ops->prepare) {
+			ret = h->fh->ops->prepare(h->fh, h->file,
+						  &h->private_data);
+		}
+		if (!ret)
+			h->state = LIVEUPDATE_STATE_PREPARED;
+	} else {
+		WARN_ON_ONCE(h->state != LIVEUPDATE_STATE_PREPARED &&
+			     h->state != LIVEUPDATE_STATE_FROZEN);
+	}
+
+	return ret;
+}
+
+static int luo_files_freeze_one(struct luo_file *h)
+{
+	int ret = 0;
+
+	guard(mutex)(&h->mutex);
+	if (h->state == LIVEUPDATE_STATE_PREPARED) {
+		if (h->fh->ops->freeze) {
+			ret = h->fh->ops->freeze(h->fh, h->file,
+						 &h->private_data);
+		}
+		if (!ret)
+			h->state = LIVEUPDATE_STATE_FROZEN;
+	} else {
+		WARN_ON_ONCE(h->state != LIVEUPDATE_STATE_FROZEN);
+	}
+
+	return ret;
+}
+
+static void luo_files_finish_one(struct luo_file *h)
+{
+	guard(mutex)(&h->mutex);
+	if (h->state == LIVEUPDATE_STATE_UPDATED) {
+		if (h->fh->ops->finish) {
+			h->fh->ops->finish(h->fh, h->file, h->private_data,
+					   h->reclaimed);
+		}
+		h->state = LIVEUPDATE_STATE_NORMAL;
+	} else {
+		WARN_ON_ONCE(h->state != LIVEUPDATE_STATE_NORMAL);
+	}
+}
+
+static void luo_files_cancel_one(struct luo_file *h)
+{
+	int ret;
+
+	guard(mutex)(&h->mutex);
+	if (h->state == LIVEUPDATE_STATE_NORMAL)
+		return;
+
+	ret = WARN_ON_ONCE(h->state != LIVEUPDATE_STATE_PREPARED &&
+			   h->state != LIVEUPDATE_STATE_FROZEN);
+	if (ret)
+		return;
+
+	if (h->fh->ops->cancel)
+		h->fh->ops->cancel(h->fh, h->file, h->private_data);
+	h->private_data = 0;
+	h->state = LIVEUPDATE_STATE_NORMAL;
+}
+
+static void __luo_files_cancel(struct luo_file *boundary_file)
+{
+	unsigned long token;
+	struct luo_file *h;
+
+	xa_for_each(&luo_files_xa_out, token, h) {
+		if (h == boundary_file)
+			break;
+
+		luo_files_cancel_one(h);
+	}
+	luo_files_fdt_cleanup();
+}
+
+static int luo_files_commit_data_to_fdt(void)
+{
+	int node_offset, ret;
+	unsigned long token;
+	char token_str[19];
+	struct luo_file *h;
+
+	guard(rwsem_read)(&luo_file_fdt_rwsem);
+	xa_for_each(&luo_files_xa_out, token, h) {
+		snprintf(token_str, sizeof(token_str), "%#0llx", (u64)token);
+		node_offset = fdt_subnode_offset(luo_file_fdt_out,
+						 0,
+						 token_str);
+		ret = fdt_setprop(luo_file_fdt_out, node_offset, "data",
+				  &h->private_data, sizeof(h->private_data));
+		if (ret < 0) {
+			pr_err("Failed to set data property for token %s: %s\n",
+			       token_str, fdt_strerror(ret));
+			return -ENOSPC;
+		}
+	}
+
+	return 0;
+}
+
 static int luo_files_prepare(struct liveupdate_subsystem *h, u64 *data)
 {
+	unsigned long token;
+	struct luo_file *luo_file;
 	int ret;
 
 	ret = luo_files_fdt_setup();
 	if (ret)
 		return ret;
 
-	scoped_guard(rwsem_read, &luo_file_fdt_rwsem)
-		*data = __pa(luo_file_fdt_out);
+	xa_for_each(&luo_files_xa_out, token, luo_file) {
+		ret = luo_files_prepare_one(luo_file);
+		if (ret < 0) {
+			pr_err("Prepare failed for file token %#0llx handler '%s' [%d]\n",
+			       (u64)token, luo_file->fh->compatible, ret);
+			__luo_files_cancel(luo_file);
+
+			return ret;
+		}
+	}
+
+	ret = luo_files_commit_data_to_fdt();
+	if (ret) {
+		__luo_files_cancel(NULL);
+	} else {
+		scoped_guard(rwsem_read, &luo_file_fdt_rwsem)
+			*data = __pa(luo_file_fdt_out);
+	}
 
 	return ret;
 }
 
 static int luo_files_freeze(struct liveupdate_subsystem *h, u64 *data)
 {
-	return 0;
+	unsigned long token;
+	struct luo_file *luo_file;
+	int ret;
+
+	xa_for_each(&luo_files_xa_out, token, luo_file) {
+		ret = luo_files_freeze_one(luo_file);
+		if (ret < 0) {
+			pr_err("Freeze callback failed for file token %#0llx handler '%s' [%d]\n",
+			       (u64)token, luo_file->fh->compatible, ret);
+			__luo_files_cancel(luo_file);
+
+			return ret;
+		}
+	}
+
+	ret = luo_files_commit_data_to_fdt();
+	if (ret)
+		__luo_files_cancel(NULL);
+
+	return ret;
 }
 
 static void luo_files_finish(struct liveupdate_subsystem *h, u64 data)
 {
+	unsigned long token;
+	struct luo_file *luo_file;
+
 	luo_files_recreate_luo_files_xa_in();
+	xa_for_each(&luo_files_xa_in, token, luo_file) {
+		luo_files_finish_one(luo_file);
+		mutex_destroy(&luo_file->mutex);
+		kfree(luo_file);
+	}
+	xa_destroy(&luo_files_xa_in);
 }
 
 static void luo_files_cancel(struct liveupdate_subsystem *h, u64 data)
 {
+	__luo_files_cancel(NULL);
 }
 
 static void luo_files_boot(struct liveupdate_subsystem *h, u64 fdt_pa)
@@ -484,6 +642,27 @@ exit_unlock:
 	return ret;
 }
 
+static void luo_files_fdt_remove_node(u64 token)
+{
+	char token_str[19];
+	int offset, ret;
+
+	guard(rwsem_write)(&luo_file_fdt_rwsem);
+	if (!luo_file_fdt_out)
+		return;
+
+	snprintf(token_str, sizeof(token_str), "%#0llx", token);
+	offset = fdt_subnode_offset(luo_file_fdt_out, 0, token_str);
+	if (offset < 0)
+		return;
+
+	ret = fdt_del_node(luo_file_fdt_out, offset);
+	if (ret < 0) {
+		pr_warn("LUO Files: Failed to delete FDT node for token %s: %s\n",
+			token_str, fdt_strerror(ret));
+	}
+}
+
 static int __luo_unregister_file(u64 token)
 {
 	struct luo_file *luo_file;
@@ -491,6 +670,12 @@ static int __luo_unregister_file(u64 token)
 	luo_file = xa_erase(&luo_files_xa_out, token);
 	if (!luo_file)
 		return -ENOENT;
+
+	if (luo_file->state == LIVEUPDATE_STATE_FROZEN ||
+	    luo_file->state == LIVEUPDATE_STATE_PREPARED) {
+		luo_files_cancel_one(luo_file);
+		luo_files_fdt_remove_node(token);
+	}
 
 	fput(luo_file->file);
 	mutex_destroy(&luo_file->mutex);
