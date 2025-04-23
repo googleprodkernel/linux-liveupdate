@@ -152,6 +152,10 @@ static long luo_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 			ret = -EFAULT;
 		break;
 
+	case LIVEUPDATE_IOCTL_SELFTESTS:
+		ret = luo_ioctl_selftests((void __user *)arg);
+		break;
+
 	default:
 		pr_warn("ioctl: unknown command nr: 0x%x\n", _IOC_NR(cmd));
 		ret = -ENOTTY;

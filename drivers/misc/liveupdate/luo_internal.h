@@ -40,6 +40,15 @@ void luo_sysfs_notify(void);
 static inline void luo_sysfs_notify(void) {}
 #endif
 
+#ifdef CONFIG_LIVEUPDATE_SELFTESTS
+int luo_ioctl_selftests(void __user *argp);
+#else
+static inline int luo_ioctl_selftests(void __user *argp)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 extern const char *const luo_state_str[];
 
 /* Get the current state as a string */
