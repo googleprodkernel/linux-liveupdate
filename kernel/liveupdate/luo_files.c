@@ -67,7 +67,6 @@
 #define LUO_FILES_COMPATIBLE	"file-descriptors-v1"
 
 static DEFINE_XARRAY(luo_files_xa_in);
-static DEFINE_XARRAY(luo_files_xa_out);
 static bool luo_files_xa_in_recreated;
 
 /* Registered files. */
@@ -80,6 +79,15 @@ static void *luo_file_fdt_in;
 static size_t luo_file_fdt_out_size;
 
 static atomic64_t luo_files_count;
+
+/* Opened sessions */
+static DECLARE_RWSEM(luo_sessions_list_rwsem);
+static LIST_HEAD(luo_sessions_list);
+
+struct luo_session {
+	struct xarray files_xa_out;
+	struct list_head list;
+};
 
 /**
  * struct luo_file - Represents a file descriptor instance preserved
@@ -262,6 +270,7 @@ static int luo_files_to_fdt(struct xarray *files_xa_out)
 
 static int luo_files_fdt_setup(void)
 {
+	struct luo_session *s;
 	int ret;
 
 	luo_file_fdt_out_size = luo_files_fdt_size();
@@ -300,9 +309,15 @@ static int luo_files_fdt_setup(void)
 	if (ret < 0)
 		goto exit_end_node;
 
-	ret = luo_files_to_fdt(&luo_files_xa_out);
-	if (ret < 0)
-		goto exit_end_node;
+	down_read(&luo_sessions_list_rwsem);
+	list_for_each_entry(s, &luo_sessions_list, list) {
+		ret = luo_files_to_fdt(&s->files_xa_out);
+		if (ret < 0) {
+			up_read(&luo_sessions_list_rwsem);
+			goto exit_end_node;
+		}
+	}
+	up_read(&luo_sessions_list_rwsem);
 
 	ret = fdt_end_node(luo_file_fdt_out);
 	if (ret < 0)
@@ -405,44 +420,59 @@ exit_unlock:
 
 static void __luo_files_cancel(struct luo_file *boundary_file)
 {
+	struct luo_session *s;
 	unsigned long token;
 	struct luo_file *h;
 
-	xa_for_each(&luo_files_xa_out, token, h) {
-		if (h == boundary_file)
-			break;
+	down_read(&luo_sessions_list_rwsem);
+	list_for_each_entry(s, &luo_sessions_list, list) {
+		xa_for_each(&s->files_xa_out, token, h) {
+			if (h == boundary_file)
+				goto exit;
 
-		luo_files_cancel_one(h);
+			luo_files_cancel_one(h);
+		}
 	}
+exit:
+	up_read(&luo_sessions_list_rwsem);
 	luo_files_fdt_cleanup();
 }
 
 static int luo_files_commit_data_to_fdt(void)
 {
+	struct luo_session *s;
 	int node_offset, ret;
 	unsigned long token;
 	char token_str[19];
 	struct luo_file *h;
 
-	xa_for_each(&luo_files_xa_out, token, h) {
-		snprintf(token_str, sizeof(token_str), "%#0llx", (u64)token);
-		node_offset = fdt_subnode_offset(luo_file_fdt_out,
-						 0,
-						 token_str);
-		ret = fdt_setprop(luo_file_fdt_out, node_offset, "data",
-				  &h->private_data, sizeof(h->private_data));
-		if (ret < 0) {
-			pr_err("Failed to set data property for token %s: %s\n",
-			       token_str, fdt_strerror(ret));
-			return -ENOSPC;
+	down_read(&luo_sessions_list_rwsem);
+	list_for_each_entry(s, &luo_sessions_list, list) {
+		xa_for_each(&s->files_xa_out, token, h) {
+			snprintf(token_str, sizeof(token_str), "%#0llx",
+				 (u64)token);
+			node_offset = fdt_subnode_offset(luo_file_fdt_out,
+							 0, token_str);
+			ret = fdt_setprop(luo_file_fdt_out, node_offset, "data",
+					  &h->private_data,
+					  sizeof(h->private_data));
+			if (ret < 0) {
+				up_read(&luo_sessions_list_rwsem);
+				pr_err("Failed to set data property for token %s: %s\n",
+				       token_str, fdt_strerror(ret));
+				up_read(&luo_sessions_list_rwsem);
+				return -ENOSPC;
+			}
 		}
 	}
+	up_read(&luo_sessions_list_rwsem);
 
 	return 0;
 }
 
 static int luo_files_prepare(void *arg, u64 *data)
 {
+	struct luo_session *s;
 	unsigned long token;
 	struct luo_file *h;
 	int ret;
@@ -451,16 +481,21 @@ static int luo_files_prepare(void *arg, u64 *data)
 	if (ret)
 		return ret;
 
-	xa_for_each(&luo_files_xa_out, token, h) {
-		ret = luo_files_prepare_one(h);
-		if (ret < 0) {
-			pr_err("Prepare failed for file token %#0llx handler '%s' [%d]\n",
-			       (u64)token, h->fh->compatible, ret);
-			__luo_files_cancel(h);
+	down_read(&luo_sessions_list_rwsem);
+	list_for_each_entry(s, &luo_sessions_list, list) {
+		xa_for_each(&s->files_xa_out, token, h) {
+			ret = luo_files_prepare_one(h);
+			if (ret < 0) {
+				pr_err("Prepare failed for file token %#0llx handler '%s' [%d]\n",
+				       (u64)token, h->fh->compatible, ret);
+				__luo_files_cancel(h);
+				up_read(&luo_sessions_list_rwsem);
 
-			return ret;
+				return ret;
+			}
 		}
 	}
+	up_read(&luo_sessions_list_rwsem);
 
 	ret = luo_files_commit_data_to_fdt();
 	if (ret)
@@ -473,20 +508,26 @@ static int luo_files_prepare(void *arg, u64 *data)
 
 static int luo_files_freeze(void *arg, u64 *data)
 {
+	struct luo_session *s;
 	unsigned long token;
 	struct luo_file *h;
 	int ret;
 
-	xa_for_each(&luo_files_xa_out, token, h) {
-		ret = luo_files_freeze_one(h);
-		if (ret < 0) {
-			pr_err("Freeze callback failed for file token %#0llx handler '%s' [%d]\n",
-			       (u64)token, h->fh->compatible, ret);
-			__luo_files_cancel(h);
+	down_read(&luo_sessions_list_rwsem);
+	list_for_each_entry(s, &luo_sessions_list, list) {
+		xa_for_each(&s->files_xa_out, token, h) {
+			ret = luo_files_freeze_one(h);
+			if (ret < 0) {
+				pr_err("Freeze callback failed for file token %#0llx handler '%s' [%d]\n",
+				       (u64)token, h->fh->compatible, ret);
+				__luo_files_cancel(h);
+				up_read(&luo_sessions_list_rwsem);
 
-			return ret;
+				return ret;
+			}
 		}
 	}
+	up_read(&luo_sessions_list_rwsem);
 
 	ret = luo_files_commit_data_to_fdt();
 	if (ret)
@@ -561,6 +602,7 @@ late_initcall(luo_files_startup);
 
 /**
  * luo_register_file - Register a file descriptor for live update management.
+ * @s: Session for the file that is being registered
  * @token: Token value for this file descriptor.
  * @fd: file descriptor to be preserved.
  *
@@ -568,10 +610,11 @@ late_initcall(luo_files_startup);
  *
  * Return: 0 on success. Negative errno on failure.
  */
-int luo_register_file(u64 token, int fd)
+int luo_register_file(struct luo_session *s, u64 token, int fd)
 {
 	struct liveupdate_file_handler *fh;
 	struct luo_file *luo_file;
+	struct luo_session *_s;
 	bool found = false;
 	int ret = -ENOENT;
 	struct file *file;
@@ -615,15 +658,20 @@ int luo_register_file(u64 token, int fd)
 	mutex_init(&luo_file->mutex);
 	luo_file->state = LIVEUPDATE_STATE_NORMAL;
 
-	if (xa_load(&luo_files_xa_out, token)) {
-		ret = -EEXIST;
-		pr_warn("Token %llu is already taken\n", token);
-		mutex_destroy(&luo_file->mutex);
-		kfree(luo_file);
-		goto exit_unlock;
+	down_read(&luo_sessions_list_rwsem);
+	list_for_each_entry(_s, &luo_sessions_list, list) {
+		if (xa_load(&_s->files_xa_out, token)) {
+			up_read(&luo_sessions_list_rwsem);
+			ret = -EEXIST;
+			pr_warn("Token %llu is already taken\n", token);
+			mutex_destroy(&luo_file->mutex);
+			kfree(luo_file);
+			goto exit_unlock;
+		}
 	}
+	up_read(&luo_sessions_list_rwsem);
 
-	ret = xa_err(xa_store(&luo_files_xa_out, token, luo_file,
+	ret = xa_err(xa_store(&s->files_xa_out, token, luo_file,
 			      GFP_KERNEL));
 	if (ret < 0) {
 		pr_warn("Failed to store file for token %llu in XArray: %d\n",
@@ -646,6 +694,7 @@ exit_unlock:
 
 /**
  * luo_unregister_file - Unregister a file instance using its token.
+ * @s: Session for the file that is being registered.
  * @token: The unique token of the file instance to unregister.
  *
  * Finds the &struct luo_file associated with the @token in the
@@ -659,7 +708,7 @@ exit_unlock:
  *
  * Return: 0 on success. Negative errno on failure.
  */
-int luo_unregister_file(u64 token)
+int luo_unregister_file(struct luo_session *s, u64 token)
 {
 	struct luo_file *luo_file;
 	int ret = 0;
@@ -671,7 +720,7 @@ int luo_unregister_file(u64 token)
 		return -EBUSY;
 	}
 
-	luo_file = xa_erase(&luo_files_xa_out, token);
+	luo_file = xa_erase(&s->files_xa_out, token);
 	if (luo_file) {
 		fput(luo_file->file);
 		mutex_destroy(&luo_file->mutex);
@@ -737,6 +786,74 @@ int luo_retrieve_file(u64 token, struct file **filep)
 }
 
 /**
+ * luo_create_session - Create and register a new LUO file preservation session.
+ *
+ * This function is called when a userspace process opens the /dev/liveupdate
+ * character device.
+ *
+ * Each session allows a specific open instance of /dev/liveupdate to
+ * independently register file descriptors for preservation. These registrations
+ * are local to the session until LUO's prepare phase aggregates them.
+ * If the /dev/liveupdate file descriptor is closed while LUO is still in
+ * the NORMAL or UPDATES states, all file descriptors registered within that
+ * session will be automatically unregistered by luo_destroy_session().
+ *
+ * Return: Pointer to the newly allocated &struct luo_session on success,
+ *         NULL on memory allocation failure.
+ */
+struct luo_session *luo_create_session(void)
+{
+	struct luo_session *s;
+
+	s = kmalloc(sizeof(struct luo_session), GFP_KERNEL);
+	if (s) {
+		xa_init(&s->files_xa_out);
+		INIT_LIST_HEAD(&s->list);
+
+		down_write(&luo_sessions_list_rwsem);
+		list_add_tail(&s->list, &luo_sessions_list);
+		up_write(&luo_sessions_list_rwsem);
+	}
+
+	return s;
+}
+
+/**
+ * luo_destroy_session - Release a LUO file preservation session.
+ * @s: Pointer to the &struct luo_session to be destroyed, previously obtained
+ *     from luo_create_session().
+ *
+ * This function must be called when a userspace file descriptor for
+ * /dev/liveupdate is being closed (typically from the .release file
+ * operation). It is responsible for cleaning up all resources associated
+ * with the given LUO session @s.
+ */
+void luo_destroy_session(struct luo_session *s)
+{
+	unsigned long token;
+	struct luo_file *h;
+
+	down_write(&luo_sessions_list_rwsem);
+	list_del(&s->list);
+	up_write(&luo_sessions_list_rwsem);
+
+	luo_state_read_enter();
+	if (!liveupdate_state_normal() && !liveupdate_state_updated()) {
+		luo_state_read_exit();
+		goto skip_unregister;
+	}
+
+	xa_for_each(&s->files_xa_out, token, h)
+		luo_unregister_file(s, token);
+
+	luo_state_read_exit();
+
+skip_unregister:
+	xa_destroy(&s->files_xa_out);
+	kfree(s);
+}
+
+/**
  * liveupdate_register_file_handler - Register a file handler with LUO.
  * @fh: Pointer to a caller-allocated &struct liveupdate_file_handler.
  * The caller must initialize this structure, including a unique
@@ -796,6 +913,7 @@ EXPORT_SYMBOL_GPL(liveupdate_register_file_handler);
  */
 int liveupdate_unregister_file_handler(struct liveupdate_file_handler *fh)
 {
+	struct luo_session *s;
 	unsigned long token;
 	struct luo_file *h;
 	int ret = 0;
@@ -807,15 +925,18 @@ int liveupdate_unregister_file_handler(struct liveupdate_file_handler *fh)
 	}
 
 	down_write(&luo_register_file_list_rwsem);
-
-	xa_for_each(&luo_files_xa_out, token, h) {
-		if (h->fh == fh) {
-			up_write(&luo_register_file_list_rwsem);
-			luo_state_read_exit();
-			return -EBUSY;
+	down_read(&luo_sessions_list_rwsem);
+	list_for_each_entry(s, &luo_sessions_list, list) {
+		xa_for_each(&s->files_xa_out, token, h) {
+			if (h->fh == fh) {
+				up_read(&luo_sessions_list_rwsem);
+				up_write(&luo_register_file_list_rwsem);
+				luo_state_read_exit();
+				return -EBUSY;
+			}
 		}
 	}
-
+	up_read(&luo_sessions_list_rwsem);
 	list_del_init(&fh->list);
 	up_write(&luo_register_file_list_rwsem);
 	luo_state_read_exit();
