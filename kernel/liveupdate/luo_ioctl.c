@@ -62,6 +62,17 @@ static int luo_open(struct inode *inodep, struct file *filep)
 	if (filep->f_flags & O_EXCL)
 		return -EINVAL;
 
+	filep->private_data = luo_create_session();
+	if (!filep->private_data)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int luo_release(struct inode *inodep, struct file *filep)
+{
+	luo_destroy_session(filep->private_data);
+
 	return 0;
 }
 
@@ -101,9 +112,11 @@ static long luo_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 			break;
 		}
 
-		ret = luo_register_file(luo_fd.token, luo_fd.fd);
+		ret = luo_register_file(filep->private_data, luo_fd.token,
+					luo_fd.fd);
 		if (!ret && copy_to_user(argp, &luo_fd, sizeof(luo_fd))) {
-			WARN_ON_ONCE(luo_unregister_file(luo_fd.token));
+			WARN_ON_ONCE(luo_unregister_file(filep->private_data,
+							 luo_fd.token));
 			ret = -EFAULT;
 		}
 		break;
@@ -114,7 +127,7 @@ static long luo_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 			break;
 		}
 
-		ret = luo_unregister_file(token);
+		ret = luo_unregister_file(filep->private_data, token);
 		break;
 
 	case LIVEUPDATE_IOCTL_FD_RESTORE:
@@ -140,6 +153,7 @@ static long luo_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 static const struct file_operations fops = {
 	.owner          = THIS_MODULE,
 	.open           = luo_open,
+	.release	= luo_release,
 	.unlocked_ioctl = luo_ioctl,
 };
 

@@ -25,9 +25,14 @@ int luo_do_subsystems_freeze_calls(void);
 void luo_do_subsystems_finish_calls(void);
 void luo_do_subsystems_cancel_calls(void);
 
+struct luo_session;
+
 int luo_retrieve_file(u64 token, struct file **filep);
-int luo_register_file(u64 token, int fd);
-int luo_unregister_file(u64 token);
+int luo_register_file(struct luo_session *s, u64 token, int fd);
+int luo_unregister_file(struct luo_session *s, u64 token);
+
+struct luo_session *luo_create_session(void);
+void luo_destroy_session(struct luo_session *s);
 
 #ifdef CONFIG_LIVEUPDATE_SYSFS_API
 void luo_sysfs_notify(void);
