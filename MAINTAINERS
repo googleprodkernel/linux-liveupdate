@@ -14023,6 +14023,7 @@ F:	include/linux/liveupdate.h
 F:	include/uapi/linux/liveupdate.h
 F:	kernel/liveupdate/
 F:	mm/memfd_luo.c
+F:	tools/lib/luo/
 F:	tools/testing/selftests/liveupdate/
 
 LLC (802.2)
