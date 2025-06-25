@@ -29,9 +29,13 @@ $(SHARED_LIB): $(OBJS)
 cli: $(STATIC_LIB)
 	$(MAKE) -C cli
 
+tests: $(STATIC_LIB)
+	$(MAKE) -C tests
+
 clean:
 	rm -f $(OBJS) $(STATIC_LIB) $(SHARED_LIB)
 	$(MAKE) -C cli clean
+	$(MAKE) -C tests clean
 
 install: all
 	install -d $(DESTDIR)/usr/local/lib
