@@ -13320,6 +13320,7 @@ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/jgg/iommufd.git
 F:	Documentation/userspace-api/iommufd.rst
 F:	drivers/iommu/iommufd/
 F:	include/linux/iommufd.h
+F:	include/linux/kho/abi/iommufd.h
 F:	include/uapi/linux/iommufd.h
 F:	tools/testing/selftests/iommu/
 

@@ -21,6 +21,9 @@ struct iommu_option;
 struct iommufd_device;
 struct dma_buf_attachment;
 struct dma_buf_phys_vec;
+struct iommufd_lu;
+
+extern const struct file_operations iommufd_fops;
 
 struct iommufd_sw_msi_map {
 	struct list_head sw_msi_item;
@@ -57,6 +60,10 @@ struct iommufd_ctx {
 	/* Compatibility with VFIO no iommu */
 	u8 no_iommu_mode;
 	struct iommufd_ioas *vfio_ioas;
+
+#ifdef CONFIG_LIVEUPDATE
+	struct iommufd_lu *lu;
+#endif
 };
 
 /* Entry for iommufd_ctx::mt_mmap */
