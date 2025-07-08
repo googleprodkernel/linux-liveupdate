@@ -18,11 +18,6 @@ MODULE_PARM_DESC(
 	"Allow IOMMUFD to bind to devices even if the platform cannot isolate "
 	"the MSI interrupt window. Enabling this is a security weakness.");
 
-struct iommufd_attach {
-	struct iommufd_hw_pagetable *hwpt;
-	struct xarray device_array;
-};
-
 static void iommufd_group_release(struct kref *kref)
 {
 	struct iommufd_group *igroup =

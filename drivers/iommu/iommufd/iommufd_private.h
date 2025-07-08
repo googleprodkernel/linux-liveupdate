@@ -474,7 +474,10 @@ static inline void iommufd_hw_pagetable_put(struct iommufd_ctx *ictx,
 	refcount_dec(&hwpt->obj.users);
 }
 
-struct iommufd_attach;
+struct iommufd_attach {
+	struct iommufd_hw_pagetable *hwpt;
+	struct xarray device_array;
+};
 
 struct iommufd_group {
 	struct kref ref;
@@ -713,14 +716,38 @@ iommufd_get_vdevice(struct iommufd_ctx *ictx, u32 id)
 }
 
 #ifdef CONFIG_LIVEUPDATE
+struct iommufd_hwpt_lu {
+	/* aligned to long */
+	int iommu_context;
+
+	u32 token;
+	bool reclaimed;
+};
+
+struct iommufd_attach_lu {
+	/* aligned to int */
+	unsigned int hwpt_idx; /* index to iommufd_lu->hwpts[] */
+	ioasid_t pasid;
+	int pci_domain; /* pci_domain_nr(pdev->bus) */
+	u16 dev_id; /* pci_dev_id(dev) */
+};
+
 struct iommufd_lu {
 	/* Only valid in restore, for lifetime purposes */
 	struct folio *folio_lu;
+
+	/* Total number of entries in each section */
+	unsigned int nr_hwpts;
+	unsigned int nr_attaches;
+
+	/* These are not valid between kexec, each boot
+	 * initializes these pointers in init_section_ptrs */
+	struct iommufd_hwpt_lu *hwpts;
+	struct iommufd_attach_lu *attaches;
 };
 
 int iommufd_liveupdate_register_lufs(void);
 int iommufd_liveupdate_unregister_lufs(void);
-
 
 int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd);
 int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd);
