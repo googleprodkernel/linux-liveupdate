@@ -8,8 +8,51 @@
 #include <linux/kexec_handover.h>
 #include <linux/liveupdate.h>
 #include <linux/mm.h>
+#include <linux/pci.h>
 
 #include "iommufd_private.h"
+
+static int iommufd_save_ioas(struct iommufd_ctx *ictx,
+			     struct iommufd_lu *iommufd_lu)
+{
+	struct iommufd_hwpt_paging *hwpt_paging;
+	struct iommufd_ioas *ioas = NULL;
+	struct iommufd_object *obj;
+	unsigned long index;
+	int rc;
+
+	/* Iterate each ioas. */
+	xa_for_each(&ictx->objects, index, obj) {
+		if (obj->type != IOMMUFD_OBJ_IOAS)
+			continue;
+
+		ioas = (struct iommufd_ioas *)obj;
+		mutex_lock(&ioas->mutex);
+
+		/*
+		 * TODO: Iterate over each device of this iommufd and only save
+		 * hwpt/domain if the device is persisted.
+		 */
+		list_for_each_entry(hwpt_paging, &ioas->hwpt_list, hwpt_item) {
+			if (!hwpt_paging->common.domain)
+				continue;
+
+			rc = iommu_domain_preserve(hwpt_paging->common.domain);
+			if (rc)
+				goto err;
+		}
+
+		mutex_unlock(&ioas->mutex);
+		ioas = NULL;
+	}
+
+	return 0;
+
+err:
+	if (ioas)
+		mutex_unlock(&ioas->mutex);
+	return rc;
+}
 
 static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
 				      struct file *file, u64 *data)
@@ -32,6 +75,10 @@ static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
 	}
 
 	iommufd_lu = folio_address(folio_lu);
+
+	rc = iommufd_save_ioas(ictx, iommufd_lu);
+	if (rc)
+		goto err_folio_put;
 
 	rc = kho_preserve_folio(folio_lu);
 	if (rc)
