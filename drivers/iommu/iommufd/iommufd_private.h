@@ -717,17 +717,30 @@ iommufd_get_vdevice(struct iommufd_ctx *ictx, u32 id)
 }
 
 #ifdef CONFIG_LIVEUPDATE
+struct iommufd_hwpt_lu {
+	int iommu_hwpt_token;
+
+	u32 token;
+	bool reclaimed;
+};
+
 struct iommufd_lu {
 	/* Only valid in restore, for lifetime purposes */
 	struct folio *folio_lu;
+
+	unsigned int nr_hwpts;
+	struct iommufd_hwpt_lu hwpts[];
 };
 
 int iommufd_liveupdate_register_lufs(void);
 int iommufd_liveupdate_unregister_lufs(void);
 
-
 int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd);
 int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd);
+
+/* TODO */
+#define iommu_domain_restore(x) ERR_PTR(-EOPNOTSUPP)
+#define iommu_domain_has_attachments(x) (false)
 #else
 static inline int iommufd_liveupdate_register_lufs(void)
 {

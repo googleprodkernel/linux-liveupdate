@@ -8,8 +8,12 @@
 #include <linux/kexec_handover.h>
 #include <linux/liveupdate.h>
 #include <linux/mm.h>
+#include <linux/pci.h>
 
 #include "iommufd_private.h"
+
+/* TODO: Function to check if device is marked for preservation */
+#define dev_is_preserved(dev) dev_is_pci(dev)
 
 int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd)
 {
@@ -38,25 +42,100 @@ int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd)
 		if (!hwpt->lu_preserved)
 			continue;
 		if (hwpt->lu_token == cmd->hwpt_token) {
-			xa_unlock(&ictx->objects);
 			rc = -EADDRINUSE;
 			goto out;
 		}
 	}
-	xa_unlock(&ictx->objects);
 
 	hwpt_target->lu_preserved = cmd->preserved;
 	hwpt_target->lu_token = cmd->hwpt_token;
 
 out:
+	xa_unlock(&ictx->objects);
 	iommufd_put_object(ictx, &hwpt_target->common.obj);
+	return rc;
+}
+
+static int iommufd_save_hwpts(struct iommufd_ctx *ictx,
+			      struct iommufd_lu *iommufd_lu)
+{
+	struct iommufd_hwpt_paging *hwpt, **hwpts = NULL;
+	struct iommufd_hwpt_lu *hwpt_lu;
+	struct iommufd_object *obj;
+	unsigned int nr_hwpts = 0;
+	unsigned long index;
+	unsigned int i;
+	int rc = 0;
+
+	if (iommufd_lu) {
+		hwpts = kcalloc(iommufd_lu->nr_hwpts, sizeof(*hwpts),
+				GFP_KERNEL);
+		if (!hwpts)
+			return -ENOMEM;
+	}
+
+	xa_lock(&ictx->objects);
+	xa_for_each(&ictx->objects, index, obj) {
+		if (obj->type != IOMMUFD_OBJ_HWPT_PAGING)
+			continue;
+
+		hwpt = container_of(obj, struct iommufd_hwpt_paging, common.obj);
+		if (!hwpt->lu_preserved)
+			continue;
+
+		/* TODO: The HWPT should be made immutable, and cannot be
+		 * destroyed */
+
+		if (!hwpt->common.domain) {
+			rc = -EINVAL;
+			xa_unlock(&ictx->objects);
+			goto out;
+		}
+
+		if (iommufd_lu) {
+			hwpts[nr_hwpts] = hwpt;
+			hwpt_lu = &iommufd_lu->hwpts[nr_hwpts];
+
+			hwpt_lu->token = hwpt->lu_token;
+			hwpt_lu->reclaimed = false;
+		}
+
+		nr_hwpts++;
+	}
+	xa_unlock(&ictx->objects);
+
+	if (WARN_ON(iommufd_lu && iommufd_lu->nr_hwpts != nr_hwpts)) {
+		rc = -EFAULT;
+		goto out;
+	}
+
+	if (iommufd_lu) {
+		/* iommu_domain_preserve may sleep and must be called
+		 * outside of xa_lock */
+		for (i = 0; i < nr_hwpts; i++) {
+			hwpt = hwpts[nr_hwpts];
+			hwpt_lu = &iommufd_lu->hwpts[nr_hwpts];
+
+			hwpt_lu->iommu_hwpt_token =
+				iommu_domain_preserve(hwpt->common.domain);
+			if (hwpt_lu->iommu_hwpt_token < 0) {
+				rc = hwpt_lu->iommu_hwpt_token;
+				goto out;
+			}
+		}
+	}
+
+	rc = nr_hwpts;
+
+out:
+	kfree(hwpts);
 	return rc;
 }
 
 static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
 				      struct file *file, u64 *data)
 {
-	struct iommufd_ctx *ictx = iommufd_ctx_from_file(file);
+	struct iommufd_ctx *ictx = iommufd_ctx_from_file(args->file);
 	struct iommufd_lu *iommufd_lu;
 	struct folio *folio_lu;
 	size_t serial_size;
@@ -65,7 +144,11 @@ static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
 	if (IS_ERR(ictx))
 		return PTR_ERR(ictx);
 
-	serial_size = sizeof(*iommufd_lu);
+	rc = iommufd_save_hwpts(ictx, NULL);
+	if (rc < 0)
+		goto err_ctx_put;
+
+	serial_size = struct_size(iommufd_lu, hwpts, rc);
 
 	folio_lu = folio_alloc(GFP_KERNEL, get_order(serial_size));
 	if (!folio_lu) {
@@ -74,6 +157,9 @@ static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
 	}
 
 	iommufd_lu = folio_address(folio_lu);
+	rc = iommufd_save_hwpts(ictx, iommufd_lu);
+	if (rc)
+		goto err_folio_put;
 
 	rc = kho_preserve_folio(folio_lu);
 	if (rc)
@@ -102,11 +188,32 @@ static int iommufd_liveupdate_freeze(struct liveupdate_file_handler *handler,
 static void iommufd_liveupdate_cancel(struct liveupdate_file_handler *handler,
 				      struct file *file, u64 data)
 {
-	struct iommufd_ctx *ictx = iommufd_ctx_from_file(file);
+	struct iommufd_ctx *ictx = iommufd_ctx_from_file(args->file);
+	struct iommufd_hwpt_paging *hwpt;
+	struct iommufd_object *obj;
 	struct folio *folio_lu;
+	unsigned long index;
 
 	if (WARN_ON(IS_ERR(ictx)))
 		return;
+
+	xa_lock(&ictx->objects);
+	xa_for_each(&ictx->objects, index, obj) {
+		if (obj->type != IOMMUFD_OBJ_HWPT_PAGING)
+			continue;
+
+		hwpt = container_of(obj, struct iommufd_hwpt_paging, common.obj);
+		if (!hwpt->lu_preserved)
+			continue;
+
+		/* TODO: The HWPT should be made mutable again */
+
+		if (!hwpt->common.domain)
+			continue;
+
+		WARN_ON(iommu_domain_unpreserve(hwpt->common.domain));
+	}
+	xa_unlock(&ictx->objects);
 
 	folio_lu = pfn_folio(PHYS_PFN(data));
 	WARN_ON(kho_unpreserve_folio(folio_lu));
@@ -171,32 +278,89 @@ err_folio_put:
 
 int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd)
 {
-	return -ENOTTY;
+	struct iommu_hwpt_lu_restore *cmd = ucmd->cmd;
+	struct iommufd_hwpt_paging *hwpt = NULL;
+	struct iommufd_ctx *ictx = ucmd->ictx;
+	struct iommufd_hwpt_lu *hwpt_lu;
+	struct iommufd_lu *iommufd_lu;
+	struct iommu_domain *domain;
+	unsigned int i;
+	int rc;
+
+	iommufd_lu = ictx->lu;
+	if (!iommufd_lu)
+		return -ENOTTY;
+
+	for (i = 0; i < iommufd_lu->nr_hwpts; i++) {
+		hwpt_lu = &iommufd_lu->hwpts[i];
+
+		if (hwpt_lu->reclaimed)
+			continue;
+
+		if (hwpt_lu->token == cmd->hwpt_token)
+			goto hwpt_found;
+	}
+
+	return -ENOENT;
+
+hwpt_found:
+	hwpt = _iommufd_hwpt_paging_alloc(ictx);
+	if (IS_ERR(hwpt))
+		return PTR_ERR(hwpt);
+
+	/* a successful iommu_domain_restore mars the point of no return */
+	domain = iommu_domain_restore(hwpt_lu->iommu_hwpt_token);
+	if (IS_ERR(domain)) {
+		rc = PTR_ERR(domain);
+		goto err_destroy;
+	}
+
+	iommufd_hwpt_init_from_domain(&hwpt->common, domain);
+	iommufd_object_finalize(ictx, &hwpt->common.obj);
+
+	hwpt_lu->reclaimed = true;
+	cmd->pt_id = hwpt->common.obj.id;
+	return 0;
+
+err_destroy:
+	iommufd_object_abort_and_destroy(ictx, &hwpt->common.obj);
+	return rc;
 }
 
 static void iommufd_liveupdate_finish(struct liveupdate_file_handler *handler,
 				      struct file *file, u64 data, bool reclaimed)
 {
+	struct iommufd_hwpt_lu *hwpt_lu;
 	struct iommufd_lu *iommufd_lu;
 	struct iommufd_ctx *ictx;
-	struct folio *folio_lu;
+	unsigned int i;
+	int rc;
 
 	if (!reclaimed || !file) {
 		pr_warn("%s: fd not reclaimed\n", __func__);
-
-		folio_lu = kho_restore_folio(data);
-		if (WARN_ON_ONCE(IS_ERR_OR_NULL(folio_lu)))
-			return;
-
-		iommufd_lu = folio_address(folio_lu);
-	} else {
-		ictx = iommufd_ctx_from_file(file);
-		iommufd_lu = ictx->lu;
-		ictx->lu = NULL;
-		iommufd_ctx_put(ictx);
+		return /* -EBUSY */;
 	}
 
+	ictx = iommufd_ctx_from_file(file);
+	iommufd_lu = ictx->lu;
+
+	for (i = 0; i < iommufd_lu->nr_hwpts; i++) {
+		hwpt_lu = &iommufd_lu->hwpts[i];
+
+		if (!hwpt_lu->reclaimed) {
+			rc = -EBUSY;
+			goto err;
+		}
+	}
+
+	/* TODO: Iterate all objects for any restored HWPTs that is in use */
+
+	ictx->lu = NULL;
 	folio_put(iommufd_lu->folio_lu);
+
+err:
+	iommufd_ctx_put(ictx);
+	return /* rc */;
 }
 
 static bool iommufd_liveupdate_can_preserve(struct liveupdate_file_handler *handler,
