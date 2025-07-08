@@ -25,7 +25,15 @@
 
 #define IOMMUFD_LUO_COMPATIBLE "iommufd-v1"
 
+struct iommufd_hwpt_lu {
+	u32 token;
+	u64 domain_data;
+	bool reclaimed;
+} __packed;
+
 struct iommufd_lu {
+	unsigned int nr_hwpts;
+	struct iommufd_hwpt_lu hwpts[];
 };
 
 #endif /* _LINUX_KHO_ABI_IOMMUFD_H */
