@@ -8,6 +8,8 @@
 #ifndef _LINUX_LUO_INTERNAL_H
 #define _LINUX_LUO_INTERNAL_H
 
+#include <uapi/linux/liveupdate.h>
+
 /*
  * Handles a deserialization failure: devices and memory is in unpredictable
  * state.
@@ -38,5 +40,11 @@ int luo_retrieve_file(u64 token, struct file **filep);
 int luo_register_file(u64 token, int fd);
 int luo_unregister_file(u64 token);
 void luo_unregister_all_files(void);
+
+int luo_file_get_state(u64 token, enum liveupdate_state *statep, bool incoming);
+int luo_file_prepare(u64 token);
+int luo_file_freeze(u64 token);
+int luo_file_cancel(u64 token);
+int luo_file_finish(u64 token);
 
 #endif /* _LINUX_LUO_INTERNAL_H */
