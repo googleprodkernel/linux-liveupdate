@@ -128,6 +128,8 @@ enum {
 	LIVEUPDATE_CMD_FD_RESTORE = 0x02,
 	LIVEUPDATE_CMD_GET_STATE = 0x03,
 	LIVEUPDATE_CMD_SET_EVENT = 0x04,
+	LIVEUPDATE_CMD_GET_FD_STATE = 0x05,
+	LIVEUPDATE_CMD_SET_FD_EVENT = 0x06,
 };
 
 /**
@@ -333,5 +335,65 @@ struct liveupdate_ioctl_set_event {
 
 #define LIVEUPDATE_IOCTL_SET_EVENT					\
 	_IO(LIVEUPDATE_IOCTL_TYPE, LIVEUPDATE_CMD_SET_EVENT)
+
+/**
+ * struct liveupdate_ioctl_get_fd_state - ioctl(LIVEUPDATE_IOCTL_GET_FD_STATE)
+ * @size:     Input; sizeof(struct liveupdate_ioctl_get_fd_state)
+ * @incoming: Input; If 1, query the state of a restored file from the incoming
+ *            (previous kernel's) set. If 0, query a file being prepared for
+ *            preservation in the current set.
+ * @token:    Input; Token of FD for which to get state.
+ * @state:    Output; The live update state of this FD.
+ *
+ * Query the current live update state of a specific preserved file descriptor.
+ *
+ * - %LIVEUPDATE_STATE_NORMAL:   Default state
+ * - %LIVEUPDATE_STATE_PREPARED: Prepare callback has been performed on this FD.
+ * - %LIVEUPDATE_STATE_FROZEN:   Freeze callback ahs been performed on this FD.
+ * - %LIVEUPDATE_STATE_UPDATED:  The system has successfully rebooted into the
+ *                               new kernel.
+ *
+ * See the definition of &enum liveupdate_state for more details on each state.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+struct liveupdate_ioctl_get_fd_state {
+	__u32		size;
+	__u8		incoming;
+	__aligned_u64	token;
+	__u32		state;
+};
+
+#define LIVEUPDATE_IOCTL_GET_FD_STATE					\
+	_IO(LIVEUPDATE_IOCTL_TYPE, LIVEUPDATE_CMD_GET_FD_STATE)
+
+/**
+ * struct liveupdate_ioctl_set_fd_event - ioctl(LIVEUPDATE_IOCTL_SET_FD_EVENT)
+ * @size:  Input; sizeof(struct liveupdate_ioctl_set_fd_event)
+ * @event: Input; The live update event.
+ * @token: Input; Token of FD for which to set the provided event.
+ *
+ * Notify a specific preserved file descriptor of an event, that causes a state
+ * transition for that file descriptor.
+ *
+ * Event, can be one of the following:
+ *
+ * - %LIVEUPDATE_PREPARE: Initiates the FD live update preparation phase.
+ * - %LIVEUPDATE_FREEZE:  Initiates the FD live update freeze phase.
+ * - %LIVEUPDATE_CANCEL:  Cancel the FD preparation or freeze phase.
+ * - %LIVEUPDATE_FINISH:  FD Restoration completion and trigger cleanup.
+ *
+ * See the definition of &enum liveupdate_event for more details on each state.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+struct liveupdate_ioctl_set_fd_event {
+	__u32		size;
+	__u32		event;
+	__aligned_u64	token;
+};
+
+#define LIVEUPDATE_IOCTL_SET_FD_EVENT					\
+	_IO(LIVEUPDATE_IOCTL_TYPE, LIVEUPDATE_CMD_SET_FD_EVENT)
 
 #endif /* _UAPI_LIVEUPDATE_H */

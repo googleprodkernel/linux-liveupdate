@@ -741,6 +741,158 @@ void luo_unregister_all_files(void)
 }
 
 /**
+ * luo_file_get_state - Get the preservation state of a specific file.
+ * @token: The token of the file to query.
+ * @statep: Output pointer to store the file's current live update state.
+ * @incoming: If true, query the state of a restored file from the incoming
+ *            (previous kernel's) set. If false, query a file being prepared
+ *            for preservation in the current set.
+ *
+ * Finds the file associated with the given @token in either the incoming
+ * or outgoing tracking arrays and returns its current LUO state
+ * (NORMAL, PREPARED, FROZEN, UPDATED).
+ *
+ * Return: 0 on success, -ENOENT if the token is not found.
+ */
+int luo_file_get_state(u64 token, enum liveupdate_state *statep, bool incoming)
+{
+	struct luo_file *luo_file;
+	struct xarray *target_xa;
+	int ret = 0;
+
+	luo_state_read_enter();
+
+	target_xa = incoming ? &luo_files_xa_in : &luo_files_xa_out;
+	luo_file = xa_load(target_xa, token);
+
+	if (!luo_file) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	scoped_guard(mutex, &luo_file->mutex)
+		*statep = luo_file->state;
+
+out_unlock:
+	luo_state_read_exit();
+	return ret;
+}
+
+/**
+ * luo_file_prepare - Prepare a single registered file for live update.
+ * @token: The token of the file to prepare.
+ *
+ * Finds the file associated with @token and transitions it to the PREPARED
+ * state by invoking its handler's ->prepare() callback. This allows for
+ * granular, per-file preparation before the global LUO PREPARE event.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int luo_file_prepare(u64 token)
+{
+	struct luo_file *luo_file;
+	int ret;
+
+	luo_state_read_enter();
+	luo_file = xa_load(&luo_files_xa_out, token);
+	if (!luo_file) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	ret = luo_files_prepare_one(luo_file);
+out_unlock:
+	luo_state_read_exit();
+	return ret;
+}
+
+/**
+ * luo_file_freeze - Freeze a single prepared file for live update.
+ * @token: The token of the file to freeze.
+ *
+ * Finds the file associated with @token and transitions it from the PREPARED
+ * to the FROZEN state by invoking its handler's ->freeze() callback. This is
+ * typically used for final, "blackout window" state saving for a specific
+ * file.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int luo_file_freeze(u64 token)
+{
+	struct luo_file *luo_file;
+	int ret;
+
+	luo_state_read_enter();
+	luo_file = xa_load(&luo_files_xa_out, token);
+	if (!luo_file) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	ret = luo_files_freeze_one(luo_file);
+out_unlock:
+	luo_state_read_exit();
+	return ret;
+}
+
+int luo_file_cancel(u64 token)
+{
+	struct luo_file *luo_file;
+	int ret = 0;
+
+	luo_state_read_enter();
+	luo_file = xa_load(&luo_files_xa_out, token);
+	if (!luo_file) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	luo_files_cancel_one(luo_file);
+out_unlock:
+	luo_state_read_exit();
+	return ret;
+}
+
+/**
+ * luo_file_finish - Clean-up a single restored file after live update.
+ * @token: The token of the file to finalize.
+ *
+ * This function is called in the new kernel after a live update, typically
+ * after a file has been restored via luo_retrieve_file() and is no longer
+ * needed by the userspace agent in its preserved state. It invokes the
+ * handler's ->finish() callback, allowing for any final cleanup of the
+ * preserved state associated with this specific file.
+ *
+ * This must be called when LUO is in the UPDATED state.
+ *
+ * Return: 0 on success, -ENOENT if the token is not found, -EBUSY if not
+ *         in the UPDATED state.
+ */
+int luo_file_finish(u64 token)
+{
+	struct luo_file *luo_file;
+	int ret = 0;
+
+	luo_state_read_enter();
+	if (!liveupdate_state_updated()) {
+		pr_warn("finish can only be done in UPDATED state\n");
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	luo_file = xa_load(&luo_files_xa_in, token);
+	if (!luo_file) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	luo_files_finish_one(luo_file);
+out_unlock:
+	luo_state_read_exit();
+	return ret;
+}
+
+/**
  * luo_retrieve_file - Find a registered file instance by its token.
  * @token: The unique token of the file instance to retrieve.
  * @filep: Output parameter. On success (return value 0), this will point

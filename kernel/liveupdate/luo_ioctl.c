@@ -127,6 +127,48 @@ static int luo_ioctl_set_event(struct luo_ucmd *ucmd)
 	return ret;
 }
 
+static int luo_ioctl_get_fd_state(struct luo_ucmd *ucmd)
+{
+	struct liveupdate_ioctl_get_fd_state *argp = ucmd->cmd;
+	enum liveupdate_state state;
+	int ret;
+
+	ret = luo_file_get_state(argp->token, &state, !!argp->incoming);
+	if (ret)
+		return ret;
+
+	argp->state = state;
+	if (copy_to_user(ucmd->ubuffer, argp, ucmd->user_size))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int luo_ioctl_set_fd_event(struct luo_ucmd *ucmd)
+{
+	struct liveupdate_ioctl_set_fd_event *argp = ucmd->cmd;
+	int ret;
+
+	switch (argp->event) {
+	case LIVEUPDATE_PREPARE:
+		ret = luo_file_prepare(argp->token);
+		break;
+	case LIVEUPDATE_FREEZE:
+		ret = luo_file_freeze(argp->token);
+		break;
+	case LIVEUPDATE_FINISH:
+		ret = luo_file_finish(argp->token);
+		break;
+	case LIVEUPDATE_CANCEL:
+		ret = luo_file_cancel(argp->token);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
 static int luo_open(struct inode *inodep, struct file *filep)
 {
 	if (atomic_cmpxchg(&luo_device_in_use, 0, 1))
@@ -149,6 +191,8 @@ union ucmd_buffer {
 	struct liveupdate_ioctl_fd_restore	restore;
 	struct liveupdate_ioctl_get_state	state;
 	struct liveupdate_ioctl_set_event	event;
+	struct liveupdate_ioctl_get_fd_state	fd_state;
+	struct liveupdate_ioctl_set_fd_event	fd_event;
 };
 
 struct luo_ioctl_op {
@@ -179,6 +223,10 @@ static const struct luo_ioctl_op luo_ioctl_ops[] = {
 		 struct liveupdate_ioctl_get_state, state),
 	IOCTL_OP(LIVEUPDATE_IOCTL_SET_EVENT, luo_ioctl_set_event,
 		 struct liveupdate_ioctl_set_event, event),
+	IOCTL_OP(LIVEUPDATE_IOCTL_GET_FD_STATE, luo_ioctl_get_fd_state,
+		 struct liveupdate_ioctl_get_fd_state, token),
+	IOCTL_OP(LIVEUPDATE_IOCTL_SET_FD_EVENT, luo_ioctl_set_fd_event,
+		 struct liveupdate_ioctl_set_fd_event, token),
 };
 
 static long luo_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
