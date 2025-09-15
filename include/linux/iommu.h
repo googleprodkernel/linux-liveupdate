@@ -14,6 +14,7 @@
 #include <linux/err.h>
 #include <linux/of.h>
 #include <linux/iova_bitmap.h>
+#include <linux/atomic.h>
 #include <uapi/linux/iommufd.h>
 
 #define IOMMU_READ	(1 << 0)
@@ -248,6 +249,10 @@ struct iommu_domain {
 			struct list_head next;
 		};
 	};
+
+#ifdef CONFIG_LIVEUPDATE
+	atomic_t preserved;
+#endif
 };
 
 static inline bool iommu_is_dma_domain(struct iommu_domain *domain)
@@ -916,6 +921,11 @@ static inline struct iommu_domain *iommu_paging_domain_alloc(struct device *dev)
 {
 	return iommu_paging_domain_alloc_flags(dev, 0);
 }
+
+#ifdef CONFIG_LIVEUPDATE
+extern int iommu_domain_preserve(struct iommu_domain *domain);
+#endif
+
 extern void iommu_domain_free(struct iommu_domain *domain);
 extern int iommu_attach_device(struct iommu_domain *domain,
 			       struct device *dev);
