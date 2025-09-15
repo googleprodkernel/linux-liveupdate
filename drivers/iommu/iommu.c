@@ -2002,6 +2002,10 @@ static void iommu_domain_init(struct iommu_domain *domain, unsigned int type,
 	domain->owner = ops;
 	if (!domain->ops)
 		domain->ops = ops->default_domain_ops;
+
+#ifdef CONFIG_LIVEUPDATE
+	atomic_set(&domain->preserved, 0);
+#endif
 }
 
 static struct iommu_domain *
@@ -2054,6 +2058,22 @@ EXPORT_SYMBOL_GPL(iommu_paging_domain_alloc_flags);
 
 #ifdef CONFIG_LIVEUPDATE
 DECLARE_RWSEM(liveupdate_state_rwsem);
+
+int iommu_domain_preserve(struct iommu_domain *domain)
+{
+	int ret;
+
+	lockdep_assert_held(&liveupdate_state_rwsem);
+	if (!domain->ops->preserve)
+		return -EOPNOTSUPP;
+
+	ret = domain->ops->preserve(domain);
+	if (!ret)
+		atomic_set(&domain->preserved, 1);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(iommu_domain_preserve);
 #endif
 
 void iommu_domain_free(struct iommu_domain *domain)
