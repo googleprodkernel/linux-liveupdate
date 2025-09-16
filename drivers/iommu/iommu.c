@@ -2093,6 +2093,10 @@ struct iommu_domain *iommu_paging_domain_alloc_flags(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(iommu_paging_domain_alloc_flags);
 
+#ifdef CONFIG_LIVEUPDATE
+DECLARE_RWSEM(liveupdate_state_rwsem);
+#endif
+
 void iommu_domain_free(struct iommu_domain *domain)
 {
 	switch (domain->cookie_type) {
