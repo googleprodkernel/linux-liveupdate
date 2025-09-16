@@ -598,6 +598,15 @@ __iommu_copy_struct_to_user(const struct iommu_user_data *dst_data,
 	__iommu_copy_struct_to_user(user_data, ksrc, data_type, sizeof(*ksrc), \
 				    offsetofend(typeof(*ksrc), min_last))
 
+#ifdef CONFIG_LIVEUPDATE
+extern struct rw_semaphore liveupdate_state_rwsem;
+#define guard_liveupdate_state_read() guard(rwsem_read)(&liveupdate_state_rwsem)
+#define guard_liveupdate_state_write() guard(rwsem_write)(&liveupdate_state_rwsem)
+#else
+#define guard_liveupdate_state_read()
+#define guard_liveupdate_state_write()
+#endif /* CONFIG_LIVEUPDATE */
+
 /**
  * struct iommu_ops - iommu ops and capabilities
  * @capable: check capability
