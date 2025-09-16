@@ -26,6 +26,7 @@
 #include <linux/dmi.h>
 #include <linux/slab.h>
 #include <linux/iommu.h>
+#include <linux/liveupdate.h>
 #include <linux/numa.h>
 #include <linux/limits.h>
 #include <asm/irq_remapping.h>
@@ -2356,6 +2357,10 @@ static int dmar_device_hotplug(acpi_handle handle, bool insert)
 	}
 	if (tmp == NULL)
 		return 0;
+
+	guard_liveupdate_state_read();
+	if (!liveupdate_state_normal())
+		return -EBUSY;
 
 	down_write(&dmar_global_lock);
 	if (insert)
