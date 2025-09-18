@@ -3865,6 +3865,9 @@ const struct iommu_domain_ops intel_fs_paging_domain_ops = {
 	.iotlb_sync = intel_iommu_tlb_sync,
 	.free = intel_iommu_domain_free,
 	.enforce_cache_coherency = intel_iommu_enforce_cache_coherency_fs,
+#ifdef CONFIG_LIVEUPDATE
+	.preserve = intel_iommu_domain_liveupdate_preserve,
+#endif
 };
 
 const struct iommu_domain_ops intel_ss_paging_domain_ops = {
@@ -3876,6 +3879,9 @@ const struct iommu_domain_ops intel_ss_paging_domain_ops = {
 	.iotlb_sync = intel_iommu_tlb_sync,
 	.free = intel_iommu_domain_free,
 	.enforce_cache_coherency = intel_iommu_enforce_cache_coherency_ss,
+#ifdef CONFIG_LIVEUPDATE
+	.preserve = intel_iommu_domain_liveupdate_preserve,
+#endif
 };
 
 const struct iommu_ops intel_iommu_ops = {

@@ -9,6 +9,15 @@
 #include <linux/liveupdate.h>
 #include <linux/module.h>
 
+#include "iommu.h"
+
+int intel_iommu_domain_liveupdate_preserve(struct iommu_domain *domain)
+{
+	pr_warn("Not implemented\n");
+	return 0;
+
+}
+
 static int intel_liveupdate_prepare(struct liveupdate_subsystem *handle, u64 *data)
 {
 	pr_warn("Not implemented\n");
