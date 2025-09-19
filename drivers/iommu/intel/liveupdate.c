@@ -258,10 +258,21 @@ static void intel_liveupdate_finish(struct liveupdate_subsystem *handle, u64 dat
 	pr_warn("Not implemented\n");
 }
 
+static int intel_liveupdate_freeze(struct liveupdate_subsystem *handle, u64 *data)
+{
+	struct iommu_ser *ser = __va(*data);
+
+	ser->iommu_units_phys = __pa(ser->iommu_units);
+	ser->devices_phys = __pa(ser->devices);
+
+	return 0;
+}
+
 static struct liveupdate_subsystem_ops intel_liveupdate_subsystem_ops = {
 	.prepare = intel_liveupdate_prepare,
 	.finish = intel_liveupdate_finish,
 	.cancel = intel_liveupdate_cancel,
+	.freeze = intel_liveupdate_freeze,
 };
 
 static struct liveupdate_subsystem intel_liveupdate_subsystem = {
