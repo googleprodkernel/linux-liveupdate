@@ -556,6 +556,7 @@ struct root_entry {
 	u64     lo;
 	u64     hi;
 };
+#define ROOT_ENTRY_NR (VTD_PAGE_SIZE/sizeof(struct root_entry))
 
 /*
  * low 64 bits:
