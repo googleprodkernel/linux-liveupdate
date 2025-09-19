@@ -1282,6 +1282,7 @@ static inline int iopf_for_domain_replace(struct iommu_domain *new,
 
 #ifdef CONFIG_LIVEUPDATE
 int intel_iommu_domain_liveupdate_preserve(struct iommu_domain *domain);
+int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu);
 #endif
 
 #ifdef CONFIG_INTEL_IOMMU_SVM

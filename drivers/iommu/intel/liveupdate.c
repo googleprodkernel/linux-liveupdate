@@ -253,9 +253,11 @@ static void intel_liveupdate_cancel(struct liveupdate_subsystem *handle, u64 dat
 	pr_warn("Not implemented\n");
 }
 
+static struct iommu_ser *serialized_state;
+
 static void intel_liveupdate_finish(struct liveupdate_subsystem *handle, u64 data)
 {
-	pr_warn("Not implemented\n");
+	serialized_state = NULL;
 }
 
 static int intel_liveupdate_freeze(struct liveupdate_subsystem *handle, u64 *data)
@@ -279,6 +281,94 @@ static struct liveupdate_subsystem intel_liveupdate_subsystem = {
 	.name = "intel-iommu",
 	.ops = &intel_liveupdate_subsystem_ops,
 };
+
+static struct iommu_ser *get_liveupdate_state(void)
+{
+	struct iommu_ser *ser;
+	u64 data;
+	int ret;
+
+	if (serialized_state)
+		return serialized_state;
+
+	ret = liveupdate_get_subsystem_data(&intel_liveupdate_subsystem, &data);
+	if (WARN_ON_ONCE(ret))
+		return NULL;
+
+	if (!kho_restore_folio(data))
+		return NULL;
+
+	ser = __va(data);
+	ser->iommu_units = __va(ser->iommu_units_phys);
+	ser->devices = __va(ser->devices_phys);
+	serialized_state = ser;
+
+	return ser;
+}
+
+static int restore_iommu_context(struct intel_iommu *iommu)
+{
+	struct context_entry *context;
+	int i, ret = 0;
+
+	for (i = 0; i < ROOT_ENTRY_NR; i++) {
+		context = iommu_context_addr(iommu, i, 0, 0);
+		if (context)
+			BUG_ON(!kho_restore_folio(virt_to_phys(context)));
+
+		if (!sm_supported(iommu))
+			continue;
+
+		context = iommu_context_addr(iommu, i, 0x80, 0);
+		if (context)
+			BUG_ON(!kho_restore_folio(virt_to_phys(context)));
+	}
+
+	return ret;
+}
+
+static struct iommu_unit_ser *get_iommu_unit_state(struct iommu_ser *ser, u64 reg_phys)
+{
+	int i;
+
+	for (i = 0; i < ser->nr_iommus; ++i) {
+		if (ser->iommu_units[i].phys_addr ==  reg_phys)
+			return &ser->iommu_units[i];
+	}
+
+	return NULL;
+}
+
+int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu)
+{
+	struct iommu_unit_ser *iser;
+	struct iommu_ser *ser;
+	int ret;
+
+	if (!liveupdate_state_updated())
+		return -EINVAL;
+
+	ser = get_liveupdate_state();
+	if (!ser)
+		return -EINVAL;
+
+	iser = get_iommu_unit_state(ser, iommu->reg_phys);
+	if (!iser)
+		return -EINVAL;
+
+	iommu->root_entry = __va(iser->root_table);
+
+	ret = restore_iommu_context(iommu);
+	if (ret) {
+		WARN_ONCE(ret, "Cannot restore iommu [%llx] root context\n", iommu->reg_phys);
+		folio_put(virt_to_folio(iommu->root_entry));
+		iommu->root_entry = NULL;
+	}
+	pr_info("Restored IOMMU[0x%llx] Root Table at: 0x%llx\n",
+		iommu->reg_phys, iser->root_table);
+
+	return ret;
+}
 
 static int __init intel_liveupdate_init(void)
 {

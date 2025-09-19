@@ -671,6 +671,13 @@ static int iommu_alloc_root_entry(struct intel_iommu *iommu)
 {
 	struct root_entry *root;
 
+#ifdef CONFIG_LIVEUPDATE
+	if (!intel_iommu_liveupdate_restore_root_table(iommu) &&
+	    iommu->root_entry) {
+		__iommu_flush_cache(iommu, iommu->root_entry, ROOT_SIZE);
+		return 0;
+	}
+#endif
 	root = iommu_alloc_pages_node_sz(iommu->node, GFP_ATOMIC, SZ_4K);
 	if (!root) {
 		pr_err("Allocating root entry for %s failed\n",
