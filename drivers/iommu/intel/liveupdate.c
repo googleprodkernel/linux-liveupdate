@@ -59,11 +59,87 @@ static int preserve_device_state(struct pci_dev *dev, struct device_ser *ser)
 	return 0;
 }
 
+static int unpreserve_iommu_context(struct intel_iommu *iommu, int end)
+{
+	struct context_entry *context;
+	int i;
+
+	if (end < 0)
+		end = ROOT_ENTRY_NR;
+
+	for (i = 0; i < end; i++) {
+		context = iommu_context_addr(iommu, i, 0, 0);
+		if (context)
+			WARN_ON_ONCE(kho_unpreserve_folio(virt_to_folio(context)));
+
+		if (!sm_supported(iommu))
+			continue;
+
+		context = iommu_context_addr(iommu, i, 0x80, 0);
+		if (context)
+			WARN_ON_ONCE(kho_unpreserve_folio(virt_to_folio(context)));
+	}
+
+	return 0;
+}
+
+static int preserve_iommu_context(struct intel_iommu *iommu)
+{
+	struct context_entry *context;
+	int ret;
+	int i;
+
+	for (i = 0; i < ROOT_ENTRY_NR; i++) {
+		context = iommu_context_addr(iommu, i, 0, 0);
+		if (context) {
+			ret = kho_preserve_folio(virt_to_folio(context));
+			if (ret)
+				goto error;
+		}
+
+		if (!sm_supported(iommu))
+			continue;
+
+		context = iommu_context_addr(iommu, i, 0x80, 0);
+		if (context) {
+			ret = kho_preserve_folio(virt_to_folio(context));
+			if (ret)
+				goto error_sm;
+		}
+	}
+
+	return 0;
+
+error_sm:
+	context = iommu_context_addr(iommu, i, 0, 0);
+	WARN_ON_ONCE(kho_unpreserve_folio(virt_to_folio(context)));
+error:
+	WARN_ON_ONCE(unpreserve_iommu_context(iommu, i));
+	return ret;
+}
+
 static int preserve_iommu_state(struct intel_iommu *iommu,
 				struct iommu_unit_ser *ser)
 {
-	pr_warn("Not implemented\n");
-	return 0;
+	int ret;
+
+	spin_lock(&iommu->lock);
+	ret = preserve_iommu_context(iommu);
+	if (ret)
+		goto error;
+
+	ret = kho_preserve_folio(virt_to_folio(iommu->root_entry));
+	if (ret) {
+		unpreserve_iommu_context(iommu, -1);
+		goto error;
+	}
+
+	ser->phys_addr = iommu->reg_phys;
+	ser->root_table = __pa(iommu->root_entry);
+	atomic_set(&iommu->preserved, 1);
+error:
+	spin_unlock(&iommu->lock);
+	return ret;
 }
 
 static void unpreserve_state(struct iommu_ser *ser)
