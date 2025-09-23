@@ -188,17 +188,66 @@ static void luo_session_remove(struct luo_session *session)
 /* One session switches from the updated state to  normal state */
 static void luo_session_finish_one(struct luo_session *session)
 {
+	scoped_guard(mutex, &session->mutex) {
+		if (session->state != LIVEUPDATE_STATE_UPDATED)
+			return;
+		luo_file_finish(session);
+		session->files = 0;
+		luo_file_unpreserve_unreclaimed_files(session);
+		session->state = LIVEUPDATE_STATE_NORMAL;
+	}
 }
 
 /* Cancel one session from frozen or prepared state, back to normal */
 static void luo_session_cancel_one(struct luo_session *session)
 {
+	guard(mutex)(&session->mutex);
+	if (session->state == LIVEUPDATE_STATE_FROZEN ||
+	    session->state == LIVEUPDATE_STATE_PREPARED) {
+		luo_file_cancel(session);
+		session->state = LIVEUPDATE_STATE_NORMAL;
+		session->files = 0;
+		session->ser = NULL;
+	}
 }
 
 /* One session is changed from normal to prepare state */
 static int luo_session_prepare_one(struct luo_session *session)
 {
-	return 0;
+	int ret;
+
+	guard(mutex)(&session->mutex);
+	if (session->state != LIVEUPDATE_STATE_NORMAL)
+		return -EBUSY;
+
+	ret = luo_file_prepare(session);
+	if (!ret)
+		session->state = LIVEUPDATE_STATE_PREPARED;
+
+	return ret;
+}
+
+/* One session is changed from prepared to frozen state */
+static int luo_session_freeze_one(struct luo_session *session)
+{
+	int ret;
+
+	guard(mutex)(&session->mutex);
+	if (session->state != LIVEUPDATE_STATE_PREPARED)
+		return -EBUSY;
+
+	ret = luo_file_freeze(session);
+
+	/*
+	 * If fail, freeze is cancel, and as a side effect, we go back to normal
+	 * state
+	 */
+	if (!ret)
+		session->state = LIVEUPDATE_STATE_FROZEN;
+	else
+		session->state = LIVEUPDATE_STATE_NORMAL;
+
+	return ret;
 }
 
 static int luo_session_release(struct inode *inodep, struct file *filep)
@@ -220,6 +269,8 @@ static int luo_session_release(struct inode *inodep, struct file *filep)
 	    session->state == LIVEUPDATE_STATE_FROZEN) {
 		luo_session_cancel_one(session);
 	}
+	scoped_guard(mutex, &session->mutex)
+		luo_file_unpreserve_all_files(session);
 
 	scoped_guard(rwsem_write, &luo_session_global.rwsem)
 		luo_session_remove(session);
@@ -228,9 +279,219 @@ static int luo_session_release(struct inode *inodep, struct file *filep)
 	return 0;
 }
 
+static int luo_session_preserve_fd(struct luo_session *session,
+				   struct luo_ucmd *ucmd)
+{
+	struct liveupdate_session_preserve_fd *argp = ucmd->cmd;
+	int ret;
+
+	guard(rwsem_read)(&luo_state_rwsem);
+	if (!liveupdate_state_normal() && !liveupdate_state_updated()) {
+		pr_warn("File can be preserved only in normal or updated state\n");
+		return -EBUSY;
+	}
+
+	guard(mutex)(&session->mutex);
+
+	if (session->state != LIVEUPDATE_STATE_NORMAL)
+		return -EBUSY;
+
+	ret = luo_preserve_file(session, argp->token, argp->fd);
+	if (ret)
+		return ret;
+
+	ret = luo_ucmd_respond(ucmd, sizeof(*argp));
+	if (ret)
+		pr_warn("The file was successfully preserved, but response to user failed\n");
+
+	return ret;
+}
+
+static int luo_session_unpreserve_fd(struct luo_session *session,
+				     struct luo_ucmd *ucmd)
+{
+	struct liveupdate_session_unpreserve_fd *argp = ucmd->cmd;
+	int ret;
+
+	if (argp->reserved)
+		return -EOPNOTSUPP;
+
+	guard(rwsem_read)(&luo_state_rwsem);
+	if (!liveupdate_state_normal() && !liveupdate_state_updated()) {
+		pr_warn("File can be preserved only in normal or updated state\n");
+		return -EBUSY;
+	}
+
+	guard(mutex)(&session->mutex);
+
+	if (session->state != LIVEUPDATE_STATE_NORMAL)
+		return -EBUSY;
+
+	ret = luo_unpreserve_file(session, argp->token);
+	if (ret)
+		return ret;
+
+	ret = luo_ucmd_respond(ucmd, sizeof(*argp));
+	if (ret)
+		pr_warn("The file was successfully unpreserved, but response to user failed\n");
+
+	return ret;
+}
+
+static int luo_session_restore_fd(struct luo_session *session,
+				  struct luo_ucmd *ucmd)
+{
+	struct liveupdate_session_restore_fd *argp = ucmd->cmd;
+	struct file *file;
+	int ret;
+
+	guard(rwsem_read)(&luo_state_rwsem);
+	if (!liveupdate_state_updated())
+		return -EBUSY;
+
+	argp->fd = get_unused_fd_flags(O_CLOEXEC);
+	if (argp->fd < 0)
+		return argp->fd;
+
+	guard(mutex)(&session->mutex);
+
+	/* Session might have already finished independatly from global state */
+	if (session->state != LIVEUPDATE_STATE_UPDATED)
+		return -EBUSY;
+
+	ret = luo_retrieve_file(session, argp->token, &file);
+	if (ret < 0) {
+		put_unused_fd(argp->fd);
+
+		return ret;
+	}
+
+	ret = luo_ucmd_respond(ucmd, sizeof(*argp));
+	if (ret)
+		return ret;
+
+	fd_install(argp->fd, file);
+
+	return 0;
+}
+
+static int luo_session_get_state(struct luo_session *session,
+				 struct luo_ucmd *ucmd)
+{
+	struct liveupdate_session_get_state *argp = ucmd->cmd;
+
+	if (argp->reserved[0] | argp->reserved[1] | argp->reserved[2])
+		return -EOPNOTSUPP;
+
+	argp->state = READ_ONCE(session->state);
+
+	return luo_ucmd_respond(ucmd, sizeof(*argp));
+}
+
+static int luo_session_set_event(struct luo_session *session,
+				 struct luo_ucmd *ucmd)
+{
+	struct liveupdate_session_set_event *argp = ucmd->cmd;
+	int ret = 0;
+
+	switch (argp->event) {
+	case LIVEUPDATE_PREPARE:
+		ret = luo_session_prepare_one(session);
+		break;
+	case LIVEUPDATE_FREEZE:
+		ret = luo_session_freeze_one(session);
+		break;
+	case LIVEUPDATE_FINISH:
+		luo_session_finish_one(session);
+		break;
+	case LIVEUPDATE_CANCEL:
+		luo_session_cancel_one(session);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+union ucmd_buffer {
+	struct liveupdate_session_get_state state;
+	struct liveupdate_session_preserve_fd preserve;
+	struct liveupdate_session_restore_fd restore;
+	struct liveupdate_session_set_event event;
+	struct liveupdate_session_unpreserve_fd unpreserve;
+};
+
+struct luo_ioctl_op {
+	unsigned int size;
+	unsigned int min_size;
+	unsigned int ioctl_num;
+	int (*execute)(struct luo_session *session, struct luo_ucmd *ucmd);
+};
+
+#define IOCTL_OP(_ioctl, _fn, _struct, _last)                                  \
+	[_IOC_NR(_ioctl) - LIVEUPDATE_CMD_SESSION_BASE] = {                    \
+		.size = sizeof(_struct) +                                      \
+			BUILD_BUG_ON_ZERO(sizeof(union ucmd_buffer) <          \
+					  sizeof(_struct)),                    \
+		.min_size = offsetofend(_struct, _last),                       \
+		.ioctl_num = _ioctl,                                           \
+		.execute = _fn,                                                \
+	}
+
+static const struct luo_ioctl_op luo_session_ioctl_ops[] = {
+	IOCTL_OP(LIVEUPDATE_SESSION_GET_STATE, luo_session_get_state,
+		 struct liveupdate_session_get_state, state),
+	IOCTL_OP(LIVEUPDATE_SESSION_PRESERVE_FD, luo_session_preserve_fd,
+		 struct liveupdate_session_preserve_fd, token),
+	IOCTL_OP(LIVEUPDATE_SESSION_RESTORE_FD, luo_session_restore_fd,
+		 struct liveupdate_session_restore_fd, token),
+	IOCTL_OP(LIVEUPDATE_SESSION_SET_EVENT, luo_session_set_event,
+		 struct liveupdate_session_set_event, event),
+	IOCTL_OP(LIVEUPDATE_SESSION_UNPRESERVE_FD, luo_session_unpreserve_fd,
+		 struct liveupdate_session_unpreserve_fd, token),
+};
+
+static long luo_session_ioctl(struct file *filep, unsigned int cmd,
+			      unsigned long arg)
+{
+	struct luo_session *session = filep->private_data;
+	const struct luo_ioctl_op *op;
+	struct luo_ucmd ucmd = {};
+	union ucmd_buffer buf;
+	unsigned int nr;
+	int ret;
+
+	nr = _IOC_NR(cmd);
+	if (nr < LIVEUPDATE_CMD_SESSION_BASE || (nr - LIVEUPDATE_CMD_SESSION_BASE) >=
+	    ARRAY_SIZE(luo_session_ioctl_ops)) {
+		return -EINVAL;
+	}
+
+	ucmd.ubuffer = (void __user *)arg;
+	ret = get_user(ucmd.user_size, (u32 __user *)ucmd.ubuffer);
+	if (ret)
+		return ret;
+
+	op = &luo_session_ioctl_ops[nr - LIVEUPDATE_CMD_SESSION_BASE];
+	if (op->ioctl_num != cmd)
+		return -ENOIOCTLCMD;
+	if (ucmd.user_size < op->min_size)
+		return -EINVAL;
+
+	ucmd.cmd = &buf;
+	ret = copy_struct_from_user(ucmd.cmd, op->size, ucmd.ubuffer,
+				    ucmd.user_size);
+	if (ret)
+		return ret;
+
+	return op->execute(session, &ucmd);
+}
+
 static const struct file_operations luo_session_fops = {
 	.owner = THIS_MODULE,
 	.release = luo_session_release,
+	.unlocked_ioctl = luo_session_ioctl,
 };
 
 static void luo_session_deserialize(void)
@@ -267,6 +528,7 @@ static void luo_session_deserialize(void)
 		session->state = LIVEUPDATE_STATE_UPDATED;
 		session->count = luo_session_global.ser[i].count;
 		session->files = luo_session_global.ser[i].files;
+		luo_file_deserialize(session);
 	}
 }
 
@@ -501,7 +763,25 @@ static int luo_session_prepare(struct liveupdate_subsystem *h, u64 *data)
 
 static int luo_session_freeze(struct liveupdate_subsystem *h, u64 *data)
 {
-	return 0;
+	struct luo_session *it;
+	int ret;
+
+	WARN_ON(!luo_session_global.fdt);
+
+	scoped_guard(rwsem_read, &luo_session_global.rwsem) {
+		list_for_each_entry(it, &luo_session_global.list, list) {
+			if (it->state == LIVEUPDATE_STATE_PREPARED) {
+				ret = luo_session_freeze_one(it);
+				if (ret)
+					break;
+			}
+		}
+	}
+
+	if (ret)
+		luo_session_cancel(h, 0);
+
+	return ret;
 }
 
 /*
