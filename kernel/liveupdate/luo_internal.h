@@ -32,6 +32,40 @@ void *luo_contig_alloc_preserve(size_t size);
 void luo_contig_free_unpreserve(void *mem, size_t size);
 void luo_contig_free_restore(void *mem, size_t size);
 
+/**
+ * struct luo_session - Represents an active or incoming Live Update session.
+ * @name:      A unique name for this session, used for identification and
+ *             retrieval.
+ * @files_xa:  An xarray used to store the files associated with this session.
+ * @ser:       Pointer to the serialized data for this session.
+ * @count:     A counter tracking the number of files currently stored in the
+ *             @files_xa for this session.
+ * @list:      A list_head member used to link this session into a global list
+ *             of either outgoing (to be preserved) or incoming (restored from
+ *             previous kernel) sessions.
+ * @retrieved: A boolean flag indicating whether this session has been retrieved
+ *             by a consumer in the new kernel. Valid only during the
+ *             LIVEUPDATE_STATE_UPDATED state.
+ * @mutex:     Session lock, protects files_xa, and count.
+ * @state:     State of this session: prepared/frozen/updated/normal.
+ * @files:     The physical address of a contiguous memory block that holds
+ *             the serialized state of files.
+ */
+struct luo_session {
+	char name[LIVEUPDATE_SESSION_NAME_LENGTH];
+	struct xarray files_xa;
+	struct luo_session_ser *ser;
+	long count;
+	struct list_head list;
+	bool retrieved;
+	struct mutex mutex;
+	enum liveupdate_state state;
+	u64 files;
+};
+
+int luo_session_create(const char *name, struct file **filep);
+int luo_session_retrieve(const char *name, struct file **filep);
+
 void luo_subsystems_startup(void *fdt);
 int luo_subsystems_fdt_setup(void *fdt);
 int luo_do_subsystems_prepare_calls(void);

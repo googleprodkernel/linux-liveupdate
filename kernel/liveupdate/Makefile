@@ -3,6 +3,7 @@
 luo-y :=								\
 		luo_core.o						\
 		luo_ioctl.o						\
+		luo_session.o						\
 		luo_subsystems.o
 
 obj-$(CONFIG_KEXEC_HANDOVER)		+= kexec_handover.o
