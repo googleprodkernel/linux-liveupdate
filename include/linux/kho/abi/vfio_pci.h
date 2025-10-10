@@ -9,6 +9,9 @@
 #ifndef _LINUX_LIVEUPDATE_ABI_VFIO_PCI_H
 #define _LINUX_LIVEUPDATE_ABI_VFIO_PCI_H
 
+#include <linux/compiler.h>
+#include <linux/types.h>
+
 /**
  * DOC: VFIO PCI Live Update ABI
  *
@@ -24,5 +27,17 @@
  */
 
 #define VFIO_PCI_LUO_FH_COMPATIBLE "vfio-pci-v1"
+
+/**
+ * struct vfio_pci_core_device_ser - Serialized state of a single VFIO PCI
+ * device.
+ *
+ * @bdf: The device's PCI bus, device, and function number.
+ * @domain: The device's PCI domain number (segment).
+ */
+struct vfio_pci_core_device_ser {
+	u16 bdf;
+	u16 domain;
+} __packed;
 
 #endif /* _LINUX_LIVEUPDATE_ABI_VFIO_PCI_H */

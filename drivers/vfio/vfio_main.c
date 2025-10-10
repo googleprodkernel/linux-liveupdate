@@ -1437,15 +1437,6 @@ const struct file_operations vfio_device_fops = {
 #endif
 };
 
-static struct vfio_device *vfio_device_from_file(struct file *file)
-{
-	struct vfio_device_file *df = file->private_data;
-
-	if (file->f_op != &vfio_device_fops)
-		return NULL;
-	return df->device;
-}
-
 /**
  * vfio_file_is_valid - True if the file is valid vfio file
  * @file: VFIO group file or VFIO device file
