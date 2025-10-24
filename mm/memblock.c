@@ -2447,6 +2447,7 @@ int reserve_mem_release_by_name(const char *name)
 
 static int __init prepare_kho_fdt(void)
 {
+	bool fdt_folio_preserved = false;
 	int err = 0, i;
 	struct page *fdt_page;
 	void *fdt;
@@ -2462,12 +2463,14 @@ static int __init prepare_kho_fdt(void)
 
 	err |= fdt_begin_node(fdt, "");
 	err |= fdt_property_string(fdt, "compatible", MEMBLOCK_KHO_NODE_COMPATIBLE);
-	for (i = 0; i < reserved_mem_count; i++) {
+	for (i = 0; !err && i < reserved_mem_count; i++) {
 		struct reserve_mem_table *map = &reserved_mem_table[i];
 		struct page *page = phys_to_page(map->start);
 		unsigned int nr_pages = map->size >> PAGE_SHIFT;
 
-		err |= kho_preserve_pages(page, nr_pages);
+		err = kho_preserve_pages(page, nr_pages);
+		if (err)
+			break;
 		err |= fdt_begin_node(fdt, map->name);
 		err |= fdt_property_string(fdt, "compatible", RESERVE_MEM_KHO_NODE_COMPATIBLE);
 		err |= fdt_property(fdt, "start", &map->start, sizeof(map->start));
@@ -2477,12 +2480,27 @@ static int __init prepare_kho_fdt(void)
 	err |= fdt_end_node(fdt);
 	err |= fdt_finish(fdt);
 
-	err |= kho_preserve_folio(page_folio(fdt_page));
-
 	if (!err)
+		err = kho_preserve_folio(page_folio(fdt_page));
+
+	if (!err) {
+		fdt_folio_preserved = true;
 		err = kho_add_subtree(MEMBLOCK_KHO_FDT, fdt);
+	}
 
 	if (err) {
+		int nr_reserve_map_preserved = i;
+
+		for (i = 0; i < nr_reserve_map_preserved; i++) {
+			struct reserve_mem_table *map = &reserved_mem_table[i];
+			struct page *page = phys_to_page(map->start);
+			unsigned int nr_pages = map->size >> PAGE_SHIFT;
+
+			kho_unpreserve_pages(page, nr_pages);
+		}
+		if (fdt_folio_preserved)
+			kho_unpreserve_folio(page_folio(fdt_page));
+
 		pr_err("failed to prepare memblock FDT for KHO: %d\n", err);
 		put_page(fdt_page);
 	}
