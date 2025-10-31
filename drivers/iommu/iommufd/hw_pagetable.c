@@ -23,6 +23,7 @@ void iommufd_hwpt_paging_destroy(struct iommufd_object *obj)
 		container_of(obj, struct iommufd_hwpt_paging, common.obj);
 
 	if (!list_empty(&hwpt_paging->hwpt_item)) {
+		/* unreachable if !hwpt_paging->ioas */
 		mutex_lock(&hwpt_paging->ioas->mutex);
 		list_del(&hwpt_paging->hwpt_item);
 		mutex_unlock(&hwpt_paging->ioas->mutex);
@@ -32,7 +33,9 @@ void iommufd_hwpt_paging_destroy(struct iommufd_object *obj)
 	}
 
 	__iommufd_hwpt_destroy(&hwpt_paging->common);
-	refcount_dec(&hwpt_paging->ioas->obj.users);
+
+	if (hwpt_paging->ioas)
+		refcount_dec(&hwpt_paging->ioas->obj.users);
 }
 
 void iommufd_hwpt_paging_abort(struct iommufd_object *obj)
@@ -41,9 +44,11 @@ void iommufd_hwpt_paging_abort(struct iommufd_object *obj)
 		container_of(obj, struct iommufd_hwpt_paging, common.obj);
 
 	/* The ioas->mutex must be held until finalize is called. */
-	lockdep_assert_held(&hwpt_paging->ioas->mutex);
+	if (hwpt_paging->ioas)
+		lockdep_assert_held(&hwpt_paging->ioas->mutex);
 
 	if (!list_empty(&hwpt_paging->hwpt_item)) {
+		/* unreachable if !hwpt_paging->ioas */
 		list_del_init(&hwpt_paging->hwpt_item);
 		iopt_table_remove_domain(&hwpt_paging->ioas->iopt,
 					 hwpt_paging->common.domain);
@@ -457,6 +462,9 @@ int iommufd_hwpt_set_dirty_tracking(struct iommufd_ucmd *ucmd)
 		return PTR_ERR(hwpt_paging);
 
 	ioas = hwpt_paging->ioas;
+	if (!ioas)
+		return -EINVAL;
+
 	enable = cmd->flags & IOMMU_HWPT_DIRTY_TRACKING_ENABLE;
 
 	rc = iopt_set_dirty_tracking(&ioas->iopt, hwpt_paging->common.domain,
@@ -482,6 +490,9 @@ int iommufd_hwpt_get_dirty_bitmap(struct iommufd_ucmd *ucmd)
 		return PTR_ERR(hwpt_paging);
 
 	ioas = hwpt_paging->ioas;
+	if (!ioas)
+		return -EINVAL;
+
 	rc = iopt_read_and_clear_dirty_data(
 		&ioas->iopt, hwpt_paging->common.domain, cmd->flags, cmd);
 
