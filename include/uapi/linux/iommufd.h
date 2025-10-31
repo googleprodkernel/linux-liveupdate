@@ -57,6 +57,8 @@ enum {
 	IOMMUFD_CMD_IOAS_CHANGE_PROCESS = 0x92,
 	IOMMUFD_CMD_VEVENTQ_ALLOC = 0x93,
 	IOMMUFD_CMD_HW_QUEUE_ALLOC = 0x94,
+	IOMMUFD_CMD_HWPT_LU_SET_PRESERVED = 0x95,
+	IOMMUFD_CMD_HWPT_LU_RESTORE = 0x96,
 };
 
 /**
@@ -1289,4 +1291,50 @@ struct iommu_hw_queue_alloc {
 	__aligned_u64 length;
 };
 #define IOMMU_HW_QUEUE_ALLOC _IO(IOMMUFD_TYPE, IOMMUFD_CMD_HW_QUEUE_ALLOC)
+
+/**
+ * struct iommu_hwpt_lu_set_preserved - ioctl(IOMMU_HWPT_LU_SET_PRESERVED)
+ * @size: sizeof(struct iommu_hwpt_lu_set_preserved)
+ * @hwpt_id: Iommufd object ID of the target HWPT
+ * @hwpt_token: Token to identify this hwpt upon restore
+ * @preserved: If non-zero, HWPT is preserved by liveupdate
+ *
+ * If preserved set to non-zero, the target HWPT will be preserved. Note that
+ * at least one device using the HWPT must be preserved, or else liveupdate will
+ * fail during prepare phase. Similarly, if a device is preserved, its HWPT
+ * must be preserved, or else liveupdate will fail during prepare phase.
+ *
+ * The hwpt_token is provided by userspace. If userspace enters a token
+ * already in use within this iommufd, -EADDRINUSE is returned from this ioctl.
+ */
+struct iommu_hwpt_lu_set_preserved {
+	__u32 size;
+	__u32 hwpt_id;
+	__u32 hwpt_token;
+	__u8 preserved;
+};
+#define IOMMU_HWPT_LU_SET_PRESERVED _IO(IOMMUFD_TYPE, IOMMUFD_CMD_HWPT_LU_SET_PRESERVED)
+
+/**
+ * struct iommu_hwpt_lu_restore - ioctl(IOMMU_HWPT_LU_RESTORE)
+ * @size: sizeof(struct iommu_hwpt_lu_restore)
+ * @pt_id: Output the ID of the recreated HWPT.
+ * @hwpt_token: Token to identify this hwpt
+ * @hwpt_alloc_flags: Combination of enum iommufd_hwpt_alloc_flags
+
+ * An immutable HWPT is restored without a parent IOAS, and the ID
+ * of this new HWPT is returned.
+ *
+ * Prior to calling this IOCTL, all devices that was formally bound to this
+ * HWPT must be rebound to this iommufd, otherwise this IOCTL will return
+ * -ENODEV.
+ */
+
+struct iommu_hwpt_lu_restore {
+	__u32 size;
+	__u32 pt_id;
+	__u32 hwpt_token;
+	__u32 hwpt_alloc_flags;
+};
+#define IOMMU_HWPT_LU_RESTORE _IO(IOMMUFD_TYPE, IOMMUFD_CMD_HWPT_LU_RESTORE)
 #endif

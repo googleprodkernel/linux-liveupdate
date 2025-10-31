@@ -11,6 +11,48 @@
 
 #include "iommufd_private.h"
 
+int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd)
+{
+	struct iommu_hwpt_lu_set_preserved *cmd = ucmd->cmd;
+	struct iommufd_hwpt_paging *hwpt_target, *hwpt;
+	struct iommufd_ctx *ictx = ucmd->ictx;
+	struct iommufd_object *obj;
+	unsigned long index;
+	int rc = 0;
+
+	/* TODO: return error if already prepared */
+
+	hwpt_target = iommufd_get_hwpt_paging(ucmd, cmd->hwpt_id);
+	if (IS_ERR(hwpt_target))
+		return PTR_ERR(hwpt_target);
+
+	xa_lock(&ictx->objects);
+	xa_for_each(&ictx->objects, index, obj) {
+		if (obj->type != IOMMUFD_OBJ_HWPT_PAGING)
+			continue;
+
+		hwpt = container_of(obj, struct iommufd_hwpt_paging, common.obj);
+
+		if (hwpt == hwpt_target)
+			continue;
+		if (!hwpt->lu_preserved)
+			continue;
+		if (hwpt->lu_token == cmd->hwpt_token) {
+			xa_unlock(&ictx->objects);
+			rc = -EADDRINUSE;
+			goto out;
+		}
+	}
+	xa_unlock(&ictx->objects);
+
+	hwpt_target->lu_preserved = cmd->preserved;
+	hwpt_target->lu_token = cmd->hwpt_token;
+
+out:
+	iommufd_put_object(ictx, &hwpt_target->common.obj);
+	return rc;
+}
+
 static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
 				      struct file *file, u64 *data)
 {
@@ -125,6 +167,11 @@ err_fput:
 err_folio_put:
 	folio_put(folio_lu);
 	return rc;
+}
+
+int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd)
+{
+	return -ENOTTY;
 }
 
 static void iommufd_liveupdate_finish(struct liveupdate_file_handler *handler,
