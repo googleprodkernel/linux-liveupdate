@@ -379,6 +379,10 @@ struct iommufd_hwpt_paging {
 	bool auto_domain : 1;
 	bool enforce_cache_coherency : 1;
 	bool nest_parent : 1;
+#ifdef CONFIG_LIVEUPDATE
+	bool lu_preserved : 1;
+	u32 lu_token;
+#endif
 	/* Head at iommufd_ioas::hwpt_list */
 	struct list_head hwpt_item;
 	struct iommufd_sw_msi_maps present_sw_msi;
@@ -720,6 +724,10 @@ struct iommufd_lu {
 
 int iommufd_liveupdate_register_lufs(void);
 int iommufd_liveupdate_unregister_lufs(void);
+
+
+int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd);
+int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd);
 #else
 static inline int iommufd_liveupdate_register_lufs(void)
 {
@@ -729,6 +737,16 @@ static inline int iommufd_liveupdate_register_lufs(void)
 static inline int iommufd_liveupdate_unregister_lufs(void)
 {
 	return 0;
+}
+
+static inline int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd)
+{
+	return -ENOTTY;
+}
+
+static inline int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd)
+{
+	return -ENOTTY;
 }
 #endif
 
