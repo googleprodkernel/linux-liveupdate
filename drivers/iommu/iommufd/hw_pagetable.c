@@ -23,6 +23,7 @@ void iommufd_hwpt_paging_destroy(struct iommufd_object *obj)
 		container_of(obj, struct iommufd_hwpt_paging, common.obj);
 
 	if (!list_empty(&hwpt_paging->hwpt_item)) {
+		/* unreachable if !hwpt_paging->ioas */
 		mutex_lock(&hwpt_paging->ioas->mutex);
 		list_del(&hwpt_paging->hwpt_item);
 		mutex_unlock(&hwpt_paging->ioas->mutex);
@@ -32,7 +33,9 @@ void iommufd_hwpt_paging_destroy(struct iommufd_object *obj)
 	}
 
 	__iommufd_hwpt_destroy(&hwpt_paging->common);
-	refcount_dec(&hwpt_paging->ioas->obj.users);
+
+	if (hwpt_paging->ioas)
+		refcount_dec(&hwpt_paging->ioas->obj.users);
 }
 
 void iommufd_hwpt_paging_abort(struct iommufd_object *obj)
@@ -41,9 +44,11 @@ void iommufd_hwpt_paging_abort(struct iommufd_object *obj)
 		container_of(obj, struct iommufd_hwpt_paging, common.obj);
 
 	/* The ioas->mutex must be held until finalize is called. */
-	lockdep_assert_held(&hwpt_paging->ioas->mutex);
+	if (hwpt_paging->ioas)
+		lockdep_assert_held(&hwpt_paging->ioas->mutex);
 
 	if (!list_empty(&hwpt_paging->hwpt_item)) {
+		/* unreachable if !hwpt_paging->ioas */
 		list_del_init(&hwpt_paging->hwpt_item);
 		iopt_table_remove_domain(&hwpt_paging->ioas->iopt,
 					 hwpt_paging->common.domain);
@@ -103,6 +108,8 @@ iommufd_hwpt_paging_enforce_cc(struct iommufd_hwpt_paging *hwpt_paging)
  * The caller must hold the ioas->mutex until after
  * iommufd_object_abort_and_destroy() or iommufd_object_finalize() is called on
  * the returned hwpt.
+ *
+ * If ioas is NULL, the HWPT will not have a parent IOAS and will be immutable.
  */
 struct iommufd_hwpt_paging *
 iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx, struct iommufd_ioas *ioas,
@@ -119,7 +126,8 @@ iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx, struct iommufd_ioas *ioas,
 	struct iommufd_hw_pagetable *hwpt;
 	int rc;
 
-	lockdep_assert_held(&ioas->mutex);
+	if (ioas)
+		lockdep_assert_held(&ioas->mutex);
 
 	if ((flags || user_data) && !ops->domain_alloc_paging_flags)
 		return ERR_PTR(-EOPNOTSUPP);
@@ -141,8 +149,10 @@ iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx, struct iommufd_ioas *ioas,
 
 	INIT_LIST_HEAD(&hwpt_paging->hwpt_item);
 	/* Pairs with iommufd_hw_pagetable_destroy() */
-	refcount_inc(&ioas->obj.users);
-	hwpt_paging->ioas = ioas;
+	if (ioas) {
+		refcount_inc(&ioas->obj.users);
+		hwpt_paging->ioas = ioas;
+	}
 	hwpt_paging->nest_parent = flags & IOMMU_HWPT_ALLOC_NEST_PARENT;
 
 	if (ops->domain_alloc_paging_flags) {
@@ -197,10 +207,12 @@ iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx, struct iommufd_ioas *ioas,
 			goto out_abort;
 	}
 
-	rc = iopt_table_add_domain(&ioas->iopt, hwpt->domain);
-	if (rc)
-		goto out_detach;
-	list_add_tail(&hwpt_paging->hwpt_item, &ioas->hwpt_list);
+	if (ioas) {
+		rc = iopt_table_add_domain(&ioas->iopt, hwpt->domain);
+		if (rc)
+			goto out_detach;
+		list_add_tail(&hwpt_paging->hwpt_item, &ioas->hwpt_list);
+	}
 	return hwpt_paging;
 
 out_detach:
@@ -457,6 +469,9 @@ int iommufd_hwpt_set_dirty_tracking(struct iommufd_ucmd *ucmd)
 		return PTR_ERR(hwpt_paging);
 
 	ioas = hwpt_paging->ioas;
+	if (!ioas)
+		return -EINVAL;
+
 	enable = cmd->flags & IOMMU_HWPT_DIRTY_TRACKING_ENABLE;
 
 	rc = iopt_set_dirty_tracking(&ioas->iopt, hwpt_paging->common.domain,
@@ -482,6 +497,9 @@ int iommufd_hwpt_get_dirty_bitmap(struct iommufd_ucmd *ucmd)
 		return PTR_ERR(hwpt_paging);
 
 	ioas = hwpt_paging->ioas;
+	if (!ioas)
+		return -EINVAL;
+
 	rc = iopt_read_and_clear_dirty_data(
 		&ioas->iopt, hwpt_paging->common.domain, cmd->flags, cmd);
 
