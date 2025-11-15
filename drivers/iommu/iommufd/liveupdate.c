@@ -165,10 +165,9 @@ out:
 	return rc;
 }
 
-static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
-				      struct file *file, u64 *data)
+static int iommufd_liveupdate_preserve(struct liveupdate_file_op_args *args)
 {
-	struct iommufd_ctx *ictx = iommufd_ctx_from_file(file);
+	struct iommufd_ctx *ictx = iommufd_ctx_from_file(args->file);
 	struct iommufd_lu iommufd_lu_counter = {0};
 	struct iommufd_lu *iommufd_lu;
 	struct folio *folio_lu;
@@ -203,7 +202,7 @@ static int iommufd_liveupdate_prepare(struct liveupdate_file_handler *handler,
 	if (rc)
 		goto err_folio_put;
 
-	*data = virt_to_phys(iommufd_lu);
+	args->serialized_data = virt_to_phys(iommufd_lu);
 
 	iommufd_ctx_put(ictx);
 	return 0;
@@ -216,17 +215,15 @@ err_ctx_put:
 	return rc;
 }
 
-static int iommufd_liveupdate_freeze(struct liveupdate_file_handler *handler,
-				     struct file *file, u64 *data)
+static int iommufd_liveupdate_freeze(struct liveupdate_file_op_args *args)
 {
 	/* No-Op; everything should be made read-only */
 	return 0;
 }
 
-static void iommufd_liveupdate_cancel(struct liveupdate_file_handler *handler,
-				      struct file *file, u64 data)
+static void iommufd_liveupdate_unpreserve(struct liveupdate_file_op_args *args)
 {
-	struct iommufd_ctx *ictx = iommufd_ctx_from_file(file);
+	struct iommufd_ctx *ictx = iommufd_ctx_from_file(args->file);
 	struct folio *folio_lu;
 
 	if (WARN_ON(IS_ERR(ictx)))
@@ -234,15 +231,14 @@ static void iommufd_liveupdate_cancel(struct liveupdate_file_handler *handler,
 
 	/* TODO: call iommu_unpreserve_domain for all preserved domains */
 
-	folio_lu = pfn_folio(PHYS_PFN(data));
+	folio_lu = pfn_folio(PHYS_PFN(args->serialized_data));
 	WARN_ON(kho_unpreserve_folio(folio_lu));
 	folio_put(folio_lu);
 
 	iommufd_ctx_put(ictx);
 }
 
-static int iommufd_liveupdate_retrieve(struct liveupdate_file_handler *handler,
-				       u64 data, struct file **file_p)
+static int iommufd_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 {
 	struct iommufd_lu *iommufd_lu;
 	struct iommufd_ctx *ictx;
@@ -250,7 +246,7 @@ static int iommufd_liveupdate_retrieve(struct liveupdate_file_handler *handler,
 	struct file *file;
 	int rc;
 
-	folio_lu = kho_restore_folio(data);
+	folio_lu = kho_restore_folio(args->serialized_data);
 	if (IS_ERR_OR_NULL(folio_lu))
 		return -EFAULT;
 
@@ -284,7 +280,7 @@ static int iommufd_liveupdate_retrieve(struct liveupdate_file_handler *handler,
 
 	iommufd_ctx_put(ictx);
 
-	*file_p = file;
+	args->file = file;
 
 	return 0;
 
@@ -430,8 +426,18 @@ err_free:
 	return rc;
 }
 
-static void iommufd_liveupdate_finish(struct liveupdate_file_handler *handler,
-				      struct file *file, u64 data, bool reclaimed)
+static bool iommufd_liveupdate_can_finish(struct liveupdate_file_op_args *args)
+{
+	if (!args->retrieved || !args->file) {
+		pr_warn("%s: fd not reclaimed\n", __func__);
+		return false;
+	}
+
+	/* Check if all the restore domain are not attached to any devices */
+	return true;
+}
+
+static void iommufd_liveupdate_finish(struct liveupdate_file_op_args *args)
 {
 	struct iommufd_hwpt_lu *hwpt_lu;
 	struct iommufd_lu *iommufd_lu;
@@ -439,12 +445,7 @@ static void iommufd_liveupdate_finish(struct liveupdate_file_handler *handler,
 	unsigned int i;
 	int rc;
 
-	if (!reclaimed || !file) {
-		pr_warn("%s: fd not reclaimed\n", __func__);
-		return /* -EBUSY */;
-	}
-
-	ictx = iommufd_ctx_from_file(file);
+	ictx = iommufd_ctx_from_file(args->file);
 	iommufd_lu = ictx->lu;
 
 	for (i = 0; i < iommufd_lu->nr_hwpts; i++) {
@@ -479,12 +480,13 @@ static bool iommufd_liveupdate_can_preserve(struct liveupdate_file_handler *hand
 }
 
 static struct liveupdate_file_ops iommufd_lu_file_ops = {
-	.prepare = iommufd_liveupdate_prepare,
-	.freeze = iommufd_liveupdate_freeze,
-	.cancel = iommufd_liveupdate_cancel,
-	.finish = iommufd_liveupdate_finish,
-	.retrieve = iommufd_liveupdate_retrieve,
 	.can_preserve = iommufd_liveupdate_can_preserve,
+	.preserve = iommufd_liveupdate_preserve,
+	.unpreserve = iommufd_liveupdate_unpreserve,
+	.freeze = iommufd_liveupdate_freeze,
+	.retrieve = iommufd_liveupdate_retrieve,
+	.can_finish = iommufd_liveupdate_can_finish,
+	.finish = iommufd_liveupdate_finish,
 };
 
 static struct liveupdate_file_handler iommufd_lu_handler = {
@@ -492,12 +494,10 @@ static struct liveupdate_file_handler iommufd_lu_handler = {
 	.ops = &iommufd_lu_file_ops,
 };
 
-int iommufd_liveupdate_register_lufs(void)
+static int __init iommufd_liveupdate_init(void)
 {
-	return liveupdate_register_file_handler(&iommufd_lu_handler);
+	WARN_ON_ONCE(liveupdate_register_file_handler(&iommufd_lu_handler));
+	return 0;
 }
 
-int iommufd_liveupdate_unregister_lufs(void)
-{
-	return liveupdate_unregister_file_handler(&iommufd_lu_handler);
-}
+subsys_initcall(iommufd_liveupdate_init);

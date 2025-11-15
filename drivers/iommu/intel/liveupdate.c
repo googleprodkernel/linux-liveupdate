@@ -142,7 +142,7 @@ error:
 	return ret;
 }
 
-static void unpreserve_state(struct iommu_ser *ser)
+/*static void unpreserve_state(struct iommu_ser *ser)
 {
 	pr_warn("Not implemented\n");
 }
@@ -188,9 +188,9 @@ static int preserve_state(struct iommu_ser *ser)
 	}
 
 	return 0;
-}
+}*/
 
-static struct iommu_ser *alloc_preserve_state_mem(void)
+/*static struct iommu_ser *alloc_preserve_state_mem(void)
 {
 	struct iommu_ser *ser_ptr;
 	struct iommu_ser ser;
@@ -226,9 +226,9 @@ error_preserve:
 	folio_put(folio);
 error:
 	return ERR_PTR(ret);
-}
+}*/
 
-static int intel_liveupdate_prepare(struct liveupdate_subsystem *handle, u64 *data)
+/*static int intel_liveupdate_prepare(struct liveupdate_subsystem *handle, u64 *data)
 {
 	struct iommu_ser *ser;
 	int ret;
@@ -252,9 +252,9 @@ static void intel_liveupdate_cancel(struct liveupdate_subsystem *handle, u64 dat
 {
 	pr_warn("Not implemented\n");
 }
-
+*/
 static struct iommu_ser *serialized_state;
-
+/*
 static void intel_liveupdate_finish(struct liveupdate_subsystem *handle, u64 data)
 {
 	serialized_state = NULL;
@@ -269,31 +269,14 @@ static int intel_liveupdate_freeze(struct liveupdate_subsystem *handle, u64 *dat
 
 	return 0;
 }
-
-static struct liveupdate_subsystem_ops intel_liveupdate_subsystem_ops = {
-	.prepare = intel_liveupdate_prepare,
-	.finish = intel_liveupdate_finish,
-	.cancel = intel_liveupdate_cancel,
-	.freeze = intel_liveupdate_freeze,
-};
-
-static struct liveupdate_subsystem intel_liveupdate_subsystem = {
-	.name = "intel-iommu",
-	.ops = &intel_liveupdate_subsystem_ops,
-};
-
+*/
 static struct iommu_ser *get_liveupdate_state(void)
 {
 	struct iommu_ser *ser;
-	u64 data;
-	int ret;
+	u64 data = 0;
 
 	if (serialized_state)
 		return serialized_state;
-
-	ret = liveupdate_get_subsystem_data(&intel_liveupdate_subsystem, &data);
-	if (WARN_ON_ONCE(ret))
-		return NULL;
 
 	if (!kho_restore_folio(data))
 		return NULL;
@@ -367,9 +350,6 @@ int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu)
 	struct iommu_ser *ser;
 	int ret;
 
-	if (!liveupdate_state_updated())
-		return -EINVAL;
-
 	ser = get_liveupdate_state();
 	if (!ser)
 		return -EINVAL;
@@ -392,10 +372,3 @@ int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu)
 	return ret;
 }
 
-static int __init intel_liveupdate_init(void)
-{
-	WARN_ON_ONCE(liveupdate_register_subsystem(&intel_liveupdate_subsystem));
-	return 0;
-}
-
-late_initcall(intel_liveupdate_init);

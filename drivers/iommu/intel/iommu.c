@@ -671,7 +671,7 @@ static int iommu_alloc_root_entry(struct intel_iommu *iommu)
 {
 	struct root_entry *root;
 
-#ifdef CONFIG_LIVEUPDATE
+#if 0 //CONFIG_LIVEUPDATE
 	if (!intel_iommu_liveupdate_restore_root_table(iommu) &&
 	    iommu->root_entry) {
 		__iommu_flush_cache(iommu, iommu->root_entry, ROOT_SIZE);
@@ -3871,7 +3871,7 @@ const struct iommu_domain_ops intel_fs_paging_domain_ops = {
 	.free = intel_iommu_domain_free,
 	.enforce_cache_coherency = intel_iommu_enforce_cache_coherency_fs,
 #ifdef CONFIG_LIVEUPDATE
-	.preserve = intel_iommu_domain_liveupdate_preserve,
+	//.preserve = intel_iommu_domain_liveupdate_preserve,
 #endif
 };
 
@@ -3885,7 +3885,7 @@ const struct iommu_domain_ops intel_ss_paging_domain_ops = {
 	.free = intel_iommu_domain_free,
 	.enforce_cache_coherency = intel_iommu_enforce_cache_coherency_ss,
 #ifdef CONFIG_LIVEUPDATE
-	.preserve = intel_iommu_domain_liveupdate_preserve,
+	//.preserve = intel_iommu_domain_liveupdate_preserve,
 #endif
 };
 

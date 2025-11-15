@@ -746,18 +746,10 @@ struct iommufd_lu {
 	struct iommufd_attach_lu *attaches;
 };
 
-int iommufd_liveupdate_register_lufs(void);
-int iommufd_liveupdate_unregister_lufs(void);
-
 int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd);
 int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd);
 #else
 static inline int iommufd_liveupdate_register_lufs(void)
-{
-	return 0;
-}
-
-static inline int iommufd_liveupdate_unregister_lufs(void)
 {
 	return 0;
 }

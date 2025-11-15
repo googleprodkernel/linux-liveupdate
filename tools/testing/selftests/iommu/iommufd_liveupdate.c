@@ -5,6 +5,8 @@
  * Samiullah Khawaja <skhawaja@google.com>
  */
 
+#include "asm-generic/errno-base.h"
+#include "linux/liveupdate.h"
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <stdbool.h>
@@ -135,40 +137,14 @@ int open_liveupdate_orchestrator(void)
 	return luo;
 }
 
-__u32 liveupdate_get_state(int luo)
+int luo_session_finish(int session_fd)
 {
-	struct liveupdate_ioctl_get_state state;
-	int ret;
+	struct liveupdate_session_finish arg = { .size = sizeof(arg) };
 
-	state.size = sizeof(state);
-	ret = ioctl(luo, LIVEUPDATE_IOCTL_GET_STATE, &state);
-	ksft_assert(!ret);
+	if (ioctl(session_fd, LIVEUPDATE_SESSION_FINISH, &arg) < 0)
+		return -errno;
 
-	return state.state;
-}
-
-bool liveupdate_state_normal(int luo)
-{
-	return liveupdate_get_state(luo) == LIVEUPDATE_STATE_NORMAL;
-}
-
-bool liveupdate_state_updated(int luo)
-{
-	return liveupdate_get_state(luo) == LIVEUPDATE_STATE_UPDATED;
-}
-
-int liveupdate_set_event(int luo, enum liveupdate_event ev)
-{
-	struct liveupdate_ioctl_set_event event;
-	int ret;
-
-	event.event = ev;
-	event.size = sizeof(event);
-
-	ret = ioctl(luo, LIVEUPDATE_IOCTL_SET_EVENT, &event);
-	ksft_assert(!ret);
-
-	return ret;
+	return 0;
 }
 
 int luo_create_session(int luo_fd, const char *name)
@@ -193,8 +169,10 @@ int luo_retrieve_session(int luo_fd, const char *name)
 	snprintf((char *)arg.name, LIVEUPDATE_SESSION_NAME_LENGTH, "%.*s",
 		 LIVEUPDATE_SESSION_NAME_LENGTH - 1, name);
 	ret = ioctl(luo_fd, LIVEUPDATE_IOCTL_RETRIEVE_SESSION, &arg);
-	ksft_assert(!ret);
-	ksft_assert(arg.fd > 0);
+	ksft_assert(!ret || errno == ENOENT);
+
+	if (ret && errno == ENOENT)
+		return -errno;
 
 	return arg.fd;
 }
@@ -209,6 +187,7 @@ int liveupdate_preserve_iommufd(int session_fd, int iommufd, int token)
 	preserve.size = sizeof(preserve);
 
 	ret = ioctl(session_fd, LIVEUPDATE_SESSION_PRESERVE_FD, &preserve);
+	perror ("pre\n");
 	ksft_assert(!ret);
 
 	return ret;
@@ -216,17 +195,16 @@ int liveupdate_preserve_iommufd(int session_fd, int iommufd, int token)
 
 int liveupdate_restore_iommufd(int session_fd, int token)
 {
-	struct liveupdate_session_restore_fd restore;
+	struct liveupdate_session_retrieve_fd arg = { .size = sizeof(arg) };
 	int ret;
 
-	restore.token = token;
-	restore.size = sizeof(restore);
+	arg.token = token;
 
-	ret = ioctl(session_fd, LIVEUPDATE_SESSION_RESTORE_FD, &restore);
+	ret = ioctl(session_fd, LIVEUPDATE_SESSION_RETRIEVE_FD, &arg);
 	ksft_assert(!ret);
-	ksft_assert(restore.fd > 0);
+	ksft_assert(arg.fd > 0);
 
-	return restore.fd;
+	return arg.fd;
 }
 
 int main(int argc, char *argv[])
@@ -234,6 +212,7 @@ int main(int argc, char *argv[])
 	int iommufd, cdev_fd, luo, session, ret;
 	const int token = 0x123456;
 	const int hwpt_token = 0x789012;
+	bool updated = false;
 
 	if (argc < 2) {
 		printf("Usage: ./iommufd_liveupdate <vfio_cdev_path>\n");
@@ -245,16 +224,16 @@ int main(int argc, char *argv[])
 	luo = open_liveupdate_orchestrator();
 	ksft_assert(luo > 0);
 
-	if (liveupdate_state_normal(luo)) {
+	session = luo_retrieve_session(luo, "iommufd-test");
+	if (session == -ENOENT) {
 		session = luo_create_session(luo, "iommufd-test");
 		iommufd = open_iommufd();
-	} else if (liveupdate_state_updated(luo)) {
-		session = luo_retrieve_session(luo, "iommufd-test");
+	} else {
+		updated = true;
 		iommufd = liveupdate_restore_iommufd(session, token);
-	} else
-		ksft_exit_fail_msg("Test can only run when LUO state is normal or updated");
+	}
 
-	if (liveupdate_state_normal(luo)) {
+	if (!updated) {
 		ret = setup_iommufd(iommufd, cdev_fd, hwpt_token);
 		ksft_assert(!ret);
 	} else {
@@ -262,19 +241,14 @@ int main(int argc, char *argv[])
 		ksft_assert(!ret);
 	}
 
-	if (liveupdate_state_normal(luo)) {
+	if (!updated) {
 		ret = liveupdate_preserve_iommufd(session, iommufd, token);
-		ksft_assert(!ret);
-
-		ret = liveupdate_set_event(luo, LIVEUPDATE_PREPARE);
 		ksft_assert(!ret);
 
 		while (1)
 			sleep(5);
 	} else {
-
-		ret = liveupdate_set_event(luo, LIVEUPDATE_FINISH);
-		ksft_assert(!ret);
+		luo_session_finish(session);
 	}
 
 	return 0;

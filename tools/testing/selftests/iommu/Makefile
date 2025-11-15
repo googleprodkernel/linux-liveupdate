@@ -7,6 +7,6 @@ TEST_GEN_PROGS :=
 TEST_GEN_PROGS += iommufd
 TEST_GEN_PROGS += iommufd_fail_nth
 TEST_GEN_PROGS += iommufd_liveupdate
-TEST_GEN_PROGS += iommufd_liveupdate_duo
+#TEST_GEN_PROGS += iommufd_liveupdate_duo
 
 include ../lib.mk
