@@ -732,9 +732,6 @@ struct iommufd_lu {
 	struct iommufd_hwpt_lu hwpts[];
 };
 
-int iommufd_liveupdate_register_lufs(void);
-int iommufd_liveupdate_unregister_lufs(void);
-
 int iommufd_hwpt_lu_set_preserved(struct iommufd_ucmd *ucmd);
 int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd);
 
@@ -743,11 +740,6 @@ int iommufd_hwpt_lu_restore(struct iommufd_ucmd *ucmd);
 #define iommu_domain_has_attachments(x) (false)
 #else
 static inline int iommufd_liveupdate_register_lufs(void)
-{
-	return 0;
-}
-
-static inline int iommufd_liveupdate_unregister_lufs(void)
 {
 	return 0;
 }

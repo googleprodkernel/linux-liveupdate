@@ -149,28 +149,6 @@ int open_liveupdate_orchestrator(void)
 	return luo;
 }
 
-__u32 liveupdate_get_state(int luo)
-{
-	struct liveupdate_ioctl_get_state state;
-	int ret;
-
-	state.size = sizeof(state);
-	ret = ioctl(luo, LIVEUPDATE_IOCTL_GET_STATE, &state);
-	ksft_assert(!ret);
-
-	return state.state;
-}
-
-bool liveupdate_state_normal(int luo)
-{
-	return liveupdate_get_state(luo) == LIVEUPDATE_STATE_NORMAL;
-}
-
-bool liveupdate_state_updated(int luo)
-{
-	return liveupdate_get_state(luo) == LIVEUPDATE_STATE_UPDATED;
-}
-
 int liveupdate_set_event(int luo, enum liveupdate_event ev)
 {
 	struct liveupdate_ioctl_set_event event;
@@ -248,6 +226,7 @@ int main(int argc, char *argv[])
 	int iommufd, cdev1_fd, cdev2_fd, luo, session, ret;
 	const int token = 0x123456;
 	const int hwpt_token = 0x789012;
+	bool updated;
 
 	if (argc < 3) {
 		printf("Usage: ./iommufd_liveupdate_duo <vfio_cdev_path_1> <vfio_cdev_path_2>\n");
@@ -260,16 +239,16 @@ int main(int argc, char *argv[])
 	luo = open_liveupdate_orchestrator();
 	ksft_assert(luo > 0);
 
+	session = luo_retrieve_session(luo, "iommufd-test");
 	if (liveupdate_state_normal(luo)) {
 		session = luo_create_session(luo, "iommufd-test");
 		iommufd = open_iommufd();
-	} else if (liveupdate_state_updated(luo)) {
-		session = luo_retrieve_session(luo, "iommufd-test");
+	} else {
+		updated = true;
 		iommufd = liveupdate_restore_iommufd(session, token);
-	} else
-		ksft_exit_fail_msg("Test can only run when LUO state is normal or updated");
+	}
 
-	if (liveupdate_state_normal(luo)) {
+	if (!updated) {
 		ret = setup_iommufd(iommufd, cdev1_fd, cdev2_fd, hwpt_token);
 		ksft_assert(!ret);
 	} else {
@@ -277,7 +256,7 @@ int main(int argc, char *argv[])
 		ksft_assert(!ret);
 	}
 
-	if (liveupdate_state_normal(luo)) {
+	if (!updated) {
 		ret = liveupdate_preserve_iommufd(session, iommufd, token);
 		ksft_assert(!ret);
 

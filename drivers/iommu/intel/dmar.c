@@ -2362,10 +2362,6 @@ static int dmar_device_hotplug(acpi_handle handle, bool insert)
 	if (tmp == NULL)
 		return 0;
 
-	guard_liveupdate_state_read();
-	if (!liveupdate_state_normal())
-		return -EBUSY;
-
 	down_write(&dmar_global_lock);
 	if (insert)
 		ret = dmar_hotplug_insert(tmp);
