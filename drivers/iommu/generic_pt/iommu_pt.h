@@ -944,6 +944,27 @@ static void preserved_folio_put(struct folio *folio)
 }
 
 /**
+ * unpreserve() - Unpreserve page tables and other state of a domain.
+ * @domain: Domain to unpreserve
+ */
+void DOMAIN_NS(unpreserve)(struct iommu_domain *domain, struct iommu_domain_ser *ser)
+{
+	struct pt_iommu *iommu_table =
+		container_of(domain, struct pt_iommu, domain);
+	struct pt_common *common = common_from_iommu(iommu_table);
+	struct pt_range range = pt_all_range(common);
+	struct pt_iommu_collect_args collect = {
+		.free_list = IOMMU_PAGES_LIST_INIT(collect.free_list),
+	};
+
+	iommu_pages_list_add(&collect.free_list, range.top_table);
+	pt_walk_range(&range, __collect_tables, &collect);
+
+	preserved_folio_put(virt_to_folio(ser->data));
+	iommu_unpreserve_pages(&collect.free_list, -1);
+}
+EXPORT_SYMBOL_NS_GPL(DOMAIN_NS(unpreserve), "GENERIC_PT_IOMMU");
+/**
  * preserve() - Preserve page tables and other state of a domain.
  * @domain: Domain to preserve
  *
@@ -983,82 +1004,6 @@ int DOMAIN_NS(preserve)(struct iommu_domain *domain, struct iommu_domain_ser *se
 	return 0;
 preserve_err:
 	preserved_folio_put(folio);
-
-#if 0
-  struct pt_iommu *iommu_table =
-		container_of(domain, struct pt_iommu, domain);
-	pt_vaddr_t pgsize_bitmap = iommu_table->domain.pgsize_bitmap;
-	struct pt_common *common = common_from_iommu(iommu_table);
-	struct iommu_iotlb_gather iotlb_gather;
-	pt_vaddr_t len = pgsize * pgcount;
-	struct pt_iommu_map_args map = {
-		.iotlb_gather = &iotlb_gather,
-		.oa = paddr,
-		.leaf_pgsize_lg2 = vaffs(pgsize),
-	};
-	bool single_page = false;
-	struct pt_range range;
-	int ret;
-
-	iommu_iotlb_gather_init(&iotlb_gather);
-
-	if (WARN_ON(!(prot & (IOMMU_READ | IOMMU_WRITE))))
-		return -EINVAL;
-
-	/* Check the paddr doesn't exceed what the table can store */
-	if ((sizeof(pt_oaddr_t) < sizeof(paddr) &&
-	     (pt_vaddr_t)paddr > PT_VADDR_MAX) ||
-	    (common->max_oasz_lg2 != PT_VADDR_MAX_LG2 &&
-	     oalog2_div(paddr, common->max_oasz_lg2)))
-		return -ERANGE;
-
-	ret = pt_iommu_set_prot(common, &map.attrs, prot);
-	if (ret)
-		return ret;
-	map.attrs.gfp = gfp;
-
-	ret = make_range_no_check(common, &range, iova, len);
-	if (ret)
-		return ret;
-
-	/* Calculate target page size and level for the leaves */
-	if (pt_has_system_page_size(common) && pgsize == PAGE_SIZE &&
-	    pgcount == 1) {
-		PT_WARN_ON(!(pgsize_bitmap & PAGE_SIZE));
-		if (log2_mod(iova | paddr, PAGE_SHIFT))
-			return -ENXIO;
-		map.leaf_pgsize_lg2 = PAGE_SHIFT;
-		map.leaf_level = 0;
-		single_page = true;
-	} else {
-		map.leaf_pgsize_lg2 = pt_compute_best_pgsize(
-			pgsize_bitmap, range.va, range.last_va, paddr);
-		if (!map.leaf_pgsize_lg2)
-			return -ENXIO;
-		map.leaf_level =
-			pt_pgsz_lg2_to_level(common, map.leaf_pgsize_lg2);
-	}
-
-	ret = check_map_range(iommu_table, &range, &map);
-	if (ret)
-		return ret;
-
-	PT_WARN_ON(map.leaf_level > range.top_level);
-
-	ret = do_map(&range, common, single_page, &map);
-
-	/*
-	 * Table levels were freed and replaced with large items, flush any walk
-	 * cache that may refer to the freed levels.
-	 */
-	if (!iommu_pages_list_empty(&iotlb_gather.freelist))
-		iommu_iotlb_sync(&iommu_table->domain, &iotlb_gather);
-
-	/* Bytes successfully mapped */
-	PT_WARN_ON(!ret && map.oa - paddr != len);
-	*mapped += map.oa - paddr;
-	return ret;
-#endif
         return ret;
 }
 EXPORT_SYMBOL_NS_GPL(DOMAIN_NS(preserve), "GENERIC_PT_IOMMU");

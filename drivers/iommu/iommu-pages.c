@@ -138,7 +138,7 @@ void iommu_unpreserve_pages(struct iommu_pages_list *list, int count)
 	struct ioptdesc *iopt;
 
 	list_for_each_entry(iopt, &list->pages, iopt_freelist_elm) {
-		if (count--)
+		if (count > 0 && count--)
 			break;
 
 		kho_unpreserve_folio(ioptdesc_folio(iopt));
