@@ -496,7 +496,9 @@ static struct liveupdate_file_handler iommufd_lu_handler = {
 
 static int __init iommufd_liveupdate_init(void)
 {
-	WARN_ON_ONCE(liveupdate_register_file_handler(&iommufd_lu_handler));
+	if (!WARN_ON_ONCE(liveupdate_register_file_handler(&iommufd_lu_handler)))
+		WARN_ON_ONCE(iommu_liveupdate_register_flb(&iommufd_lu_handler));
+
 	return 0;
 }
 

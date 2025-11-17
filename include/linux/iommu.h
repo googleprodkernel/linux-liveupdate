@@ -12,6 +12,7 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/liveupdate.h>
 #include <linux/of.h>
 #include <linux/iova_bitmap.h>
 #include <linux/atomic.h>
@@ -254,6 +255,14 @@ struct iommu_domain {
 	atomic_t preserved;
 #endif
 };
+
+#ifdef CONFIG_LIVEUPDATE
+struct iommu_domain_ser {
+	u64 ID;
+	void *data;
+	char compatible[64];
+};
+#endif
 
 static inline bool iommu_is_dma_domain(struct iommu_domain *domain)
 {
@@ -603,15 +612,6 @@ __iommu_copy_struct_to_user(const struct iommu_user_data *dst_data,
 	__iommu_copy_struct_to_user(user_data, ksrc, data_type, sizeof(*ksrc), \
 				    offsetofend(typeof(*ksrc), min_last))
 
-#ifdef CONFIG_LIVEUPDATE
-extern struct rw_semaphore liveupdate_state_rwsem;
-#define guard_liveupdate_state_read() guard(rwsem_read)(&liveupdate_state_rwsem)
-#define guard_liveupdate_state_write() guard(rwsem_write)(&liveupdate_state_rwsem)
-#else
-#define guard_liveupdate_state_read()
-#define guard_liveupdate_state_write()
-#endif /* CONFIG_LIVEUPDATE */
-
 /**
  * struct iommu_ops - iommu ops and capabilities
  * @capable: check capability
@@ -795,7 +795,7 @@ struct iommu_domain_ops {
 				  unsigned long quirks);
 
 	void (*free)(struct iommu_domain *domain);
-	int (*preserve)(struct iommu_domain *domain);
+	int (*preserve)(struct iommu_domain *domain, struct iommu_domain_ser *ser);
 };
 
 /**
@@ -924,6 +924,7 @@ static inline struct iommu_domain *iommu_paging_domain_alloc(struct device *dev)
 
 #ifdef CONFIG_LIVEUPDATE
 extern int iommu_domain_preserve(struct iommu_domain *domain);
+extern int iommu_liveupdate_register_flb(struct liveupdate_file_handler *handler);
 #endif
 
 extern void iommu_domain_free(struct iommu_domain *domain);

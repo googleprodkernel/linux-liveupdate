@@ -6,6 +6,7 @@
 #include "iommu-pages.h"
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
+#include <linux/kexec_handover.h>
 #include <linux/mm.h>
 
 #define IOPTDESC_MATCH(pg_elm, elm)                    \
@@ -130,6 +131,42 @@ void iommu_put_pages_list(struct iommu_pages_list *list)
 		__iommu_free_desc(iopt);
 }
 EXPORT_SYMBOL_GPL(iommu_put_pages_list);
+
+#if IS_ENABLED(CONFIG_LIVEUPDATE)
+void iommu_unpreserve_pages(struct iommu_pages_list *list, int count)
+{
+	struct ioptdesc *iopt;
+
+	list_for_each_entry(iopt, &list->pages, iopt_freelist_elm) {
+		if (count--)
+			break;
+
+		kho_unpreserve_folio(ioptdesc_folio(iopt));
+	}
+}
+EXPORT_SYMBOL_GPL(iommu_unpreserve_pages);
+
+int iommu_preserve_pages(struct iommu_pages_list *list)
+{
+	struct ioptdesc *iopt;
+	int count = 0;
+	int ret;
+
+	list_for_each_entry(iopt, &list->pages, iopt_freelist_elm) {
+		ret = kho_preserve_folio(ioptdesc_folio(iopt));
+		if (ret) {
+			iommu_unpreserve_pages(list, count);
+			return ret;
+		}
+
+		++count;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(iommu_preserve_pages);
+
+#endif
 
 /**
  * iommu_pages_start_incoherent - Setup the page for cache incoherent operation
