@@ -21,6 +21,8 @@
 #include <linux/iommufd.h>
 #include <linux/idr.h>
 #include <linux/err.h>
+#include <linux/kexec_handover.h>
+#include <linux/liveupdate.h>
 #include <linux/pci.h>
 #include <linux/pci-ats.h>
 #include <linux/bitops.h>
@@ -2043,10 +2045,6 @@ static void iommu_domain_init(struct iommu_domain *domain, unsigned int type,
 	domain->owner = ops;
 	if (!domain->ops)
 		domain->ops = ops->default_domain_ops;
-
-#ifdef CONFIG_LIVEUPDATE
-	atomic_set(&domain->preserved, 0);
-#endif
 }
 
 static struct iommu_domain *
@@ -2098,21 +2096,121 @@ struct iommu_domain *iommu_paging_domain_alloc_flags(struct device *dev,
 EXPORT_SYMBOL_GPL(iommu_paging_domain_alloc_flags);
 
 #ifdef CONFIG_LIVEUPDATE
-DECLARE_RWSEM(liveupdate_state_rwsem);
+#define MAX_PRESERVE_DOMAINS 256
+
+struct iommu_ser {
+	u64 nr_domains;
+	union {
+		u64 domains_ser_phys;
+		struct iommu_domain_ser *domains_ser;
+	};
+};
+
+static struct folio *folio_alloc_preserved(size_t sz)
+{
+	struct folio *folio;
+	int ret;
+
+	folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, get_order(sz));
+	if (!folio)
+		return ERR_PTR(-ENOMEM);
+
+	ret = kho_preserve_folio(folio);
+	if (ret) {
+		folio_put(folio);
+		folio = ERR_PTR(ret);
+	}
+
+	return folio;
+}
+
+static void preserved_folio_put(struct folio *folio)
+{
+	kho_unpreserve_folio(folio);
+	folio_put(folio);
+}
+
+static void iommu_liveupdate_flb_free(struct iommu_ser *ser)
+{
+	if (ser->domains_ser)
+		preserved_folio_put(virt_to_folio(ser->domains_ser));
+	preserved_folio_put(virt_to_folio(ser));
+}
+
+static int iommu_liveupdate_flb_preserve(struct liveupdate_flb_op_args *argp) {
+	struct iommu_ser *ser = NULL;
+	struct folio *folio;
+
+	folio = folio_alloc_preserved(sizeof(*ser));
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+
+	ser = folio_address(folio);
+
+	folio =	folio_alloc_preserved(sizeof(struct iommu_domain_ser) *
+				      MAX_PRESERVE_DOMAINS);
+	if (IS_ERR(folio))
+		goto err_free;
+
+	ser->domains_ser = folio_address(folio);
+	return 0;
+
+err_free:
+	iommu_liveupdate_flb_free(ser);
+	return PTR_ERR(folio);
+}
+
+static void iommu_liveupdate_flb_unpreserve(struct liveupdate_flb_op_args *argp) {
+}
+
+static void iommu_liveupdate_flb_finish(struct liveupdate_flb_op_args *argp) {
+}
+
+static void iommu_liveupdate_flb_retrieve(struct liveupdate_flb_op_args *argp) {
+}
+
+static struct liveupdate_flb_ops iommu_flb_ops = {
+	.preserve = iommu_liveupdate_flb_preserve,
+	.unpreserve = iommu_liveupdate_flb_unpreserve,
+	.finish = iommu_liveupdate_flb_finish,
+	.retrieve = iommu_liveupdate_flb_retrieve,
+};
+
+static struct liveupdate_flb iommu_flb = {
+	.compatible = "iommu",
+	.ops = &iommu_flb_ops,
+};
+
+int iommu_liveupdate_register_flb(struct liveupdate_file_handler *handler)
+{
+	return liveupdate_register_flb(handler, &iommu_flb);
+}
+EXPORT_SYMBOL(iommu_liveupdate_register_flb);
 
 int iommu_domain_preserve(struct iommu_domain *domain)
 {
+	struct iommu_domain_ser domain_ser;
+	struct iommu_ser *ser;
 	int ret;
 
-	lockdep_assert_held(&liveupdate_state_rwsem);
 	if (!domain->ops->preserve)
 		return -EOPNOTSUPP;
 
-	ret = domain->ops->preserve(domain);
-	if (!ret)
-		atomic_set(&domain->preserved, 1);
+	ret = liveupdate_flb_outgoing_locked(&iommu_flb, (void **) &ser);
+	if (ret)
+		return ret;
 
-	return ret;
+	if (ser->nr_domains == MAX_PRESERVE_DOMAINS)
+		return -ENOMEM;
+
+	ret = domain->ops->preserve(domain, &domain_ser);
+	if (ret)
+		return ret;
+
+	domain_ser.ID = ser->nr_domains;
+	ser->domains_ser[ser->nr_domains++] = domain_ser;
+
+	return domain_ser.ID;
 }
 EXPORT_SYMBOL_GPL(iommu_domain_preserve);
 #endif
@@ -3897,3 +3995,6 @@ int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
 	return ret;
 }
 #endif /* CONFIG_IRQ_MSI_IOMMU */
+
+#if IS_ENABLED(CONFIG_LIVEUPDATE)
+#endif
