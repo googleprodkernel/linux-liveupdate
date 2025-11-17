@@ -2209,10 +2209,31 @@ int iommu_domain_preserve(struct iommu_domain *domain)
 
 	domain_ser.ID = ser->nr_domains;
 	ser->domains_ser[ser->nr_domains++] = domain_ser;
+	domain->preserved_id = domain_ser.ID;
 
 	return domain_ser.ID;
 }
 EXPORT_SYMBOL_GPL(iommu_domain_preserve);
+
+int iommu_domain_unpreserve(struct iommu_domain *domain)
+{
+	struct iommu_domain_ser *domain_ser;
+	struct iommu_ser *ser;
+	int ret;
+
+	if (!domain->ops->unpreserve)
+		return -EOPNOTSUPP;
+
+	ret = liveupdate_flb_outgoing_locked(&iommu_flb, (void **) &ser);
+	if (ret)
+		return ret;
+
+	domain_ser = &ser->domains_ser[domain->preserved_id];
+	domain->ops->unpreserve(domain, domain_ser);
+	domain_ser->data = 0;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(iommu_domain_unpreserve);
 #endif
 
 void iommu_domain_free(struct iommu_domain *domain)
