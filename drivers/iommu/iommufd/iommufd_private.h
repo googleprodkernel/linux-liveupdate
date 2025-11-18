@@ -730,6 +730,7 @@ struct iommufd_attach_lu {
 	ioasid_t pasid;
 	int pci_domain; /* pci_domain_nr(pdev->bus) */
 	u16 dev_id; /* pci_dev_id(dev) */
+	u64 preserve_id;
 };
 
 struct iommufd_lu {

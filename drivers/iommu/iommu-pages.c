@@ -133,6 +133,18 @@ void iommu_put_pages_list(struct iommu_pages_list *list)
 EXPORT_SYMBOL_GPL(iommu_put_pages_list);
 
 #if IS_ENABLED(CONFIG_LIVEUPDATE)
+void iommu_unpreserve_page(void *virt)
+{
+	kho_unpreserve_folio(ioptdesc_folio(virt_to_ioptdesc(virt)));
+}
+EXPORT_SYMBOL_GPL(iommu_unpreserve_page);
+
+int iommu_preserve_page(void *virt)
+{
+	return kho_preserve_folio(ioptdesc_folio(virt_to_ioptdesc(virt)));
+}
+EXPORT_SYMBOL_GPL(iommu_preserve_page);
+
 void iommu_unpreserve_pages(struct iommu_pages_list *list, int count)
 {
 	struct ioptdesc *iopt;

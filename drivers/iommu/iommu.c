@@ -2096,13 +2096,23 @@ struct iommu_domain *iommu_paging_domain_alloc_flags(struct device *dev,
 EXPORT_SYMBOL_GPL(iommu_paging_domain_alloc_flags);
 
 #ifdef CONFIG_LIVEUPDATE
-#define MAX_PRESERVE_DOMAINS 256
+#define MAX_PRESERVED_OBJS 256
 
 struct iommu_ser {
 	u64 nr_domains;
 	union {
 		u64 domains_ser_phys;
 		struct iommu_domain_ser *domains_ser;
+	};
+	u64 nr_devices;
+	union {
+		u64 devices_ser_phys;
+		struct device_ser *devices_ser;
+	};
+	u64 nr_iommu_devices;
+	union {
+		u64 iommu_devices_ser_phys;
+		struct iommu_device_ser *iommu_devices_ser;
 	};
 };
 
@@ -2134,6 +2144,13 @@ static void iommu_liveupdate_flb_free(struct iommu_ser *ser)
 {
 	if (ser->domains_ser)
 		preserved_folio_put(virt_to_folio(ser->domains_ser));
+
+	if (ser->devices_ser)
+		preserved_folio_put(virt_to_folio(ser->devices_ser));
+
+	if (ser->iommu_devices_ser)
+		preserved_folio_put(virt_to_folio(ser->devices_ser));
+
 	preserved_folio_put(virt_to_folio(ser));
 }
 
@@ -2148,11 +2165,23 @@ static int iommu_liveupdate_flb_preserve(struct liveupdate_flb_op_args *argp) {
 	ser = folio_address(folio);
 
 	folio =	folio_alloc_preserved(sizeof(struct iommu_domain_ser) *
-				      MAX_PRESERVE_DOMAINS);
+				      MAX_PRESERVED_OBJS);
 	if (IS_ERR(folio))
 		goto err_free;
 
 	ser->domains_ser = folio_address(folio);
+	folio =	folio_alloc_preserved(sizeof(struct device_ser) *
+				      MAX_PRESERVED_OBJS);
+	if (IS_ERR(folio))
+		goto err_free;
+
+	ser->devices_ser = folio_address(folio);
+	folio =	folio_alloc_preserved(sizeof(struct iommu_device_ser) *
+				      MAX_PRESERVED_OBJS);
+	if (IS_ERR(folio))
+		goto err_free;
+
+	ser->iommu_devices_ser = folio_address(folio);
 	return 0;
 
 err_free:
@@ -2187,6 +2216,33 @@ int iommu_liveupdate_register_flb(struct liveupdate_file_handler *handler)
 }
 EXPORT_SYMBOL(iommu_liveupdate_register_flb);
 
+static inline bool iommu_device_ser_match(struct iommu_device_ser * iommu1,
+				   struct iommu_device_ser *iommu2)
+{
+	return iommu1->token == iommu2->token ||
+			!strncmp(iommu1->compatible, iommu2->compatible, sizeof(iommu2->token));
+}
+
+int iommu_get_preserved_data(struct iommu_device_ser *iommu_device_ser)
+{
+	struct iommu_ser *ser;
+	int ret, i;
+
+	ret = liveupdate_flb_outgoing_locked(&iommu_flb, (void **) &ser);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ser->nr_iommu_devices; ++i) {
+		if (iommu_device_ser_match(&ser->iommu_devices_ser[i], iommu_device_ser)) {
+			*iommu_device_ser = ser->iommu_devices_ser[i];
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+EXPORT_SYMBOL(iommu_get_preserved_data);
+
 int iommu_domain_preserve(struct iommu_domain *domain)
 {
 	struct iommu_domain_ser domain_ser;
@@ -2200,18 +2256,17 @@ int iommu_domain_preserve(struct iommu_domain *domain)
 	if (ret)
 		return ret;
 
-	if (ser->nr_domains == MAX_PRESERVE_DOMAINS)
+	if (ser->nr_domains == MAX_PRESERVED_OBJS)
 		return -ENOMEM;
 
 	ret = domain->ops->preserve(domain, &domain_ser);
 	if (ret)
 		return ret;
 
-	domain_ser.ID = ser->nr_domains;
 	ser->domains_ser[ser->nr_domains++] = domain_ser;
-	domain->preserved_id = domain_ser.ID;
+	domain->preserved_id = ser->nr_domains;
 
-	return domain_ser.ID;
+	return domain->preserved_id;
 }
 EXPORT_SYMBOL_GPL(iommu_domain_preserve);
 
@@ -2228,12 +2283,82 @@ int iommu_domain_unpreserve(struct iommu_domain *domain)
 	if (ret)
 		return ret;
 
-	domain_ser = &ser->domains_ser[domain->preserved_id];
+	domain_ser = &ser->domains_ser[domain->preserved_id - 1];
 	domain->ops->unpreserve(domain, domain_ser);
 	domain_ser->data = 0;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(iommu_domain_unpreserve);
+
+static int iommu_preserve(struct iommu_device *iommu)
+{
+	struct iommu_device_ser iommu_device_ser;
+	struct iommu_ser *ser;
+	int ret;
+
+	if (!iommu->ops->preserve)
+		return -EOPNOTSUPP;
+
+	ret = liveupdate_flb_outgoing_locked(&iommu_flb, (void **) &ser);
+	if (ret)
+		return ret;
+
+	if (ser->nr_iommu_devices == MAX_PRESERVED_OBJS)
+		return -ENOMEM;
+
+	ret = iommu->ops->preserve(iommu, &iommu_device_ser);
+	if (ret)
+		return ret;
+
+	ser->iommu_devices_ser[ser->nr_iommu_devices++] = iommu_device_ser;
+	iommu->preserve_ID = ser->nr_iommu_devices;
+	return 0;
+}
+
+int iommu_preserve_device(struct iommu_domain *domain, struct device *dev)
+{
+	struct device_ser device_ser;
+	struct dev_iommu *iommu;
+	struct iommu_ser *ser;
+	int ret;
+
+	if (!dev_is_pci(dev))
+		return -EOPNOTSUPP;
+
+	iommu = dev_iommu_get(dev);
+	if (!iommu->iommu_dev->ops->preserve_device ||
+	    !iommu->iommu_dev->ops->preserve)
+		return -EOPNOTSUPP;
+
+
+	ret = liveupdate_flb_outgoing_locked(&iommu_flb, (void **) &ser);
+	if (ret)
+		return ret;
+
+	if (!iommu->iommu_dev->preserve_ID) {
+		ret = iommu_preserve(iommu->iommu_dev);
+		if (ret) {
+			return ret;
+		}
+	}
+
+	if (ser->nr_devices == MAX_PRESERVED_OBJS)
+		return -ENOMEM;
+
+	ret = iommu->iommu_dev->ops->preserve_device(dev, &device_ser);
+	if (ret)
+		return ret;
+
+	device_ser.domain_idx = domain->preserved_id - 1;
+	device_ser.iommu_idx = iommu->iommu_dev->preserve_ID - 1;
+	ser->devices_ser[ser->nr_devices++] = device_ser;
+	return ser->nr_devices;
+}
+
+extern int iommu_unpreserve_device(struct iommu_domain *domain, struct device *dev)
+{
+	return 0;
+}
 #endif
 
 void iommu_domain_free(struct iommu_domain *domain)

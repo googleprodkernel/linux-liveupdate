@@ -258,7 +258,21 @@ struct iommu_domain {
 
 #ifdef CONFIG_LIVEUPDATE
 struct iommu_domain_ser {
-	u64 ID;
+	void *data;
+	char compatible[64];
+};
+
+struct device_ser {
+	u64 token;
+	u64 domain_idx;
+	u64 iommu_idx;
+	void *data;
+	char compatible_domain[64];
+	char compatible_iommu[64];
+};
+
+struct iommu_device_ser {
+	u64 token;
 	void *data;
 	char compatible[64];
 };
@@ -717,6 +731,11 @@ struct iommu_ops {
 			   struct iommu_domain *parent_domain,
 			   const struct iommu_user_data *user_data);
 
+	int (*preserve_device)(struct device *dev, struct device_ser *device_ser);
+	void (*unpreserve_device)(struct device *dev, struct device_ser *device_ser);
+	int (*preserve)(struct iommu_device *iommu, struct iommu_device_ser *iommu_ser);
+	void (*unpreserve)(struct iommu_device *iommu, struct iommu_device_ser *iommu_ser);
+
 	const struct iommu_domain_ops *default_domain_ops;
 	struct module *owner;
 	struct iommu_domain *identity_domain;
@@ -817,6 +836,7 @@ struct iommu_device {
 	struct iommu_group *singleton_group;
 	u32 max_pasids;
 	bool ready;
+	u64 preserve_ID;
 };
 
 /**
@@ -927,6 +947,9 @@ static inline struct iommu_domain *iommu_paging_domain_alloc(struct device *dev)
 extern int iommu_domain_preserve(struct iommu_domain *domain);
 extern int iommu_domain_unpreserve(struct iommu_domain *domain);
 extern int iommu_liveupdate_register_flb(struct liveupdate_file_handler *handler);
+extern int iommu_preserve_device(struct iommu_domain *domain, struct device *dev);
+extern int iommu_unpreserve_device(struct iommu_domain *domain, struct device *dev);
+extern int iommu_get_preserved_data(struct iommu_device_ser *iommu_device_ser);
 #endif
 
 extern void iommu_domain_free(struct iommu_domain *domain);

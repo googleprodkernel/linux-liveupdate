@@ -150,6 +150,9 @@ static int iommufd_save_devices(struct iommufd_ctx *ictx,
 				attach_lu->pasid = pasid;
 				attach_lu->pci_domain = pci_domain_nr(pdev->bus);
 				attach_lu->dev_id = pci_dev_id(pdev);
+
+				attach_lu->preserve_id = iommu_preserve_device(hwpt->common.domain,
+									       idev->dev);
 			}
 		}
 	}

@@ -740,9 +740,6 @@ struct intel_iommu {
 	void *perf_statistic;
 
 	struct iommu_pmu *pmu;
-#ifdef CONFIG_LIVEUPDATE
-	atomic_t preserved;
-#endif
 };
 
 /* PCI domain-device relationship */
@@ -1281,7 +1278,10 @@ static inline int iopf_for_domain_replace(struct iommu_domain *new,
 }
 
 #ifdef CONFIG_LIVEUPDATE
-int intel_iommu_domain_liveupdate_preserve(struct iommu_domain *domain);
+int intel_iommu_preserve_device(struct device *dev, struct device_ser *device_ser);
+void intel_iommu_unpreserve_device(struct device *dev, struct device_ser *device_ser);
+int intel_iommu_preserve(struct iommu_device *iommu, struct iommu_device_ser *iommu_device_ser);
+void intel_iommu_unpreserve(struct iommu_device *iommu, struct iommu_device_ser *iommu_device_ser);
 int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu);
 #endif
 

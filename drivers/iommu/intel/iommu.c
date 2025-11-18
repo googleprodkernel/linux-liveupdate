@@ -3870,9 +3870,6 @@ const struct iommu_domain_ops intel_fs_paging_domain_ops = {
 	.iotlb_sync = intel_iommu_tlb_sync,
 	.free = intel_iommu_domain_free,
 	.enforce_cache_coherency = intel_iommu_enforce_cache_coherency_fs,
-#ifdef CONFIG_LIVEUPDATE
-	//.preserve = intel_iommu_domain_liveupdate_preserve,
-#endif
 };
 
 const struct iommu_domain_ops intel_ss_paging_domain_ops = {
@@ -3884,9 +3881,6 @@ const struct iommu_domain_ops intel_ss_paging_domain_ops = {
 	.iotlb_sync = intel_iommu_tlb_sync,
 	.free = intel_iommu_domain_free,
 	.enforce_cache_coherency = intel_iommu_enforce_cache_coherency_ss,
-#ifdef CONFIG_LIVEUPDATE
-	//.preserve = intel_iommu_domain_liveupdate_preserve,
-#endif
 };
 
 const struct iommu_ops intel_iommu_ops = {
@@ -3906,6 +3900,10 @@ const struct iommu_ops intel_iommu_ops = {
 	.is_attach_deferred	= intel_iommu_is_attach_deferred,
 	.def_domain_type	= device_def_domain_type,
 	.page_response		= intel_iommu_page_response,
+	.preserve_device	= intel_iommu_preserve_device,
+	.unpreserve_device	= intel_iommu_unpreserve_device,
+	.preserve		= intel_iommu_preserve,
+	.unpreserve		= intel_iommu_unpreserve,
 };
 
 static void quirk_iommu_igfx(struct pci_dev *dev)
