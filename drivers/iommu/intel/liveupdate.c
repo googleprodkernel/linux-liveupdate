@@ -12,12 +12,14 @@
 #include <linux/pci.h>
 
 #include "iommu.h"
+#include "../iommu-pages.h"
 
 struct iommu_unit_ser {
 	u64 phys_addr;
 	u64 root_table;
 };
 
+#if 0
 struct device_ser {
 	u64 bdf;
 	u64 pasid_table;
@@ -40,12 +42,6 @@ struct iommu_ser {
 	};
 };
 
-int intel_iommu_domain_liveupdate_preserve(struct iommu_domain *domain)
-{
-	pr_warn("Not implemented\n");
-	return 0;
-}
-
 static bool is_device_domain_preserved(struct device *dev)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
@@ -58,7 +54,7 @@ static int preserve_device_state(struct pci_dev *dev, struct device_ser *ser)
 	pr_warn("Not implemented\n");
 	return 0;
 }
-
+#endif
 static int unpreserve_iommu_context(struct intel_iommu *iommu, int end)
 {
 	struct context_entry *context;
@@ -70,14 +66,14 @@ static int unpreserve_iommu_context(struct intel_iommu *iommu, int end)
 	for (i = 0; i < end; i++) {
 		context = iommu_context_addr(iommu, i, 0, 0);
 		if (context)
-			WARN_ON_ONCE(kho_unpreserve_folio(virt_to_folio(context)));
+			iommu_unpreserve_page(context);
 
 		if (!sm_supported(iommu))
 			continue;
 
 		context = iommu_context_addr(iommu, i, 0x80, 0);
 		if (context)
-			WARN_ON_ONCE(kho_unpreserve_folio(virt_to_folio(context)));
+			iommu_unpreserve_page(context);
 	}
 
 	return 0;
@@ -92,7 +88,7 @@ static int preserve_iommu_context(struct intel_iommu *iommu)
 	for (i = 0; i < ROOT_ENTRY_NR; i++) {
 		context = iommu_context_addr(iommu, i, 0, 0);
 		if (context) {
-			ret = kho_preserve_folio(virt_to_folio(context));
+			ret = iommu_preserve_page(context);
 			if (ret)
 				goto error;
 		}
@@ -102,7 +98,7 @@ static int preserve_iommu_context(struct intel_iommu *iommu)
 
 		context = iommu_context_addr(iommu, i, 0x80, 0);
 		if (context) {
-			ret = kho_preserve_folio(virt_to_folio(context));
+			ret = iommu_preserve_page(context);
 			if (ret)
 				goto error_sm;
 		}
@@ -112,33 +108,9 @@ static int preserve_iommu_context(struct intel_iommu *iommu)
 
 error_sm:
 	context = iommu_context_addr(iommu, i, 0, 0);
-	WARN_ON_ONCE(kho_unpreserve_folio(virt_to_folio(context)));
+	iommu_unpreserve_page(context);
 error:
 	WARN_ON_ONCE(unpreserve_iommu_context(iommu, i));
-	return ret;
-}
-
-static int preserve_iommu_state(struct intel_iommu *iommu,
-				struct iommu_unit_ser *ser)
-{
-	int ret;
-
-	spin_lock(&iommu->lock);
-	ret = preserve_iommu_context(iommu);
-	if (ret)
-		goto error;
-
-	ret = kho_preserve_folio(virt_to_folio(iommu->root_entry));
-	if (ret) {
-		unpreserve_iommu_context(iommu, -1);
-		goto error;
-	}
-
-	ser->phys_addr = iommu->reg_phys;
-	ser->root_table = __pa(iommu->root_entry);
-	atomic_set(&iommu->preserved, 1);
-error:
-	spin_unlock(&iommu->lock);
 	return ret;
 }
 
@@ -252,9 +224,7 @@ static void intel_liveupdate_cancel(struct liveupdate_subsystem *handle, u64 dat
 {
 	pr_warn("Not implemented\n");
 }
-*/
 static struct iommu_ser *serialized_state;
-/*
 static void intel_liveupdate_finish(struct liveupdate_subsystem *handle, u64 data)
 {
 	serialized_state = NULL;
@@ -269,7 +239,6 @@ static int intel_liveupdate_freeze(struct liveupdate_subsystem *handle, u64 *dat
 
 	return 0;
 }
-*/
 static struct iommu_ser *get_liveupdate_state(void)
 {
 	struct iommu_ser *ser;
@@ -288,7 +257,8 @@ static struct iommu_ser *get_liveupdate_state(void)
 
 	return ser;
 }
-
+*/
+#if 0
 static void sanitize_iommu_context(struct intel_iommu *iommu)
 {
 	struct context_entry *context;
@@ -371,4 +341,82 @@ int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu)
 
 	return ret;
 }
+#endif
+
+static struct folio *folio_alloc_preserved(size_t sz)
+{
+	struct folio *folio;
+	int ret;
+
+	folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, get_order(sz));
+	if (!folio)
+		return ERR_PTR(-ENOMEM);
+
+	ret = kho_preserve_folio(folio);
+	if (ret) {
+		folio_put(folio);
+		folio = ERR_PTR(ret);
+	}
+
+	return folio;
+}
+
+static void preserved_folio_put(struct folio *folio)
+{
+	kho_unpreserve_folio(folio);
+	folio_put(folio);
+}
+
+int intel_iommu_preserve_device(struct device *dev, struct device_ser *device_ser)
+{
+	return 0;
+}
+
+void intel_iommu_unpreserve_device(struct device *dev, struct device_ser *device_ser)
+{
+}
+
+int intel_iommu_preserve(struct iommu_device *iommu_dev, struct iommu_device_ser *iommu_device_ser)
+{
+	struct iommu_unit_ser *ser;
+	struct intel_iommu *iommu;
+	struct folio *folio;
+	int ret;
+
+	iommu = container_of(iommu_dev, struct intel_iommu, iommu);
+
+	folio = folio_alloc_preserved(sizeof(*ser));
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+
+	ser = folio_address(folio);
+
+	spin_lock(&iommu->lock);
+	ret = preserve_iommu_context(iommu);
+	if (ret)
+		goto err;
+
+	ret = iommu_preserve_page(iommu->root_entry);
+	if (ret) {
+		unpreserve_iommu_context(iommu, -1);
+		goto err;
+	}
+
+	ser->phys_addr = iommu->reg_phys;
+	ser->root_table = __pa(iommu->root_entry);
+	strncpy(iommu_device_ser->compatible, "intel", sizeof(iommu_device_ser->compatible));
+	iommu_device_ser->token = iommu->reg_phys;
+	spin_unlock(&iommu->lock);
+
+	return 0;
+err:
+	preserved_folio_put(folio);
+	spin_unlock(&iommu->lock);
+	return ret;
+}
+
+void intel_iommu_unpreserve(struct iommu_device *iommu, struct iommu_device_ser *iommu_device_ser)
+{
+}
+
 

@@ -54,6 +54,8 @@ void iommu_free_pages(void *virt);
 void iommu_put_pages_list(struct iommu_pages_list *list);
 
 #if IS_ENABLED(CONFIG_LIVEUPDATE)
+int iommu_preserve_page(void *virt);
+void iommu_unpreserve_page(void *virt);
 int iommu_preserve_pages(struct iommu_pages_list *list);
 void iommu_unpreserve_pages(struct iommu_pages_list *list, int count);
 #endif
