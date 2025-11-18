@@ -278,6 +278,7 @@ static void sanitize_iommu_context(struct intel_iommu *iommu)
 			memset(context, 0, PAGE_SIZE);
 	}
 }
+#endif
 
 static int restore_iommu_context(struct intel_iommu *iommu)
 {
@@ -297,36 +298,13 @@ static int restore_iommu_context(struct intel_iommu *iommu)
 			BUG_ON(!kho_restore_folio(virt_to_phys(context)));
 	}
 
-	sanitize_iommu_context(iommu);
-
 	return ret;
 }
 
-static struct iommu_unit_ser *get_iommu_unit_state(struct iommu_ser *ser, u64 reg_phys)
+int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu, void *iommu_ser)
 {
-	int i;
-
-	for (i = 0; i < ser->nr_iommus; ++i) {
-		if (ser->iommu_units[i].phys_addr ==  reg_phys)
-			return &ser->iommu_units[i];
-	}
-
-	return NULL;
-}
-
-int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu)
-{
-	struct iommu_unit_ser *iser;
-	struct iommu_ser *ser;
+	struct iommu_unit_ser *iser = iommu_ser;
 	int ret;
-
-	ser = get_liveupdate_state();
-	if (!ser)
-		return -EINVAL;
-
-	iser = get_iommu_unit_state(ser, iommu->reg_phys);
-	if (!iser)
-		return -EINVAL;
 
 	iommu->root_entry = __va(iser->root_table);
 
@@ -341,7 +319,6 @@ int intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu)
 
 	return ret;
 }
-#endif
 
 static struct folio *folio_alloc_preserved(size_t sz)
 {
@@ -406,6 +383,7 @@ int intel_iommu_preserve(struct iommu_device *iommu_dev, struct iommu_device_ser
 	ser->root_table = __pa(iommu->root_entry);
 	strncpy(iommu_device_ser->compatible, "intel", sizeof(iommu_device_ser->compatible));
 	iommu_device_ser->token = iommu->reg_phys;
+	iommu_device_ser->data = ser;
 	spin_unlock(&iommu->lock);
 
 	return 0;

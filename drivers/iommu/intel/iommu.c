@@ -667,12 +667,12 @@ pgtable_walk:
 #endif
 
 /* iommu handling */
-static int iommu_alloc_root_entry(struct intel_iommu *iommu)
+static int iommu_alloc_root_entry(struct intel_iommu *iommu, void *iommu_state)
 {
 	struct root_entry *root;
 
-#if 0 //CONFIG_LIVEUPDATE
-	if (!intel_iommu_liveupdate_restore_root_table(iommu) &&
+#if CONFIG_LIVEUPDATE
+	if (!intel_iommu_liveupdate_restore_root_table(iommu, iommu_state) &&
 	    iommu->root_entry) {
 		__iommu_flush_cache(iommu, iommu->root_entry, ROOT_SIZE);
 		return 0;
@@ -1618,6 +1618,7 @@ out_unmap:
 
 static int __init init_dmars(void)
 {
+	struct iommu_device_ser iommu_ser;
 	struct dmar_drhd_unit *drhd;
 	struct intel_iommu *iommu;
 	int ret;
@@ -1640,6 +1641,13 @@ static int __init init_dmars(void)
 						   intel_pasid_max_id);
 		}
 
+#if IS_ENABLED(CONFIG_LIVEUPDATE)
+		iommu_ser.token = iommu->reg_phys;
+		strncpy(iommu_ser.compatible, "intel", sizeof(iommu_ser.compatible));
+		if (iommu_get_preserved_data(&iommu_ser))
+			iommu_ser.data = NULL;
+#endif
+
 		intel_iommu_init_qi(iommu);
 		init_translation_status(iommu);
 
@@ -1655,7 +1663,7 @@ static int __init init_dmars(void)
 		 * we could share the same root & context tables
 		 * among all IOMMU's. Need to Split it later.
 		 */
-		ret = iommu_alloc_root_entry(iommu);
+		ret = iommu_alloc_root_entry(iommu, iommu_ser.data);
 		if (ret)
 			goto free_iommu;
 
@@ -2110,6 +2118,7 @@ int dmar_parse_one_satc(struct acpi_dmar_header *hdr, void *arg)
 static int intel_iommu_add(struct dmar_drhd_unit *dmaru)
 {
 	struct intel_iommu *iommu = dmaru->iommu;
+	struct iommu_device_ser iommu_ser;
 	int ret;
 
 	/*
@@ -2118,7 +2127,14 @@ static int intel_iommu_add(struct dmar_drhd_unit *dmaru)
 	if (iommu->gcmd & DMA_GCMD_TE)
 		iommu_disable_translation(iommu);
 
-	ret = iommu_alloc_root_entry(iommu);
+#if IS_ENABLED(CONFIG_LIVEUPDATE)
+		iommu_ser.token = iommu->reg_phys;
+		strncpy(iommu_ser.compatible, "intel", sizeof(iommu_ser.compatible));
+		if (iommu_get_preserved_data(&iommu_ser))
+			iommu_ser.data = NULL;
+#endif
+
+	ret = iommu_alloc_root_entry(iommu, iommu_ser.data);
 	if (ret)
 		goto out;
 
