@@ -143,6 +143,12 @@ struct vfio_pci_core_device {
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
 	struct list_head	dmabufs;
+
+	/*
+	 * State passed by the previous kernel during a Live Update. Only
+	 * safe to access when first opening the device.
+	 */
+	struct vfio_pci_core_device_ser *liveupdate_state;
 };
 
 enum vfio_pci_io_width {
