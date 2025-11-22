@@ -433,6 +433,10 @@ int iommufd_hwpt_set_dirty_tracking(struct iommufd_ucmd *ucmd);
 int iommufd_hwpt_get_dirty_bitmap(struct iommufd_ucmd *ucmd);
 
 struct iommufd_hwpt_paging *
+_iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx);
+void iommufd_hwpt_init_from_domain(struct iommufd_hw_pagetable *hwpt,
+				   struct iommu_domain *domain);
+struct iommufd_hwpt_paging *
 iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx, struct iommufd_ioas *ioas,
 			  struct iommufd_device *idev, ioasid_t pasid,
 			  u32 flags, bool immediate_attach,

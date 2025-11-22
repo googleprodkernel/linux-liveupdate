@@ -90,6 +90,29 @@ iommufd_hwpt_paging_enforce_cc(struct iommufd_hwpt_paging *hwpt_paging)
 	return 0;
 }
 
+struct iommufd_hwpt_paging *
+_iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx)
+{
+	struct iommufd_hwpt_paging *hwpt_paging;
+
+	hwpt_paging = __iommufd_object_alloc(
+		ictx, hwpt_paging, IOMMUFD_OBJ_HWPT_PAGING, common.obj);
+	if (IS_ERR(hwpt_paging))
+		return ERR_CAST(hwpt_paging);
+
+	INIT_LIST_HEAD(&hwpt_paging->hwpt_item);
+
+	return hwpt_paging;
+}
+
+void iommufd_hwpt_init_from_domain(struct iommufd_hw_pagetable *hwpt,
+				   struct iommu_domain *domain)
+{
+	hwpt->domain = domain;
+	domain->iommufd_hwpt = hwpt;
+	domain->cookie_type = IOMMU_COOKIE_IOMMUFD;
+}
+
 /**
  * iommufd_hwpt_paging_alloc() - Get a PAGING iommu_domain for a device
  * @ictx: iommufd context
@@ -122,6 +145,7 @@ iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx, struct iommufd_ioas *ioas,
 	const struct iommu_ops *ops = dev_iommu_ops(idev->dev);
 	struct iommufd_hwpt_paging *hwpt_paging;
 	struct iommufd_hw_pagetable *hwpt;
+	struct iommu_domain *domain;
 	int rc;
 
 	lockdep_assert_held(&ioas->mutex);
@@ -137,38 +161,34 @@ iommufd_hwpt_paging_alloc(struct iommufd_ctx *ictx, struct iommufd_ioas *ioas,
 	    (flags & IOMMU_HWPT_ALLOC_NEST_PARENT))
 		return ERR_PTR(-EOPNOTSUPP);
 
-	hwpt_paging = __iommufd_object_alloc(
-		ictx, hwpt_paging, IOMMUFD_OBJ_HWPT_PAGING, common.obj);
+	hwpt_paging = _iommufd_hwpt_paging_alloc(ictx);
 	if (IS_ERR(hwpt_paging))
 		return ERR_CAST(hwpt_paging);
+
 	hwpt = &hwpt_paging->common;
 	hwpt->pasid_compat = flags & IOMMU_HWPT_ALLOC_PASID;
 
-	INIT_LIST_HEAD(&hwpt_paging->hwpt_item);
 	/* Pairs with iommufd_hw_pagetable_destroy() */
 	refcount_inc(&ioas->obj.users);
 	hwpt_paging->ioas = ioas;
 	hwpt_paging->nest_parent = flags & IOMMU_HWPT_ALLOC_NEST_PARENT;
 
 	if (ops->domain_alloc_paging_flags) {
-		hwpt->domain = ops->domain_alloc_paging_flags(idev->dev,
+		domain = ops->domain_alloc_paging_flags(idev->dev,
 				flags & ~IOMMU_HWPT_FAULT_ID_VALID, user_data);
-		if (IS_ERR(hwpt->domain)) {
-			rc = PTR_ERR(hwpt->domain);
-			hwpt->domain = NULL;
+		if (IS_ERR(domain)) {
+			rc = PTR_ERR(domain);
 			goto out_abort;
 		}
-		hwpt->domain->owner = ops;
+		domain->owner = ops;
 	} else {
-		hwpt->domain = iommu_paging_domain_alloc(idev->dev);
-		if (IS_ERR(hwpt->domain)) {
-			rc = PTR_ERR(hwpt->domain);
-			hwpt->domain = NULL;
+		domain = iommu_paging_domain_alloc(idev->dev);
+		if (IS_ERR(domain)) {
+			rc = PTR_ERR(domain);
 			goto out_abort;
 		}
 	}
-	hwpt->domain->iommufd_hwpt = hwpt;
-	hwpt->domain->cookie_type = IOMMU_COOKIE_IOMMUFD;
+	iommufd_hwpt_init_from_domain(hwpt, domain);
 
 	/*
 	 * Set the coherency mode before we do iopt_table_add_domain() as some
@@ -237,6 +257,7 @@ iommufd_hwpt_nested_alloc(struct iommufd_ctx *ictx,
 	const struct iommu_ops *ops = dev_iommu_ops(idev->dev);
 	struct iommufd_hwpt_nested *hwpt_nested;
 	struct iommufd_hw_pagetable *hwpt;
+	struct iommu_domain *domain;
 	int rc;
 
 	if ((flags & ~(IOMMU_HWPT_FAULT_ID_VALID | IOMMU_HWPT_ALLOC_PASID)) ||
@@ -256,17 +277,15 @@ iommufd_hwpt_nested_alloc(struct iommufd_ctx *ictx,
 	refcount_inc(&parent->common.obj.users);
 	hwpt_nested->parent = parent;
 
-	hwpt->domain = ops->domain_alloc_nested(
+	domain = ops->domain_alloc_nested(
 		idev->dev, parent->common.domain,
 		flags & ~IOMMU_HWPT_FAULT_ID_VALID, user_data);
-	if (IS_ERR(hwpt->domain)) {
-		rc = PTR_ERR(hwpt->domain);
-		hwpt->domain = NULL;
+	if (IS_ERR(domain)) {
+		rc = PTR_ERR(domain);
 		goto out_abort;
 	}
-	hwpt->domain->owner = ops;
-	hwpt->domain->iommufd_hwpt = hwpt;
-	hwpt->domain->cookie_type = IOMMU_COOKIE_IOMMUFD;
+	iommufd_hwpt_init_from_domain(hwpt, domain);
+	domain->owner = ops;
 
 	if (WARN_ON_ONCE(hwpt->domain->type != IOMMU_DOMAIN_NESTED)) {
 		rc = -EOPNOTSUPP;
@@ -294,6 +313,7 @@ iommufd_viommu_alloc_hwpt_nested(struct iommufd_viommu *viommu, u32 flags,
 {
 	struct iommufd_hwpt_nested *hwpt_nested;
 	struct iommufd_hw_pagetable *hwpt;
+	struct iommu_domain *domain;
 	int rc;
 
 	if (flags & ~(IOMMU_HWPT_FAULT_ID_VALID | IOMMU_HWPT_ALLOC_PASID))
@@ -314,16 +334,14 @@ iommufd_viommu_alloc_hwpt_nested(struct iommufd_viommu *viommu, u32 flags,
 	refcount_inc(&viommu->obj.users);
 	hwpt_nested->parent = viommu->hwpt;
 
-	hwpt->domain = viommu->ops->alloc_domain_nested(
+	domain = viommu->ops->alloc_domain_nested(
 		viommu, flags & ~IOMMU_HWPT_FAULT_ID_VALID, user_data);
-	if (IS_ERR(hwpt->domain)) {
-		rc = PTR_ERR(hwpt->domain);
-		hwpt->domain = NULL;
+	if (IS_ERR(domain)) {
+		rc = PTR_ERR(domain);
 		goto out_abort;
 	}
-	hwpt->domain->iommufd_hwpt = hwpt;
-	hwpt->domain->owner = viommu->iommu_dev->ops;
-	hwpt->domain->cookie_type = IOMMU_COOKIE_IOMMUFD;
+	iommufd_hwpt_init_from_domain(hwpt, domain);
+	domain->owner = viommu->iommu_dev->ops;
 
 	if (WARN_ON_ONCE(hwpt->domain->type != IOMMU_DOMAIN_NESTED)) {
 		rc = -EOPNOTSUPP;
