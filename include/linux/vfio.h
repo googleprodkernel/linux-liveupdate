@@ -16,6 +16,7 @@
 #include <linux/cdev.h>
 #include <uapi/linux/vfio.h>
 #include <linux/iova_bitmap.h>
+#include <linux/pci.h>
 
 struct kvm;
 struct iommufd_ctx;
@@ -430,5 +431,15 @@ static inline int __vfio_device_fops_cdev_open(struct vfio_device *device,
 #endif /* IS_ENABLED(CONFIG_VFIO_DEVICE_CDEV) */
 
 struct vfio_device *vfio_find_device(const void *data, device_match_t match);
+
+static inline bool vfio_liveupdate_incoming_is_preserved(struct vfio_device *device)
+{
+	struct device *d = device->dev;
+
+	if (dev_is_pci(d))
+		return pci_liveupdate_incoming_is_preserved(to_pci_dev(d));
+
+	return false;
+}
 
 #endif /* VFIO_H */
