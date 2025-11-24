@@ -449,17 +449,25 @@ static int __pci_device_probe(struct pci_driver *drv, struct pci_dev *pci_dev)
 }
 
 #ifdef CONFIG_PCI_IOV
-static inline bool pci_device_can_probe(struct pci_dev *pdev)
+static inline bool pci_iov_device_can_probe(struct pci_dev *pdev)
 {
 	return (!pdev->is_virtfn || pdev->physfn->sriov->drivers_autoprobe ||
 		pdev->driver_override);
 }
 #else
-static inline bool pci_device_can_probe(struct pci_dev *pdev)
+static inline bool pci_iov_device_can_probe(struct pci_dev *pdev)
 {
 	return true;
 }
 #endif
+
+static inline bool pci_device_can_probe(struct pci_dev *pdev)
+{
+	if (pci_liveupdate_incoming_is_preserved(pdev))
+		return pdev->driver_override;
+
+	return pci_iov_device_can_probe(pdev);
+}
 
 static int pci_device_probe(struct device *dev)
 {
