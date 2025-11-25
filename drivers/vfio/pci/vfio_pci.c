@@ -258,6 +258,10 @@ static int __init vfio_pci_init(void)
 	int ret;
 	bool is_disable_vga = true;
 
+	ret = vfio_pci_liveupdate_init();
+	if (ret)
+		return ret;
+
 #ifdef CONFIG_VFIO_PCI_VGA
 	is_disable_vga = disable_vga;
 #endif
@@ -266,8 +270,10 @@ static int __init vfio_pci_init(void)
 
 	/* Register and scan for devices */
 	ret = pci_register_driver(&vfio_pci_driver);
-	if (ret)
+	if (ret) {
+		vfio_pci_liveupdate_cleanup();
 		return ret;
+	}
 
 	vfio_pci_fill_ids();
 
@@ -281,6 +287,7 @@ module_init(vfio_pci_init);
 static void __exit vfio_pci_cleanup(void)
 {
 	pci_unregister_driver(&vfio_pci_driver);
+	vfio_pci_liveupdate_cleanup();
 }
 module_exit(vfio_pci_cleanup);
 
