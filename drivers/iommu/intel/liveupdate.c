@@ -92,6 +92,15 @@ static void restore_iommu_context(struct intel_iommu *iommu)
 	}
 }
 
+static int __restore_used_domain_ids(struct device_ser *ser, void *arg)
+{
+	int id = ser->domain_iommu_ser.did;
+	struct intel_iommu *iommu = arg;
+
+	ida_alloc_range(&iommu->domain_ida, id, id, GFP_KERNEL);
+	return 0;
+}
+
 void intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu,
 					       struct iommu_ser *iommu_ser)
 {
@@ -99,6 +108,7 @@ void intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu,
 	iommu->root_entry = __va(iommu_ser->intel.root_table);
 
 	restore_iommu_context(iommu);
+	iommu_for_each_preserved_device(__restore_used_domain_ids, iommu);
 	pr_info("Restored IOMMU[0x%llx] Root Table at: 0x%llx\n",
 		iommu->reg_phys, iommu_ser->intel.root_table);
 }
