@@ -175,6 +175,35 @@ int iommu_liveupdate_unregister_flb(struct liveupdate_file_handler *handler)
 }
 EXPORT_SYMBOL(iommu_liveupdate_unregister_flb);
 
+struct iommu_ser *iommu_get_preserved_data(u64 token, enum iommu_lu_type type)
+{
+	struct iommu_lu_flb_obj *obj;
+	struct iommus_ser *iommus;
+	int ret, i, idx;
+
+	ret = liveupdate_flb_get_incoming(&iommu_flb, (void **)&obj);
+	if (ret)
+		return NULL;
+
+	iommus = __va(obj->ser->iommus_phys);
+	for (i = 0, idx = 0; i < obj->ser->nr_iommus; ++i, ++idx) {
+		if (idx >= MAX_IOMMU_SERS) {
+			iommus = __va(iommus->objs.next_objs);
+			idx = 0;
+		}
+
+		if (iommus->iommus[idx].obj.deleted)
+			continue;
+
+		if (iommus->iommus[idx].token == token &&
+		    iommus->iommus[idx].type == type)
+			return &iommus->iommus[idx];
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL(iommu_get_preserved_data);
+
 static int reserve_obj_ser(struct iommu_objs_ser **objs_ptr, u64 max_objs)
 {
 	struct iommu_objs_ser *next_objs, *objs = *objs_ptr;

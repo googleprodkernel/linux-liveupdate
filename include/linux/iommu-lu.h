@@ -78,6 +78,7 @@ static inline void *iommu_domain_restored_state(struct iommu_domain *domain)
 }
 #endif
 
+struct iommu_ser *iommu_get_preserved_data(u64 token, enum iommu_lu_type type);
 int iommu_domain_preserve(struct iommu_domain *domain, struct iommu_domain_ser **ser);
 int iommu_domain_unpreserve(struct iommu_domain *domain);
 int iommu_preserve_device(struct iommu_domain *domain, struct device *dev);
