@@ -127,3 +127,85 @@ int iommu_liveupdate_unregister_flb(struct liveupdate_file_handler *handler)
 	return liveupdate_unregister_flb(handler, &iommu_flb);
 }
 EXPORT_SYMBOL(iommu_liveupdate_unregister_flb);
+
+static int reserve_obj_ser(struct iommu_objs_ser **objs_ptr, u64 max_objs)
+{
+	struct iommu_objs_ser *next_objs, *objs = *objs_ptr;
+	int idx;
+
+	if (objs->nr_objs == max_objs) {
+		next_objs = kho_alloc_preserve(PAGE_SIZE);
+		if (!next_objs)
+			return -ENOMEM;
+
+		objs->next_objs = virt_to_phys(next_objs);
+		objs = next_objs;
+		*objs_ptr = objs;
+		objs->nr_objs = 0;
+	}
+
+	idx = objs->nr_objs++;
+	return idx;
+}
+
+int iommu_domain_preserve(struct iommu_domain *domain, struct iommu_domain_ser **ser)
+{
+	struct iommu_domain_ser *domain_ser;
+	struct iommu_lu_flb_obj *flb_obj;
+	int idx, ret;
+
+	if (!domain->ops->preserve)
+		return -EOPNOTSUPP;
+
+	ret = liveupdate_flb_get_outgoing(&iommu_flb, (void **)&flb_obj);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&flb_obj->lock);
+	idx = reserve_obj_ser((struct iommu_objs_ser **)&flb_obj->iommu_domains,
+			      MAX_IOMMU_DOMAIN_SERS);
+	if (idx < 0)
+		return idx;
+
+	domain_ser = &flb_obj->iommu_domains->iommu_domains[idx];
+	idx = flb_obj->ser->nr_domains++;
+	domain_ser->obj.idx = idx;
+	domain_ser->obj.ref_count = 1;
+
+	ret = domain->ops->preserve(domain, domain_ser);
+	if (ret) {
+		domain_ser->obj.deleted = true;
+		return ret;
+	}
+
+	domain->preserved_state = domain_ser;
+	*ser = domain_ser;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(iommu_domain_preserve);
+
+int iommu_domain_unpreserve(struct iommu_domain *domain)
+{
+	struct iommu_domain_ser *domain_ser;
+	struct iommu_lu_flb_obj *flb_obj;
+	int ret;
+
+	if (!domain->ops->unpreserve)
+		return -EOPNOTSUPP;
+
+	ret = liveupdate_flb_get_outgoing(&iommu_flb, (void **)&flb_obj);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&flb_obj->lock);
+	domain_ser = domain->preserved_state;
+	if (domain_ser->attach_count)
+		ret = -EBUSY;
+
+	domain->ops->unpreserve(domain, domain_ser);
+	domain_ser->obj.deleted = true;
+	domain->preserved_state = NULL;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(iommu_domain_unpreserve);
