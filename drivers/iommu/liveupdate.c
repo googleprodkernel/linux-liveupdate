@@ -467,3 +467,34 @@ int iommu_unpreserve_device(struct iommu_domain *domain, struct device *dev)
 {
 	return -EOPNOTSUPP;
 }
+
+struct iommu_domain *iommu_restore_domain(struct device *dev, struct device_ser *ser)
+{
+	struct iommu_domain_ser *domain_ser;
+	struct iommu_lu_flb_obj *flb_obj;
+	struct iommu_domain *domain;
+	int ret;
+
+	domain_ser = __va(ser->domain_iommu_ser.domain_phys);
+
+	ret = liveupdate_flb_get_incoming(&iommu_flb, (void **)&flb_obj);
+	if (ret)
+		return ERR_PTR(ret);
+
+	guard(mutex)(&flb_obj->lock);
+	if (domain_ser->restored_domain)
+		return domain_ser->restored_domain;
+
+	domain_ser->obj.incoming =  true;
+	domain = iommu_paging_domain_alloc(dev);
+	if (IS_ERR(domain))
+		return domain;
+
+	ret = domain->ops->restore(domain, domain_ser);
+	if (ret)
+		return ERR_PTR(ret);
+
+	domain->preserved_state = domain_ser;
+	domain_ser->restored_domain = domain;
+	return domain;
+}
