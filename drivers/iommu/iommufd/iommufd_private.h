@@ -738,8 +738,6 @@ static inline bool iopt_lu_map_immutable(const struct io_pagetable *iopt)
 }
 
 /* TODO */
-#define iommu_domain_restore(x) ERR_PTR(-EOPNOTSUPP)
-#define iommu_domain_preserve(x, y) (-EOPNOTSUPP)
 #define iommu_domain_has_attachments(x) (false)
 #else
 static inline int iommufd_liveupdate_register_lufs(void)
