@@ -1283,6 +1283,8 @@ int intel_iommu_preserve_device(struct device *dev, struct device_ser *device_se
 void intel_iommu_unpreserve_device(struct device *dev, struct device_ser *device_ser);
 int intel_iommu_preserve(struct iommu_device *iommu, struct iommu_ser *iommu_ser);
 void intel_iommu_unpreserve(struct iommu_device *iommu, struct iommu_ser *iommu_ser);
+void intel_iommu_liveupdate_restore_root_table(struct intel_iommu *iommu,
+					       struct iommu_ser *iommu_ser);
 bool intel_iommu_liveupdate_clear_context_entries(struct intel_iommu *iommu);
 #endif
 
