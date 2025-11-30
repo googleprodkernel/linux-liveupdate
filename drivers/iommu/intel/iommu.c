@@ -16,6 +16,7 @@
 #include <linux/crash_dump.h>
 #include <linux/dma-direct.h>
 #include <linux/dmi.h>
+#include <linux/iommu-lu.h>
 #include <linux/memory.h>
 #include <linux/pci.h>
 #include <linux/pci-ats.h>
@@ -51,6 +52,10 @@ static int intel_iommu_set_dirty_tracking(struct iommu_domain *domain,
 static int rwbf_quirk;
 
 #define rwbf_required(iommu)	(rwbf_quirk || cap_rwbf((iommu)->cap))
+
+#ifdef CONFIG_LIVEUPDATE
+static void __clean_unpreserved_context_entries(struct intel_iommu *iommu);
+#endif
 
 /*
  * set to 1 to panic kernel if can't successfully enable VT-d
@@ -2376,8 +2381,12 @@ void intel_iommu_shutdown(void)
 		/* Disable PMRs explicitly here. */
 		iommu_disable_protect_mem_regions(iommu);
 
-		/* Make sure the IOMMUs are switched off */
-		iommu_disable_translation(iommu);
+		if (iommu->iommu.outgoing_preserved_state) {
+			__clean_unpreserved_context_entries(iommu);
+		} else {
+			/* Make sure the IOMMUs are switched off */
+			iommu_disable_translation(iommu);
+		}
 	}
 }
 
@@ -2899,6 +2908,26 @@ static const struct iommu_dirty_ops intel_second_stage_dirty_ops = {
 	IOMMU_PT_DIRTY_OPS(vtdss),
 	.set_dirty_tracking = intel_iommu_set_dirty_tracking,
 };
+
+static void __clean_unpreserved_context_entries(struct intel_iommu *iommu)
+{
+	struct device_domain_info *info;
+	struct pci_dev *pdev = NULL;
+
+	for_each_pci_dev(pdev) {
+		info = dev_iommu_priv_get(&pdev->dev);
+		if (!info)
+			continue;
+
+		if (info->iommu != iommu)
+			continue;
+
+		if (dev_iommu_preserved_state(&pdev->dev))
+			continue;
+
+		domain_context_clear(info);
+	}
+}
 
 static struct iommu_domain *
 intel_iommu_domain_alloc_second_stage(struct device *dev,

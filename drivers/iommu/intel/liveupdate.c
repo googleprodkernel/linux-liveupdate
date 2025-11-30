@@ -9,6 +9,7 @@
 
 #include <linux/kexec_handover.h>
 #include <linux/liveupdate.h>
+#include <linux/iommu-lu.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 
