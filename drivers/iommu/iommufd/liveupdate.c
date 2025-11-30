@@ -8,6 +8,7 @@
 #include <linux/kexec_handover.h>
 #include <linux/kho/abi/iommufd.h>
 #include <linux/liveupdate.h>
+#include <linux/iommu-lu.h>
 #include <linux/mm.h>
 #include <linux/pci.h>
 
@@ -394,10 +395,22 @@ static struct liveupdate_file_handler iommufd_lu_handler = {
 
 int iommufd_liveupdate_register_lufs(void)
 {
-	return liveupdate_register_file_handler(&iommufd_lu_handler);
+	int ret;
+
+	ret = liveupdate_register_file_handler(&iommufd_lu_handler);
+	if (ret)
+		return ret;
+
+	ret = iommu_liveupdate_register_flb(&iommufd_lu_handler);
+	if (ret)
+		liveupdate_unregister_file_handler(&iommufd_lu_handler);
+
+	return ret;
 }
 
 int iommufd_liveupdate_unregister_lufs(void)
 {
+	WARN_ON(iommu_liveupdate_unregister_flb(&iommufd_lu_handler));
+
 	return liveupdate_unregister_file_handler(&iommufd_lu_handler);
 }
