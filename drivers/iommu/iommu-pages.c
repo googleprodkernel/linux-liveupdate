@@ -6,6 +6,7 @@
 #include "iommu-pages.h"
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
+#include <linux/kexec_handover.h>
 #include <linux/mm.h>
 
 #define IOPTDESC_MATCH(pg_elm, elm)                    \
@@ -130,6 +131,75 @@ void iommu_put_pages_list(struct iommu_pages_list *list)
 		__iommu_free_desc(iopt);
 }
 EXPORT_SYMBOL_GPL(iommu_put_pages_list);
+
+#if IS_ENABLED(CONFIG_LIVEUPDATE)
+void iommu_unpreserve_page(void *virt)
+{
+	kho_unpreserve_folio(ioptdesc_folio(virt_to_ioptdesc(virt)));
+}
+EXPORT_SYMBOL_GPL(iommu_unpreserve_page);
+
+int iommu_preserve_page(void *virt)
+{
+	return kho_preserve_folio(ioptdesc_folio(virt_to_ioptdesc(virt)));
+}
+EXPORT_SYMBOL_GPL(iommu_preserve_page);
+
+void iommu_unpreserve_pages(struct iommu_pages_list *list, int count)
+{
+	struct ioptdesc *iopt;
+
+	if (count < 0)
+		count = 0;
+
+	list_for_each_entry(iopt, &list->pages, iopt_freelist_elm) {
+		kho_unpreserve_folio(ioptdesc_folio(iopt));
+		if (count > 0 && --count ==  0)
+			break;
+	}
+}
+EXPORT_SYMBOL_GPL(iommu_unpreserve_pages);
+
+void iommu_restore_page(u64 phys)
+{
+	struct ioptdesc *iopt;
+	struct folio *folio;
+	unsigned long pgcnt;
+	unsigned int order;
+
+	folio = kho_restore_folio(phys);
+	BUG_ON(!folio);
+
+	iopt = folio_ioptdesc(folio);
+
+	order = folio_order(folio);
+	pgcnt = 1UL << order;
+	mod_node_page_state(folio_pgdat(folio), NR_IOMMU_PAGES, pgcnt);
+	lruvec_stat_mod_folio(folio, NR_SECONDARY_PAGETABLE, pgcnt);
+}
+EXPORT_SYMBOL_GPL(iommu_restore_page);
+
+int iommu_preserve_pages(struct iommu_pages_list *list)
+{
+	struct ioptdesc *iopt;
+	int count = 0;
+	int ret;
+
+	list_for_each_entry(iopt, &list->pages, iopt_freelist_elm) {
+		ret = kho_preserve_folio(ioptdesc_folio(iopt));
+		if (ret) {
+			iommu_unpreserve_pages(list, count);
+			return ret;
+		}
+
+		++count;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(iommu_preserve_pages);
+
+#endif
 
 /**
  * iommu_pages_start_incoherent - Setup the page for cache incoherent operation
