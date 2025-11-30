@@ -382,6 +382,9 @@ static struct dev_iommu *dev_iommu_get(struct device *dev)
 
 	mutex_init(&param->lock);
 	dev->iommu = param;
+#ifdef CONFIG_LIVEUPDATE
+	dev->iommu->device_ser = NULL;
+#endif
 	return param;
 }
 
