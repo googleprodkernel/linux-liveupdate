@@ -10,6 +10,9 @@
 #
 # Normal rules (sorted alphabetically)
 #
+
+gemini*
+*.orig
 .*
 *.a
 *.asn1.[ch]
