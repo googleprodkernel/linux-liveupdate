@@ -386,6 +386,7 @@ struct iommufd_hwpt_paging {
 	bool nest_parent : 1;
 #ifdef CONFIG_LIVEUPDATE
 	bool lu_preserved : 1;
+	bool lu_restored : 1;
 	u32 lu_token;
 #endif
 	/* Head at iommufd_ioas::hwpt_list */
@@ -736,9 +737,6 @@ static inline bool iopt_lu_map_immutable(const struct io_pagetable *iopt)
 {
 	return iopt->lu_map_immutable;
 }
-
-/* TODO */
-#define iommu_domain_has_attachments(x) (false)
 #else
 static inline int iommufd_liveupdate_register_lufs(void)
 {
