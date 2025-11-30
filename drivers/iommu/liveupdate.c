@@ -14,6 +14,17 @@
 #include <linux/pci.h>
 #include <linux/errno.h>
 
+static void iommu_liveupdate_restore_objs(u64 next)
+{
+	struct iommu_objs_ser *objs;
+
+	while (next) {
+		BUG_ON(!kho_restore_folio(next));
+		objs = __va(next);
+		next = objs->next_objs;
+	}
+}
+
 static void iommu_liveupdate_free_objs(u64 next, bool incoming)
 {
 	struct iommu_objs_ser *objs;
@@ -98,11 +109,46 @@ static void iommu_liveupdate_flb_unpreserve(struct liveupdate_flb_op_args *argp)
 
 static void iommu_liveupdate_flb_finish(struct liveupdate_flb_op_args *argp)
 {
+	struct iommu_lu_flb_obj *obj = argp->obj;
+
+	if (obj->iommu_domains)
+		iommu_liveupdate_free_objs(obj->ser->iommu_domains_phys, true);
+
+	if (obj->devices)
+		iommu_liveupdate_free_objs(obj->ser->devices_phys, true);
+
+	if (obj->iommus)
+		iommu_liveupdate_free_objs(obj->ser->iommus_phys, true);
+
+	folio_put(virt_to_folio(obj->ser));
 }
 
 static int iommu_liveupdate_flb_retrieve(struct liveupdate_flb_op_args *argp)
 {
-	return -EOPNOTSUPP;
+	struct iommu_lu_flb_obj *obj;
+	struct iommu_lu_flb_ser *ser;
+
+	obj = kzalloc(sizeof(*obj), GFP_ATOMIC);
+	if (!obj)
+		return -ENOMEM;
+
+	mutex_init(&obj->lock);
+	BUG_ON(!kho_restore_folio(argp->data));
+	ser = phys_to_virt(argp->data);
+	obj->ser = ser;
+
+	iommu_liveupdate_restore_objs(ser->iommu_domains_phys);
+	obj->iommu_domains = phys_to_virt(ser->iommu_domains_phys);
+
+	iommu_liveupdate_restore_objs(ser->devices_phys);
+	obj->devices = phys_to_virt(ser->devices_phys);
+
+	iommu_liveupdate_restore_objs(ser->iommus_phys);
+	obj->iommus = phys_to_virt(ser->iommus_phys);
+
+	argp->obj = obj;
+
+	return 0;
 }
 
 static struct liveupdate_flb_ops iommu_flb_ops = {
