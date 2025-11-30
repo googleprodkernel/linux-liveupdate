@@ -175,6 +175,74 @@ int iommu_liveupdate_unregister_flb(struct liveupdate_file_handler *handler)
 }
 EXPORT_SYMBOL(iommu_liveupdate_unregister_flb);
 
+int iommu_for_each_preserved_device(int (*fn)(struct device_ser *ser, void *arg), void *arg)
+{
+	struct iommu_lu_flb_obj *obj;
+	struct devices_ser *devices;
+	int ret, i, idx;
+
+	ret = liveupdate_flb_get_incoming(&iommu_flb, (void **)&obj);
+	if (ret)
+		return -ENOENT;
+
+	devices = __va(obj->ser->devices_phys);
+	for (i = 0, idx = 0; i < obj->ser->nr_devices; ++i, ++idx) {
+		if (idx >= MAX_DEVICE_SERS) {
+			devices = __va(devices->objs.next_objs);
+			idx = 0;
+		}
+
+		if (devices->devices[idx].obj.deleted)
+			continue;
+
+		ret = fn(&devices->devices[idx], arg);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(iommu_for_each_preserved_device);
+
+static inline bool device_ser_match(struct device_ser *match,
+				    struct pci_dev *pdev)
+{
+	return match->devid == pci_dev_id(pdev) && match->pci_domain == pci_domain_nr(pdev->bus);
+}
+
+struct device_ser *iommu_get_device_preserved_data(struct device *dev)
+{
+	struct iommu_lu_flb_obj *obj;
+	struct devices_ser *devices;
+	int ret, i, idx;
+
+	if (!dev_is_pci(dev))
+		return NULL;
+
+	ret = liveupdate_flb_get_incoming(&iommu_flb, (void **)&obj);
+	if (ret)
+		return NULL;
+
+	devices = __va(obj->ser->devices_phys);
+	for (i = 0, idx = 0; i < obj->ser->nr_devices; ++i, ++idx) {
+		if (idx >= MAX_DEVICE_SERS) {
+			devices = __va(devices->objs.next_objs);
+			idx = 0;
+		}
+
+		if (devices->devices[idx].obj.deleted)
+			continue;
+
+		if (device_ser_match(&devices->devices[idx], to_pci_dev(dev))) {
+			devices->devices[idx].obj.incoming = true;
+			return &devices->devices[idx];
+		}
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL(iommu_get_device_preserved_data);
+
 struct iommu_ser *iommu_get_preserved_data(u64 token, enum iommu_lu_type type)
 {
 	struct iommu_lu_flb_obj *obj;
