@@ -205,6 +205,7 @@ static int vfio_pci_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 
 	vdev = container_of(device, struct vfio_pci_core_device, vdev);
 	vdev->liveupdate_state = ser;
+	device->preserved_iommufd_token = ser->iommufd_ser.token;
 
 	args->file = file;
 

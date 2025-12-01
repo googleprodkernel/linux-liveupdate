@@ -205,6 +205,7 @@ void iommufd_device_destroy(struct iommufd_object *obj)
  * @ictx: iommufd file descriptor
  * @dev: Pointer to a physical device struct
  * @id: Output ID number to return to userspace for this device
+ * @restore_token: Preserved state token if restoring.
  *
  * A successful bind establishes an ownership over the device and returns
  * struct iommufd_device pointer, otherwise returns error pointer.
@@ -217,7 +218,8 @@ void iommufd_device_destroy(struct iommufd_object *obj)
  * The caller must undo this with iommufd_device_unbind()
  */
 struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
-					   struct device *dev, u32 *id)
+					   struct device *dev, u32 *id,
+					   u32 restore_token)
 {
 	struct iommufd_device *idev;
 	struct iommufd_group *igroup;
@@ -254,7 +256,7 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 			"Use the \"allow_unsafe_interrupts\" module parameter to override\n");
 	}
 
-	rc = iommu_device_claim_dma_owner(dev, ictx);
+	rc = iommu_device_claim_dma_owner(dev, ictx, restore_token);
 	if (rc)
 		goto out_group_put;
 

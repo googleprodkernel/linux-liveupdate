@@ -80,6 +80,10 @@ struct vfio_device {
 	 */
 	struct dentry *debug_root;
 #endif
+
+#ifdef CONFIG_LIVEUPDATE
+	u32 preserved_iommufd_token;
+#endif
 };
 
 struct vfio_device_file {
