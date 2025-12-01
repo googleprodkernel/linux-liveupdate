@@ -2290,9 +2290,12 @@ static bool domain_iommu_ops_compatible(const struct iommu_ops *ops,
 static int __iommu_attach_group(struct iommu_domain *domain,
 				struct iommu_group *group)
 {
+	bool allow_replace = false;
 	struct device *dev;
 
-	if (group->domain && group->domain != group->default_domain &&
+	allow_replace = group->domain && iommu_domain_restored_state(group->domain);
+	if (!allow_replace && group->domain &&
+	    group->domain != group->default_domain &&
 	    group->domain != group->blocking_domain)
 		return -EBUSY;
 
