@@ -1140,6 +1140,7 @@ static void context_present_cache_flush(struct intel_iommu *iommu, u16 did,
 }
 
 static int domain_context_mapping_one(struct dmar_domain *domain,
+				      struct dmar_domain *old_domain,
 				      struct intel_iommu *iommu,
 				      u8 bus, u8 devfn)
 {
@@ -1148,7 +1149,8 @@ static int domain_context_mapping_one(struct dmar_domain *domain,
 	u16 did = domain_id_iommu(domain, iommu);
 	int translation = CONTEXT_TT_MULTI_LEVEL;
 	struct pt_iommu_vtdss_hw_info pt_info;
-	struct context_entry *context;
+	struct context_entry *context, new_context;
+	u16 did_old;
 	int ret;
 
 	if (WARN_ON(!intel_domain_is_ss_paging(domain)))
@@ -1166,26 +1168,44 @@ static int domain_context_mapping_one(struct dmar_domain *domain,
 		goto out_unlock;
 
 	ret = 0;
-	if (context_present(context) && !context_copied(iommu, bus, devfn))
+	if (!old_domain && (context_present(context) && !context_copied(iommu, bus, devfn)))
 		goto out_unlock;
 
+	if (old_domain) {
+		did_old = context_domain_id(context);
+		WARN_ON(did_old != domain_id_iommu(old_domain, iommu));
+	}
+
 	copied_context_tear_down(iommu, context, bus, devfn);
-	context_clear_entry(context);
-	context_set_domain_id(context, did);
+	context_set_domain_id(&new_context, did);
 
 	if (info && info->ats_supported)
 		translation = CONTEXT_TT_DEV_IOTLB;
 	else
 		translation = CONTEXT_TT_MULTI_LEVEL;
 
-	context_set_address_root(context, pt_info.ssptptr);
-	context_set_address_width(context, pt_info.aw);
-	context_set_translation_type(context, translation);
-	context_set_fault_enable(context);
-	context_set_present(context);
+	context_set_address_root(&new_context, pt_info.ssptptr);
+	context_set_address_width(&new_context, pt_info.aw);
+	context_set_translation_type(&new_context, translation);
+	context_set_fault_enable(&new_context);
+	context_set_present(&new_context);
+
+	*context = new_context;
 	if (!ecap_coherent(iommu->ecap))
 		clflush_cache_range(context, sizeof(*context));
-	context_present_cache_flush(iommu, did, bus, devfn);
+
+	/*
+	 * Spec 6.5.3.3, changing a present context entry requires,
+	 * - IOTLB invalidation for each effected Domain.
+	 * - Issue Device IOTLB invalidation for function.
+	 */
+	if (old_domain) {
+		intel_context_flush_no_pasid(info, context, did);
+		intel_context_flush_no_pasid(info, context, did_old);
+	} else {
+		context_present_cache_flush(iommu, did, bus, devfn);
+	}
+
 	ret = 0;
 
 out_unlock:
@@ -1194,30 +1214,39 @@ out_unlock:
 	return ret;
 }
 
+struct domain_context_mapping_data {
+	struct dmar_domain *domain;
+	struct dmar_domain *old_domain;
+};
+
 static int domain_context_mapping_cb(struct pci_dev *pdev,
 				     u16 alias, void *opaque)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(&pdev->dev);
 	struct intel_iommu *iommu = info->iommu;
-	struct dmar_domain *domain = opaque;
+	struct domain_context_mapping_data *data = opaque;
 
-	return domain_context_mapping_one(domain, iommu,
+	return domain_context_mapping_one(data->domain, data->old_domain, iommu,
 					  PCI_BUS_NUM(alias), alias & 0xff);
 }
 
 static int
-domain_context_mapping(struct dmar_domain *domain, struct device *dev)
+domain_context_mapping(struct dmar_domain *domain,
+		       struct dmar_domain *old_domain, struct device *dev)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_iommu *iommu = info->iommu;
 	u8 bus = info->bus, devfn = info->devfn;
+	struct domain_context_mapping_data data;
 	int ret;
 
 	if (!dev_is_pci(dev))
-		return domain_context_mapping_one(domain, iommu, bus, devfn);
+		return domain_context_mapping_one(domain, old_domain, iommu, bus, devfn);
 
+	data.domain = domain;
+	data.old_domain = old_domain;
 	ret = pci_for_each_dma_alias(to_pci_dev(dev),
-				     domain_context_mapping_cb, domain);
+				     domain_context_mapping_cb, &data);
 	if (ret)
 		return ret;
 
@@ -1309,17 +1338,27 @@ static int domain_setup_first_level(struct intel_iommu *iommu,
 					  pt_info.gcr3_pt, flags, old);
 }
 
-static int dmar_domain_attach_device(struct dmar_domain *domain,
-				     struct device *dev)
+static int device_replace_dmar_domain(struct dmar_domain *domain,
+				      struct dmar_domain *old_domain,
+				      struct device *dev)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_iommu *iommu = info->iommu;
 	unsigned long flags;
 	int ret;
 
+	if (old_domain && dev_is_real_dma_subdevice(dev))
+		return -EOPNOTSUPP;
+
 	ret = domain_attach_iommu(domain, iommu);
 	if (ret)
 		return ret;
+
+	if (old_domain) {
+		spin_lock_irqsave(&info->domain->lock, flags);
+		list_del(&info->link);
+		spin_unlock_irqrestore(&info->domain->lock, flags);
+	}
 
 	info->domain = domain;
 	info->domain_attached = true;
@@ -1331,27 +1370,27 @@ static int dmar_domain_attach_device(struct dmar_domain *domain,
 		return 0;
 
 	if (!sm_supported(iommu))
-		ret = domain_context_mapping(domain, dev);
+		ret = domain_context_mapping(domain, old_domain, dev);
 	else if (intel_domain_is_fs_paging(domain))
 		ret = domain_setup_first_level(iommu, domain, dev,
-					       IOMMU_NO_PASID, NULL);
+					       IOMMU_NO_PASID, &old_domain->domain);
 	else if (intel_domain_is_ss_paging(domain))
 		ret = domain_setup_second_level(iommu, domain, dev,
-						IOMMU_NO_PASID, NULL);
+						IOMMU_NO_PASID, &old_domain->domain);
 	else if (WARN_ON(true))
 		ret = -EINVAL;
 
+	if (!ret)
+		ret = cache_tag_assign_domain(domain, dev, IOMMU_NO_PASID);
+
 	if (ret)
-		goto out_block_translation;
+		device_block_translation(dev);
 
-	ret = cache_tag_assign_domain(domain, dev, IOMMU_NO_PASID);
-	if (ret)
-		goto out_block_translation;
+	if (old_domain) {
+		cache_tag_unassign_domain(old_domain, dev, IOMMU_NO_PASID);
+		domain_detach_iommu(old_domain, iommu);
+	}
 
-	return 0;
-
-out_block_translation:
-	device_block_translation(dev);
 	return ret;
 }
 
@@ -3127,19 +3166,27 @@ static int intel_iommu_attach_device(struct iommu_domain *domain,
 				     struct device *dev,
 				     struct iommu_domain *old)
 {
+	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	int ret;
 
-	device_block_translation(dev);
+	if (dev_is_real_dma_subdevice(dev) ||
+	    domain->type != __IOMMU_DOMAIN_PAGING ||
+	    !info->domain || &info->domain->domain != old)
+		old = NULL;
+
+	if (!old)
+		device_block_translation(dev);
 
 	ret = paging_domain_compatible(domain, dev);
 	if (ret)
 		return ret;
 
-	ret = iopf_for_domain_set(domain, dev);
+	ret = iopf_for_domain_replace(domain, old, dev);
 	if (ret)
 		return ret;
 
-	ret = dmar_domain_attach_device(to_dmar_domain(domain), dev);
+	ret = device_replace_dmar_domain(to_dmar_domain(domain),
+					 old ? to_dmar_domain(old) : NULL, dev);
 	if (ret)
 		iopf_for_domain_remove(domain, dev);
 
