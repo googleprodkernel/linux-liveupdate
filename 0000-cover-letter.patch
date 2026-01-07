@@ -1,0 +1,58 @@
+From 69237880e6220b2dc6a4a4d8d27f0c7d418637a1 Mon Sep 17 00:00:00 2001
+From: Samiullah Khawaja <skhawaja@google.com>
+Date: Wed, 7 Jan 2026 20:14:53 +0000
+Subject: [PATCH 0/3] iommu/vt-d: Add support to hitless replace IOMMU domain
+
+Intel IOMMU Driver already supports replacing IOMMU domain hitlessly in
+scalable mode. The support is not available in legacy mode and for
+NO_PASID in scalable mode. This patch series adds the support for legacy
+mode and NO_PASID scalable mode.
+
+This is needed for the Live update IOMMU persistence to hotswap the
+iommu domain after liveupdate:
+https://lore.kernel.org/all/20251202230303.1017519-1-skhawaja@google.com/
+
+The patch adds the support for scalable mode NO_PASID mode by using the
+existing replace semantics. This works since in scalable mode the
+context entries are not updated and only the pasid entries are updated.
+
+The patch series also contains a vfio selftests for the iommu domain
+replace using iommufd hwpt replace functionality.
+
+Tested on a Host with scalable mode and on Qemu with legacy mode:
+
+tools/testing/selftests/vfio/scripts/setup.sh <dsa_device_bdf>
+tools/testing/selftests/vfio/vfio_iommufd_hwpt_replace_test <dsa_device_bdf>
+
+TAP version 13
+1..2
+# Starting 2 tests from 2 test cases.
+#  RUN           vfio_iommufd_replace_hwpt_test.domain_replace.memcpy ...
+#            OK  vfio_iommufd_replace_hwpt_test.domain_replace.memcpy
+ok 1 vfio_iommufd_replace_hwpt_test.domain_replace.memcpy
+#  RUN           vfio_iommufd_replace_hwpt_test.noreplace.memcpy ...
+#            OK  vfio_iommufd_replace_hwpt_test.noreplace.memcpy
+ok 2 vfio_iommufd_replace_hwpt_test.noreplace.memcpy
+# PASSED: 2 / 2 tests passed.
+# Totals: pass:2 fail:0 xfail:0 xpass:0 skip:0 error:0
+
+Samiullah Khawaja (3):
+  iommu/vt-d: Allow replacing no_pasid iommu_domain
+  vfio: selftests: Add support of creating iommus from iommufd
+  vfio: selftests: Add iommufd hwpt replace test
+
+ drivers/iommu/intel/iommu.c                   | 107 +++++++++----
+ tools/testing/selftests/vfio/Makefile         |   1 +
+ .../vfio/lib/include/libvfio/iommu.h          |   2 +
+ .../lib/include/libvfio/vfio_pci_device.h     |   2 +
+ tools/testing/selftests/vfio/lib/iommu.c      |  60 ++++++-
+ .../selftests/vfio/lib/vfio_pci_device.c      |  16 +-
+ .../vfio/vfio_iommufd_hwpt_replace_test.c     | 151 ++++++++++++++++++
+ 7 files changed, 303 insertions(+), 36 deletions(-)
+ create mode 100644 tools/testing/selftests/vfio/vfio_iommufd_hwpt_replace_test.c
+
+
+base-commit: 6cd6c12031130a349a098dbeb19d8c3070d2dfbe
+-- 
+2.52.0.351.gbe84eed79e-goog
+
