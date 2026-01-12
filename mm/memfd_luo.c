@@ -324,9 +324,15 @@ static void memfd_luo_finish(struct liveupdate_file_op_args *args)
 {
 	struct memfd_luo_folio_ser *folios_ser;
 	struct memfd_luo_ser *ser;
+	struct inode *inode;
 
 	if (args->retrieved)
 		return;
+
+	inode = file_inode(args->file);
+	inode_lock(inode);
+	shmem_freeze(inode, false);
+	inode_unlock(inode);
 
 	ser = phys_to_virt(args->serialized_data);
 	if (!ser)
@@ -465,6 +471,9 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 		if (err)
 			goto put_file;
 	}
+
+	/* Not taking lock because we hold exclusive reference to the file */
+	shmem_freeze(file_inode(file), true);
 
 	args->file = file;
 	kho_restore_free(ser);
