@@ -270,6 +270,11 @@ static int iopt_alloc_area_pages(struct io_pagetable *iopt,
 	}
 
 	down_write(&iopt->iova_rwsem);
+	if (iopt_lu_map_immutable(iopt)) {
+		rc = -EBUSY;
+		goto out_unlock;
+	}
+
 	if ((length & (iopt->iova_alignment - 1)) || !length) {
 		rc = -EINVAL;
 		goto out_unlock;
@@ -328,6 +333,7 @@ static void iopt_abort_area(struct iopt_area *area)
 		WARN_ON(area->pages);
 	if (area->iopt) {
 		down_write(&area->iopt->iova_rwsem);
+		WARN_ON(iopt_lu_map_immutable(area->iopt));
 		interval_tree_remove(&area->node, &area->iopt->area_itree);
 		up_write(&area->iopt->iova_rwsem);
 	}
@@ -755,6 +761,12 @@ static int iopt_unmap_iova_range(struct io_pagetable *iopt, unsigned long start,
 again:
 	down_read(&iopt->domains_rwsem);
 	down_write(&iopt->iova_rwsem);
+
+	if (iopt_lu_map_immutable(iopt)) {
+		rc = -EBUSY;
+		goto out_unlock_iova;
+	}
+
 	while ((area = iopt_area_iter_first(iopt, start, last))) {
 		unsigned long area_last = iopt_area_last_iova(area);
 		unsigned long area_first = iopt_area_iova(area);
@@ -1398,6 +1410,11 @@ int iopt_cut_iova(struct io_pagetable *iopt, unsigned long *iovas,
 	int i;
 
 	down_write(&iopt->iova_rwsem);
+	if (iopt->lu_map_immutable) {
+		up_write(&iopt->iova_rwsem);
+		return -EBUSY;
+	}
+
 	for (i = 0; i < num_iovas; i++) {
 		struct iopt_area *area;
 

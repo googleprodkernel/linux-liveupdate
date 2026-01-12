@@ -54,6 +54,29 @@ out:
 	return rc;
 }
 
+static void iommufd_set_ioas_mutable(struct iommufd_ctx *ictx)
+{
+	struct iommufd_object *obj;
+	struct iommufd_ioas *ioas;
+	unsigned long index;
+
+	xa_lock(&ictx->objects);
+	xa_for_each(&ictx->objects, index, obj) {
+		if (obj->type != IOMMUFD_OBJ_IOAS)
+			continue;
+
+		ioas = container_of(obj, struct iommufd_ioas, obj);
+
+		/*
+		 * Not taking any IOAS lock here. All writers take LUO
+		 * session mutex, and this writer racing with readers is not
+		 * really a problem.
+		 */
+		WRITE_ONCE(ioas->iopt.lu_map_immutable, false);
+	}
+	xa_unlock(&ictx->objects);
+}
+
 static int iommufd_save_hwpts(struct iommufd_ctx *ictx,
 			      struct iommufd_lu *iommufd_lu)
 {
@@ -81,10 +104,19 @@ static int iommufd_save_hwpts(struct iommufd_ctx *ictx,
 		if (!hwpt->lu_preserved)
 			continue;
 
-		/*
-		 * TODO: The HWPT should be made immutable, and cannot be
-		 * destroyed
-		 */
+		if (hwpt->ioas) {
+			/* Obtain exclusive access to the IOAS and IOPT while
+			 * we set immutability */
+			mutex_lock(&hwpt->ioas->mutex);
+			down_write(&hwpt->ioas->iopt.domains_rwsem);
+			down_write(&hwpt->ioas->iopt.iova_rwsem);
+
+			hwpt->ioas->iopt.lu_map_immutable = true;
+
+			up_write(&hwpt->ioas->iopt.iova_rwsem);
+			up_write(&hwpt->ioas->iopt.domains_rwsem);
+			mutex_unlock(&hwpt->ioas->mutex);
+		}
 
 		if (!hwpt->common.domain) {
 			rc = -EINVAL;
@@ -143,14 +175,14 @@ static int iommufd_liveupdate_preserve(struct liveupdate_file_op_args *args)
 
 	rc = iommufd_save_hwpts(ictx, NULL);
 	if (rc < 0)
-		goto err_ctx_put;
+		goto err_ioas_mutable;
 
 	serial_size = struct_size(iommufd_lu, hwpts, rc);
 
 	mem = kho_alloc_preserve(serial_size);
 	if (!mem) {
 		rc = -ENOMEM;
-		goto err_ctx_put;
+		goto err_ioas_mutable;
 	}
 
 	iommufd_lu = mem;
@@ -165,7 +197,8 @@ static int iommufd_liveupdate_preserve(struct liveupdate_file_op_args *args)
 
 err_free:
 	kho_unpreserve_free(mem);
-err_ctx_put:
+err_ioas_mutable:
+	iommufd_set_ioas_mutable(ictx);
 	iommufd_ctx_put(ictx);
 	return rc;
 }
@@ -194,9 +227,6 @@ static void iommufd_liveupdate_unpreserve(struct liveupdate_file_op_args *args)
 		hwpt = container_of(obj, struct iommufd_hwpt_paging, common.obj);
 		if (!hwpt->lu_preserved)
 			continue;
-
-		/* TODO: The HWPT should be made mutable again */
-
 		if (!hwpt->common.domain)
 			continue;
 
@@ -205,6 +235,8 @@ static void iommufd_liveupdate_unpreserve(struct liveupdate_file_op_args *args)
 	xa_unlock(&ictx->objects);
 
 	kho_unpreserve_free(phys_to_virt(args->serialized_data));
+
+	iommufd_set_ioas_mutable(ictx);
 	iommufd_ctx_put(ictx);
 }
 
