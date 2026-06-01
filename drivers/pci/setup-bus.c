@@ -1700,6 +1700,12 @@ static void pci_bridge_release_resources(struct pci_bus *bus,
 
 	idx = pci_resource_num(dev, b_win);
 
+	if (pci_liveupdate_is_incoming(dev)) {
+		pci_info(dev, "%s %pR: not releasing window of bridge preserved across Live Update\n",
+			 pci_resource_name(dev, idx), b_win);
+		return;
+	}
+
 	/* If there are children, release them all */
 	release_child_resources(b_win);
 
