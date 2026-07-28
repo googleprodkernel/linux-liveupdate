@@ -34,6 +34,7 @@ The following types of file descriptors can be preserved
    :maxdepth: 1
 
    ../mm/shmem_preservation
+   ../liveupdate/vmm
 
 Public API
 ==========
