@@ -68,9 +68,6 @@
 #include <linux/kvm_dirty_ring.h>
 
 
-/* Worst case buffer size needed for holding an integer. */
-#define ITOA_MAX_LEN 12
-
 MODULE_AUTHOR("Qumranet");
 MODULE_DESCRIPTION("Kernel-based Virtual Machine (KVM) Hypervisor");
 MODULE_LICENSE("GPL");
@@ -5496,29 +5493,18 @@ bool file_is_kvm(struct file *file)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(file_is_kvm);
 
-static int kvm_dev_ioctl_create_vm(unsigned long type)
+struct file *kvm_create_vm_file(unsigned long type, const char *fdname)
 {
-	char fdname[ITOA_MAX_LEN + 1];
-	int r, fd;
-	struct kvm *kvm;
+	struct kvm *kvm = kvm_create_vm(type, fdname);
 	struct file *file;
 
-	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0)
-		return fd;
-
-	snprintf(fdname, sizeof(fdname), "%d", fd);
-
-	kvm = kvm_create_vm(type, fdname);
-	if (IS_ERR(kvm)) {
-		r = PTR_ERR(kvm);
-		goto put_fd;
-	}
+	if (IS_ERR(kvm))
+		return ERR_CAST(kvm);
 
 	file = anon_inode_getfile("kvm-vm", &kvm_vm_fops, kvm, O_RDWR);
 	if (IS_ERR(file)) {
-		r = PTR_ERR(file);
-		goto put_kvm;
+		kvm_put_kvm(kvm);
+		return file;
 	}
 
 	/*
@@ -5527,13 +5513,33 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
 	 * cases it will be called by the final fput(file) and will take
 	 * care of doing kvm_put_kvm(kvm).
 	 */
-	kvm_uevent_notify_change(KVM_EVENT_CREATE_VM, kvm);
+
+	return file;
+}
+
+static int kvm_dev_ioctl_create_vm(unsigned long type)
+{
+	char fdname[ITOA_MAX_LEN + 1];
+	int r, fd;
+	struct file *file;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	snprintf(fdname, sizeof(fdname), "%d", fd);
+
+	file = kvm_create_vm_file(type, fdname);
+	if (IS_ERR(file)) {
+		r = PTR_ERR(file);
+		goto put_fd;
+	}
+
+	kvm_uevent_notify_change(KVM_EVENT_CREATE_VM, file->private_data);
 
 	fd_install(fd, file);
 	return fd;
 
-put_kvm:
-	kvm_put_kvm(kvm);
 put_fd:
 	put_unused_fd(fd);
 	return r;
