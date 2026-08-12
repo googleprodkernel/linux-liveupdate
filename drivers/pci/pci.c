@@ -5694,9 +5694,36 @@ int pci_probe_reset_slot(struct pci_slot *slot)
 }
 EXPORT_SYMBOL_GPL(pci_probe_reset_slot);
 
+/* Call @cb on every device a slot or bus reset affects, stopping on error. */
+static int pci_walk_reset_check(struct pci_bus *bus, struct pci_slot *slot,
+				int (*cb)(struct pci_dev *dev, void *data),
+				void *data)
+{
+	struct pci_dev *dev;
+	int rc;
+
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		if (slot && (!dev->slot || dev->slot != slot))
+			continue;
+		rc = cb(dev, data);
+		if (rc)
+			return rc;
+		if (dev->subordinate) {
+			rc = pci_walk_reset_check(dev->subordinate,
+						  NULL, cb, data);
+			if (rc)
+				return rc;
+		}
+	}
+
+	return 0;
+}
+
 /**
  * pci_try_reset_slot - Try to reset a PCI slot
  * @slot: PCI slot to reset
+ * @check: optional per-device callback that can abort the reset
+ * @data: opaque argument for @check
  *
  * A PCI bus may host multiple slots, each slot may support a reset mechanism
  * independent of other slots.  For instance, some slots may support slot power
@@ -5709,7 +5736,9 @@ EXPORT_SYMBOL_GPL(pci_probe_reset_slot);
  *
  * Same as above except return -EAGAIN if the slot cannot be locked
  */
-static int pci_try_reset_slot(struct pci_slot *slot)
+static int pci_try_reset_slot(struct pci_slot *slot,
+			      int (*check)(struct pci_dev *dev, void *data),
+			      void *data)
 {
 	int rc;
 
@@ -5718,10 +5747,14 @@ static int pci_try_reset_slot(struct pci_slot *slot)
 		return rc;
 
 	if (pci_slot_trylock(slot)) {
-		pci_slot_save_and_disable_locked(slot);
-		might_sleep();
-		rc = pci_reset_hotplug_slot(slot->hotplug, PCI_RESET_DO_RESET);
-		pci_slot_restore_locked(slot);
+		rc = check ? pci_walk_reset_check(slot->bus, slot, check, data) : 0;
+		if (!rc) {
+			pci_slot_save_and_disable_locked(slot);
+			might_sleep();
+			rc = pci_reset_hotplug_slot(slot->hotplug,
+						    PCI_RESET_DO_RESET);
+			pci_slot_restore_locked(slot);
+		}
 		pci_slot_unlock(slot);
 	} else
 		rc = -EAGAIN;
@@ -5753,10 +5786,14 @@ static int pci_bus_reset(struct pci_bus *bus, bool probe)
 /**
  * pci_try_reset_bus - Try to reset a PCI bus
  * @bus: top level PCI bus to reset
+ * @check: optional per-device callback that can abort the reset
+ * @data: opaque argument for @check
  *
  * Same as above except return -EAGAIN if the bus cannot be locked
  */
-static int pci_try_reset_bus(struct pci_bus *bus)
+static int pci_try_reset_bus(struct pci_bus *bus,
+			     int (*check)(struct pci_dev *dev, void *data),
+			     void *data)
 {
 	int rc;
 
@@ -5765,10 +5802,13 @@ static int pci_try_reset_bus(struct pci_bus *bus)
 		return rc;
 
 	if (pci_bus_trylock(bus)) {
-		pci_bus_save_and_disable_locked(bus);
-		might_sleep();
-		rc = pci_bridge_secondary_bus_reset(bus->self);
-		pci_bus_restore_locked(bus);
+		rc = check ? pci_walk_reset_check(bus, NULL, check, data) : 0;
+		if (!rc) {
+			pci_bus_save_and_disable_locked(bus);
+			might_sleep();
+			rc = pci_bridge_secondary_bus_reset(bus->self);
+			pci_bus_restore_locked(bus);
+		}
 		pci_bus_unlock(bus);
 	} else
 		rc = -EAGAIN;
@@ -5807,7 +5847,7 @@ static int pci_reset_bridge(struct pci_dev *bridge, bool restore)
 
 	list_for_each_entry(slot, &bus->slots, list) {
 		if (restore)
-			ret = pci_try_reset_slot(slot);
+			ret = pci_try_reset_slot(slot, NULL, NULL);
 		else
 			ret = pci_slot_reset(slot, PCI_RESET_DO_RESET);
 
@@ -5821,7 +5861,7 @@ bus_reset:
 	mutex_unlock(&pci_slot_mutex);
 
 	if (restore)
-		return pci_try_reset_bus(bus);
+		return pci_try_reset_bus(bus, NULL, NULL);
 	return pci_bus_reset(bridge->subordinate, PCI_RESET_DO_RESET);
 }
 
@@ -5853,15 +5893,42 @@ int pci_probe_reset_bus(struct pci_bus *bus)
 EXPORT_SYMBOL_GPL(pci_probe_reset_bus);
 
 /**
+ * pci_reset_bus_cond - conditionally reset the slot or bus containing a device
+ * @pdev: top level PCI device to reset via slot/bus
+ * @check: optional callback invoked on each affected device before the reset
+ * @data: opaque argument passed to @check
+ *
+ * Reset the slot or bus containing @pdev.  Once the entire physical bus/slot
+ * hierarchy is locked, @check (if not NULL) is called on each of those locked
+ * devices.  A nonzero return aborts the reset and is returned to the caller,
+ * otherwise the reset proceeds.
+ *
+ * NB. @check runs with the full set of device_locks noted above held; callbacks
+ * must take these locking semantics into account.  Use NULL to perform an
+ * unconditional reset.
+ *
+ * Return: 0 on success, -ENOTTY if @pdev is not resettable, -EAGAIN if the
+ * devices cannot be locked, or the value returned by @check.
+ */
+int pci_reset_bus_cond(struct pci_dev *pdev,
+		       int (*check)(struct pci_dev *dev, void *data),
+		       void *data)
+{
+	return !pci_probe_reset_slot(pdev->slot) ?
+		pci_try_reset_slot(pdev->slot, check, data) :
+		pci_try_reset_bus(pdev->bus, check, data);
+}
+EXPORT_SYMBOL_GPL(pci_reset_bus_cond);
+
+/**
  * pci_reset_bus - Try to reset a PCI bus
  * @pdev: top level PCI device to reset via slot/bus
  *
- * Same as above except return -EAGAIN if the bus cannot be locked
+ * Same as above without the conditional check.
  */
 int pci_reset_bus(struct pci_dev *pdev)
 {
-	return (!pci_probe_reset_slot(pdev->slot)) ?
-	    pci_try_reset_slot(pdev->slot) : pci_try_reset_bus(pdev->bus);
+	return pci_reset_bus_cond(pdev, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(pci_reset_bus);
 
