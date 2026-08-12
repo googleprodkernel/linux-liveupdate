@@ -101,6 +101,7 @@ bool pci_reset_supported(struct pci_dev *dev)
 {
 	return dev->reset_methods[0] != 0;
 }
+EXPORT_SYMBOL_GPL(pci_reset_supported);
 
 #ifdef CONFIG_PCI_DOMAINS
 int pci_domains_supported = 1;
