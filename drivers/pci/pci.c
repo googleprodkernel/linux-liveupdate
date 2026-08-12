@@ -5349,11 +5349,22 @@ int pci_reset_function(struct pci_dev *dev)
 		pci_dev_lock(bridge);
 
 	pci_dev_lock(dev);
+
+	/*
+	 * Reset of an SR-IOV PF necessarily resets any active VFs.  Such resets are
+	 * beyond the scope advertised for pci_reset_function() and variants, refuse.
+	 */
+	if (pci_num_vf(dev) > 0) {
+		rc = -ENOTTY;
+		goto unlock;
+	}
+
 	pci_dev_save_and_disable(dev);
 
 	rc = __pci_reset_function_locked(dev);
 
 	pci_dev_restore(dev);
+unlock:
 	pci_dev_unlock(dev);
 
 	if (bridge)
@@ -5391,6 +5402,9 @@ int pci_reset_function_locked(struct pci_dev *dev)
 	if (!pci_reset_supported(dev))
 		return -ENOTTY;
 
+	if (pci_num_vf(dev) > 0)
+		return -ENOTTY;
+
 	pci_dev_save_and_disable(dev);
 
 	rc = __pci_reset_function_locked(dev);
@@ -5416,6 +5430,11 @@ int pci_try_reset_function(struct pci_dev *dev)
 
 	if (!pci_dev_trylock(dev))
 		return -EAGAIN;
+
+	if (pci_num_vf(dev) > 0) {
+		pci_dev_unlock(dev);
+		return -ENOTTY;
+	}
 
 	pci_dev_save_and_disable(dev);
 	rc = __pci_reset_function_locked(dev);

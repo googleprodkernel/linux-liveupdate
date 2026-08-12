@@ -794,7 +794,9 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 		if (bridge && !pci_dev_trylock(bridge))
 			goto out_restore_state;
 		if (pci_dev_trylock(pdev)) {
-			if (!__pci_reset_function_locked(pdev))
+			/* Enforce function scope under lock for SR-IOV PFs */
+			if (!pci_num_vf(pdev) &&
+			    !__pci_reset_function_locked(pdev))
 				vdev->needs_reset = false;
 			pci_dev_unlock(pdev);
 		}
