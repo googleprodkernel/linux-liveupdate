@@ -3743,10 +3743,14 @@ void pci_allocate_cap_save_buffers(struct pci_dev *dev)
 			pci_err(dev, "unable to reserve PCI-X save state\n");
 	}
 
-	error = pci_add_ext_cap_save_buffer(dev, PCI_EXT_CAP_ID_LTR,
-					    2 * sizeof(u16));
-	if (error)
-		pci_err(dev, "unable to allocate suspend buffer for LTR\n");
+	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_LTR);
+	if (pos) {
+		unsigned int off = pos + PCI_LTR_MAX_SNOOP_LAT;
+
+		error = pci_reserve_saved_cap(dev, off, sizeof(u32));
+		if (error)
+			pci_err(dev, "unable to reserve LTR save state\n");
+	}
 
 	pci_allocate_acs_save_buffer(dev);
 	pci_allocate_vc_save_buffers(dev);
