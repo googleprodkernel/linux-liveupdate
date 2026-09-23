@@ -94,9 +94,9 @@ bool pci_saved_cap_reserved(struct pci_dev *dev, unsigned int off)
  * @off: offset of the register in configuration space
  * @len: size of the register in bytes
  *
- * Reserve room to save the register at @off, which may then be saved with
- * pci_save_cap_word() and friends. Must be called during device setup, before
- * the store is finalized.
+ * Reserve room to save the register at @off, which pci_save_caps() then reads
+ * into the store. Must be called during device setup, before the store is
+ * finalized.
  *
  * Return: 0 on success, negative errno otherwise.
  */
@@ -136,6 +136,27 @@ int pci_reserve_saved_cap(struct pci_dev *dev, unsigned int off, unsigned int le
 }
 
 /**
+ * pci_save_caps - save every reserved capability register
+ * @dev: the PCI device
+ *
+ * Read all of the configuration space DWORDs that capabilities reserved during
+ * device setup into the store. Values are kept in ascending offset order, the
+ * same order that for_each_set_bit() walks the reservation bitmap, so the
+ * destination slot advances in lockstep with the bitmap and needs no lookup.
+ */
+void pci_save_caps(struct pci_dev *dev)
+{
+	struct pci_saved_caps *caps = &dev->saved_caps;
+	unsigned int dword, i = 0;
+
+	if (!caps->dword_val)
+		return;
+
+	for_each_set_bit(dword, caps->dword_map, PCI_CFG_SPACE_EXP_DWORDS)
+		pci_read_config_dword(dev, dword * sizeof(u32), &caps->dword_val[i++]);
+}
+
+/**
  * pci_save_cap_dword - save a 32-bit capability register
  * @dev: the PCI device
  * @off: offset of the register in configuration space
@@ -148,16 +169,6 @@ void pci_save_cap_dword(struct pci_dev *dev, unsigned int off)
 		return;
 
 	pci_read_config_dword(dev, ALIGN_DOWN(off, sizeof(u32)), slot);
-}
-
-/**
- * pci_save_cap_word - save a 16-bit capability register
- * @dev: the PCI device
- * @off: offset of the register in configuration space
- */
-void pci_save_cap_word(struct pci_dev *dev, unsigned int off)
-{
-	pci_save_cap_dword(dev, ALIGN_DOWN(off, sizeof(u32)));
 }
 
 /**
