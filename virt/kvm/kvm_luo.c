@@ -65,6 +65,7 @@ static int kvm_luo_preserve(struct liveupdate_file_op_args *args)
 {
 	struct kvm *kvm = args->file->private_data;
 	struct kvm_luo_ser *ser;
+	int err;
 
 	mutex_lock(&kvm->lock);
 	if (kvm->luo_preserved) {
@@ -83,16 +84,16 @@ static int kvm_luo_preserve(struct liveupdate_file_op_args *args)
 		return PTR_ERR(ser);
 	}
 
-#if defined(CONFIG_X86)
-	ser->type = kvm->arch.vm_type;
-#elif defined(CONFIG_ARM64)
-	ser->type = kvm_phys_shift(&kvm->arch.mmu);
-	if (kvm_vm_is_protected(kvm))
-		ser->type |= KVM_VM_TYPE_ARM_PROTECTED;
-
-#else
+	/*
+	 * @type is the argument the new kernel will pass to KVM_CREATE_VM, and
+	 * only the architecture knows how to spell it.
+	 */
 	ser->type = 0;
-#endif
+	err = kvm_arch_vm_luo_preserve(kvm, ser);
+	if (err) {
+		kho_unpreserve_free(ser);
+		return err;
+	}
 
 	kvm->luo_preserved = true;
 	mutex_unlock(&kvm->lock);
