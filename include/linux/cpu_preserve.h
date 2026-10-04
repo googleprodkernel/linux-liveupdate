@@ -53,6 +53,8 @@ struct cpupr_ser;
  * @session_pgd_pa: Session root page table physical address, or 0.
  * @ser: Preserved CPU descriptor in isolated address space.
  * @entry_fn: Workload entry function to run.
+ * @fault: Faults and machine checks taken by the preserved CPU (x86).
+ * @x86: Descriptor tables and exception stacks (x86).
  *
  * This structure lives at the base of a preserved CPU's dedicated stack and is
  * accessed by the preserved CPU during parking and workload execution. It is
@@ -64,6 +66,10 @@ struct cpupr_stack_context {
 	u64 session_pgd_pa;
 	struct cpupr_ser *ser;
 	void (*entry_fn)(void *data);
+#ifdef CONFIG_X86_64
+	struct x86_preserved_fault fault;
+	struct x86_preserved_cpu x86;
+#endif
 };
 
 /**
@@ -266,6 +272,9 @@ void *cpupr_as_alloc_buffer(struct cpupr_session *ps, size_t size);
 int cpupr_as_adopt_page(struct cpupr_session *ps, struct page *page);
 
 const struct cpumask *cpupr_session_cpus(struct cpupr_session *ps);
+
+void arch_cpupr_switch_pgd(phys_addr_t pgd_pa)
+	__cpupr_sym_asm(arch_cpupr_switch_pgd);
 
 /**
  * arch_cpupr_as_map - Add one range to a preserved address space

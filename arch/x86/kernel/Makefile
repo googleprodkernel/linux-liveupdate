@@ -78,6 +78,15 @@ obj-$(CONFIG_IRQ_WORK)  += irq_work.o
 obj-y			+= probe_roms.o
 obj-$(CONFIG_X86_32)	+= sys_ia32.o
 obj-$(CONFIG_IA32_EMULATION)	+= sys_ia32.o signal_32.o
+preserved-obj-$(CONFIG_LIVEUPDATE_CPU) += cpu_preserve_runtime.preserved.o \
+					  preserve_cpu.preserved.o \
+					  lib-memcpy_64.preserved.o \
+					  lib-memmove_64.preserved.o \
+					  lib-memset_64.preserved.o
+include $(srctree)/scripts/Makefile.cpu_preserve
+$(obj)/lib-%.preserved.raw.o: $(srctree)/arch/x86/lib/%.S FORCE
+	$(call if_changed_rule,as_o_S)
+obj-y				+= $(preserved-obj-y)
 obj-$(CONFIG_X86_64)	+= sys_x86_64.o
 obj-$(CONFIG_X86_ESPFIX64)	+= espfix_64.o
 obj-$(CONFIG_SYSFS)	+= ksysfs.o
