@@ -165,6 +165,27 @@ u64 arch_cpupr_hwid(unsigned int cpu);
 void arch_cpupr_park_finish(int cpu) __cpupr_sym_asm(arch_cpupr_park_finish);
 
 /**
+ * arch_cpupr_early_init - Initialize the arch data of the runtime
+ *
+ * Architecture backend hook that initializes the data the preserved runtime
+ * reads, such as the x86 preserved IDT.  Called once at boot, before the
+ * runtime is copied: preserved CPUs run on the copy, which later writes to
+ * the sections do not reach.
+ */
+void arch_cpupr_early_init(void);
+
+/**
+ * arch_cpupr_mode - Modes of the kernel that preserved CPUs depend on
+ *
+ * Architecture backend hook.  The outgoing kernel records its value in the
+ * handover data, and the incoming kernel refuses the handover unless it
+ * returns the same value, such as the same x86 APIC mode.
+ *
+ * Return: Architecture mode descriptor.
+ */
+struct cpupr_arch_mode_ser arch_cpupr_mode(void);
+
+/**
  * arch_cpupr_park_on_stack - Switch stack and enter park loop
  * @cpu: Logical CPU identifier.
  * @stack_top: Top of the dedicated preserved stack.

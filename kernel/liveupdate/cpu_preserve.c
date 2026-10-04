@@ -221,6 +221,7 @@
 #include <linux/capability.h>
 #include <linux/cpu.h>
 #include <linux/cpu_preserve.h>
+#include "luo_internal.h"
 #include <linux/file.h>
 #include <linux/fs_struct.h>
 #include <linux/iopoll.h>
@@ -265,6 +266,9 @@ static struct cpumask cpupr_incoming_mask;
 static struct cpumask cpupr_outgoing_mask;
 static DEFINE_PER_CPU(struct cpupr_ser *, cpupr_cpu_ser);
 static DEFINE_PER_CPU(struct cpupr_session *, cpupr_cpu_session);
+/* The link that points to the descriptor of a CPU on the handover list */
+static DEFINE_PER_CPU(u64 *, cpupr_cpu_link);
+static struct cpupr_global_ser *cpupr_global_ser;
 
 /* The session whose address space adopted each page, indexed by PFN */
 static DEFINE_XARRAY(cpupr_adopted);
@@ -620,6 +624,32 @@ err_as_unpreserve:
 	return ret;
 }
 
+static bool cpupr_folio_block_ser_is_valid(struct cpupr_folio_block_ser *fb)
+{
+	return fb && fb->size == sizeof(*fb) && fb->flags == 0 &&
+		fb->count <= CPUPR_FOLIOS_PER_BLOCK;
+}
+
+/* Free an incoming address space, which the previous kernel created. */
+static void cpupr_as_restore_free(struct cpupr_as_ser *ser)
+{
+	struct cpupr_folio_block_ser *blk, *next;
+
+	if (!ser)
+		return;
+
+	for (blk = KHOSER_LOAD_PTR(ser->folios); blk; blk = next) {
+		if (WARN_ON_ONCE(!cpupr_folio_block_ser_is_valid(blk)))
+			break;
+
+		next = KHOSER_LOAD_PTR(blk->next);
+		for (u64 i = 0; i < blk->count; i++)
+			kho_restore_free(phys_to_virt(blk->pa[i]));
+		kho_restore_free(blk);
+	}
+	kho_restore_free(ser);
+}
+
 static bool cpupr_is_incoming(int cpu)
 {
 	if ((unsigned int)cpu >= nr_cpu_ids)
@@ -838,6 +868,38 @@ void cpupr_park(int cpu)
 	arch_cpupr_park_on_stack(cpu, (unsigned long)sctx + CPUPR_STACK_SIZE);
 }
 
+static bool cpupr_is_frozen(unsigned int cpu)
+{
+	return per_cpu(cpupr_cpu_link, cpu) != NULL;
+}
+
+/*
+ * Unlink @cpu from the list of CPUs handed over to the next kernel.  Each CPU
+ * on the list records the link that points to its descriptor, the head of the
+ * list or the descriptor of the CPU before it, so that unlinking is O(1).
+ */
+static void cpupr_handover_del(unsigned int cpu)
+{
+	struct cpupr_ser *ser = per_cpu(cpupr_cpu_ser, cpu);
+	struct cpupr_ser *next = KHOSER_LOAD_PTR(ser->next);
+	u64 *link = per_cpu(cpupr_cpu_link, cpu);
+
+	lockdep_assert_held(&cpupr_lock);
+
+	*link = ser->next.phys;
+	cpupr_clean(link);
+	if (next) {
+		int next_cpu = cpupr_find_cpu_by_hwid(next->hwid);
+
+		if (!WARN_ON_ONCE(next_cpu < 0))
+			per_cpu(cpupr_cpu_link, next_cpu) = link;
+	}
+
+	ser->next.phys = 0;
+	cpupr_clean(ser);
+	per_cpu(cpupr_cpu_link, cpu) = NULL;
+}
+
 /*
  * Drop @cpu out of the preserved state.  The caller holds cpupr_lock,
  * and the core either never parked or has stopped.  Its stack and descriptor
@@ -847,6 +909,10 @@ void cpupr_park(int cpu)
 static void cpupr_unpreserve_locked(unsigned int cpu)
 {
 	lockdep_assert_held(&cpupr_lock);
+
+	/* LUO unfreezes a file before it unpreserves it */
+	if (WARN_ON_ONCE(cpupr_is_frozen(cpu)))
+		cpupr_handover_del(cpu);
 
 	WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), NULL);
 	per_cpu(cpupr_cpu_session, cpu) = NULL;
@@ -872,7 +938,11 @@ static struct cpupr_session *cpupr_session_alloc(void)
 
 static void cpupr_session_release(struct cpupr_session *ps)
 {
-	cpupr_as_unpreserve(ps);
+	if (ps->incoming)
+		cpupr_as_restore_free(ps->as);
+	else
+		cpupr_as_unpreserve(ps);
+
 	kfree(ps);
 }
 
@@ -989,6 +1059,29 @@ static void cpupr_session_remove_cpu(struct cpupr_session *ps,
 
 	if (empty)
 		cpupr_session_release(ps);
+}
+
+/*
+ * Look up the incoming preserved CPU session of @as, or create it.
+ */
+static struct cpupr_session *cpupr_incoming_session_get(struct cpupr_as_ser *as)
+{
+	struct cpupr_session *ps;
+
+	lockdep_assert_held(&cpupr_sessions_lock);
+	list_for_each_entry(ps, &cpupr_sessions, node) {
+		if (ps->incoming && ps->as == as)
+			return ps;
+	}
+
+	ps = cpupr_session_alloc();
+	if (!ps)
+		return NULL;
+
+	ps->incoming = true;
+	ps->as = as;
+	list_add(&ps->node, &cpupr_sessions);
+	return ps;
 }
 
 /* Map the context block and the stack, but not the guard page between them. */
@@ -1181,6 +1274,247 @@ err_put:
 	return ret;
 }
 
+static int cpupr_preserve_runtime_buffer(void)
+{
+	int ret;
+
+	lockdep_assert_held(&cpupr_lock);
+
+	ret = kho_preserve_folio(cpupr_text_folio);
+	if (ret)
+		return ret;
+
+	ret = kho_preserve_folio(cpupr_data_folio);
+	if (ret) {
+		kho_unpreserve_folio(cpupr_text_folio);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void cpupr_unpreserve_runtime_buffer(void)
+{
+	lockdep_assert_held(&cpupr_lock);
+
+	kho_unpreserve_folio(cpupr_text_folio);
+	kho_unpreserve_folio(cpupr_data_folio);
+}
+
+static int cpupr_flb_preserve(struct liveupdate_flb_op_args *argp)
+{
+	struct cpupr_global_ser *ser;
+	int ret;
+
+	guard(mutex)(&cpupr_lock);
+	ret = cpupr_init_runtime_buffer_locked();
+	if (ret)
+		return ret;
+
+	ret = cpupr_preserve_runtime_buffer();
+	if (ret)
+		return ret;
+
+	ser = kho_alloc_preserve(sizeof(*ser));
+	if (IS_ERR(ser)) {
+		cpupr_unpreserve_runtime_buffer();
+		return PTR_ERR(ser);
+	}
+
+	/* The CPUs are linked when LUO freezes their files */
+	ser->size = sizeof(*ser);
+	ser->text_runtime_pa = PFN_PHYS(folio_pfn(cpupr_text_folio));
+	ser->text_runtime_size = folio_size(cpupr_text_folio);
+	ser->data_runtime_pa = PFN_PHYS(folio_pfn(cpupr_data_folio));
+	ser->data_runtime_size = folio_size(cpupr_data_folio);
+	ser->arch_mode = arch_cpupr_mode();
+	cpupr_clean(ser);
+	cpupr_global_ser = ser;
+
+	argp->data = virt_to_phys(ser);
+	argp->obj = ser;
+	return 0;
+}
+
+static void cpupr_flb_unpreserve(struct liveupdate_flb_op_args *argp)
+{
+	struct cpupr_global_ser *ser;
+
+	if (!argp->data)
+		return;
+
+	ser = phys_to_virt(argp->data);
+	scoped_guard(mutex, &cpupr_lock) {
+		if (WARN_ON_ONCE(!cpumask_empty(&cpupr_outgoing_mask)))
+			return;
+		cpupr_global_ser = NULL;
+		cpupr_unpreserve_runtime_buffer();
+	}
+
+	kho_unpreserve_free(ser);
+}
+
+static bool cpupr_runtime_valid(u64 pa, u64 size)
+{
+	return pa && size && PAGE_ALIGNED(pa) && PAGE_ALIGNED(size);
+}
+
+static bool cpupr_ser_is_valid(struct cpupr_ser *ser)
+{
+	return ser && ser->size == sizeof(*ser) && ser->flags == 0 &&
+		ser->reserved == 0 && ser->stack_pa &&
+		PAGE_ALIGNED(ser->stack_pa) && READ_ONCE(ser->state) < CPUPR_NR_STATES;
+}
+
+static bool cpupr_as_ser_is_valid(struct cpupr_as_ser *as)
+{
+	bool c = (as && as->size == sizeof(*as) && as->flags == 0 &&
+		  as->pgd_pa && PAGE_ALIGNED(as->pgd_pa));
+
+	return c && cpupr_folio_block_ser_is_valid(KHOSER_LOAD_PTR(as->folios));
+}
+
+/*
+ * Validate @ser and take over the incoming CPU it describes, attaching it to
+ * the session of its isolated address space.
+ */
+static int cpupr_restore_cpu(struct cpupr_ser *ser)
+{
+	struct cpupr_session *ps;
+	int cpu;
+
+	if (!cpupr_ser_is_valid(ser)) {
+		luo_restore_fail("invalid cpupr_ser format\n");
+		return -EINVAL;
+	}
+
+	if (!cpupr_as_ser_is_valid(KHOSER_LOAD_PTR(ser->as))) {
+		luo_restore_fail("invalid cpupr_as_ser format\n");
+		return -EINVAL;
+	}
+
+	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+	if (cpu < 0) {
+		luo_restore_fail("no CPU with hardware id 0x%llx\n", ser->hwid);
+		return cpu;
+	}
+
+	if (cpu_online(cpu)) {
+		luo_restore_fail("Preserved cpu %d is on-line\n", cpu);
+		return -EBUSY;
+	}
+
+	if (cpumask_test_and_set_cpu(cpu, &cpupr_incoming_mask)) {
+		luo_restore_fail("double entry for cpu %d (hwid 0x%llx)\n",
+				 cpu, ser->hwid);
+		return -EEXIST;
+	}
+
+	ps = cpupr_incoming_session_get(KHOSER_LOAD_PTR(ser->as));
+	if (!ps) {
+		luo_restore_fail("failed to allocate incoming session\n");
+		return -ENOMEM;
+	}
+
+	cpumask_set_cpu(cpu, &ps->cpus);
+	per_cpu(cpupr_cpu_ser, cpu) = ser;
+	per_cpu(cpupr_cpu_session, cpu) = ps;
+	return 0;
+}
+
+/*
+ * Take over the CPUs listed in @gser, with their sessions.
+ */
+static int cpupr_restore_cpus(struct cpupr_global_ser *gser)
+{
+	struct cpupr_ser *pser;
+	int ret;
+
+	guard(mutex)(&cpupr_sessions_lock);
+	guard(mutex)(&cpupr_lock);
+
+	if (!KHOSER_LOAD_PTR(gser->cpus)) {
+		luo_restore_fail("no preserved CPUs listed\n");
+		return -EINVAL;
+	}
+
+	for (pser = KHOSER_LOAD_PTR(gser->cpus); pser; pser = KHOSER_LOAD_PTR(pser->next)) {
+		ret = cpupr_restore_cpu(pser);
+		if (ret)
+			return ret;
+	}
+
+	cpumask_or(&cpupr_mask, &cpupr_mask, &cpupr_incoming_mask);
+	return 0;
+}
+
+static int cpupr_flb_retrieve(struct liveupdate_flb_op_args *argp)
+{
+	struct cpupr_arch_mode_ser mode = arch_cpupr_mode();
+	struct cpupr_global_ser *ser;
+	int ret;
+
+	if (!argp->data) {
+		luo_restore_fail("invalid flb data\n");
+		return -EINVAL;
+	}
+
+	ser = phys_to_virt(argp->data);
+	if (ser->size != sizeof(*ser) || ser->flags != 0) {
+		luo_restore_fail("invalid cpupr_global_ser\n");
+		return -EINVAL;
+	}
+
+	if (!cpupr_runtime_valid(ser->text_runtime_pa, ser->text_runtime_size) ||
+	    !cpupr_runtime_valid(ser->data_runtime_pa, ser->data_runtime_size)) {
+		luo_restore_fail("invalid runtime buffers\n");
+		return -EINVAL;
+	}
+
+	if (memcmp(&ser->arch_mode, &mode, sizeof(mode))) {
+		luo_restore_fail("incompatible arch mode\n");
+		return -EINVAL;
+	}
+
+	ret = cpupr_restore_cpus(ser);
+	if (ret)
+		return ret;
+
+	argp->obj = ser;
+	return 0;
+}
+
+static void cpupr_flb_finish(struct liveupdate_flb_op_args *argp)
+{
+	struct cpupr_global_ser *ser = argp->obj;
+
+	if (!ser)
+		return;
+
+	guard(mutex)(&cpupr_lock);
+	if (WARN_ON_ONCE(!cpumask_empty(&cpupr_incoming_mask)))
+		return;
+
+	if (ser->text_runtime_pa)
+		kho_restore_free(phys_to_virt(ser->text_runtime_pa));
+	if (ser->data_runtime_pa)
+		kho_restore_free(phys_to_virt(ser->data_runtime_pa));
+	kho_restore_free(ser);
+}
+
+static const struct liveupdate_flb_ops cpupr_flb_ops = {
+	.preserve   = cpupr_flb_preserve,
+	.unpreserve = cpupr_flb_unpreserve,
+	.retrieve   = cpupr_flb_retrieve,
+	.finish     = cpupr_flb_finish,
+	.owner      = THIS_MODULE,
+};
+
+static struct liveupdate_flb cpupr_flb = {
+	.ops        = &cpupr_flb_ops,
+	.compatible = CPUPR_LUO_FLB_COMPATIBLE,
+};
+
 static ssize_t preserved_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
@@ -1282,6 +1616,59 @@ static void cpupr_unpreserve_cb(struct liveupdate_file_op_args *args)
 	cpupr_session_remove_cpu(ps, cpu);
 }
 
+/*
+ * Put the CPU of a frozen file on the list of CPUs handed over to the next
+ * kernel, in O(1).
+ */
+static int cpupr_freeze_cb(struct liveupdate_file_op_args *args)
+{
+	struct cpupr_global_ser *gser;
+	struct cpupr_ser *ser, *first;
+	unsigned int cpu;
+
+	if (!args->serialized_data)
+		return -EINVAL;
+
+	ser = phys_to_virt(args->serialized_data);
+	cpu = ser->cpu;
+
+	guard(mutex)(&cpupr_lock);
+	gser = cpupr_global_ser;
+	if (WARN_ON_ONCE(!gser || cpu >= nr_cpu_ids ||
+			 !cpumask_test_cpu(cpu, &cpupr_outgoing_mask) ||
+			 per_cpu(cpupr_cpu_ser, cpu) != ser ||
+			 cpupr_is_frozen(cpu)))
+		return -EINVAL;
+
+	/* Insert @ser at the head of the list, see cpupr_handover_del() */
+	first = KHOSER_LOAD_PTR(gser->cpus);
+	ser->next.phys = gser->cpus.phys;
+	if (first)
+		per_cpu(cpupr_cpu_link, first->cpu) = &ser->next.phys;
+	KHOSER_STORE_PTR(gser->cpus, ser);
+	per_cpu(cpupr_cpu_link, cpu) = &gser->cpus.phys;
+	cpupr_clean(ser);
+	cpupr_clean(gser);
+	return 0;
+}
+
+static void cpupr_unfreeze_cb(struct liveupdate_file_op_args *args)
+{
+	struct cpupr_ser *ser;
+	unsigned int cpu;
+
+	if (!args->serialized_data)
+		return;
+
+	ser = phys_to_virt(args->serialized_data);
+	cpu = ser->cpu;
+
+	guard(mutex)(&cpupr_lock);
+	if (cpu < nr_cpu_ids && cpupr_is_frozen(cpu) &&
+	    !WARN_ON_ONCE(per_cpu(cpupr_cpu_ser, cpu) != ser))
+		cpupr_handover_del(cpu);
+}
+
 /* The CPU that the previous kernel handed over with @ser, or -ENOENT */
 static int cpupr_incoming_cpu(u64 data)
 {
@@ -1349,6 +1736,8 @@ static const struct liveupdate_file_ops cpu_preserve_file_ops = {
 	.preserve     = cpupr_preserve_cb,
 	.retrieve     = cpupr_retrieve_cb,
 	.unpreserve   = cpupr_unpreserve_cb,
+	.freeze       = cpupr_freeze_cb,
+	.unfreeze     = cpupr_unfreeze_cb,
 	.finish       = cpupr_finish_cb,
 	.owner        = THIS_MODULE,
 };
@@ -1360,10 +1749,13 @@ static struct liveupdate_file_handler cpu_preserve_handler = {
 
 static int __init cpu_preserve_early_init(void)
 {
+	void *obj;
 	int err;
 
 	if (!liveupdate_enabled())
 		return 0;
+
+	arch_cpupr_early_init();
 
 	err = liveupdate_register_file_handler(&cpu_preserve_handler);
 	if (err) {
@@ -1371,6 +1763,19 @@ static int __init cpu_preserve_early_init(void)
 		       ERR_PTR(err));
 		return err;
 	}
+
+	err = liveupdate_register_flb(&cpu_preserve_handler,
+				      &cpupr_flb);
+	if (err) {
+		pr_err("Could not register cpu_preserve FLB: %pe\n",
+		       ERR_PTR(err));
+		liveupdate_unregister_file_handler(&cpu_preserve_handler);
+		return err;
+	}
+
+	/* Retrieve incoming preserved CPUs before secondary CPU bringup */
+	if (!liveupdate_flb_get_incoming(&cpupr_flb, &obj))
+		liveupdate_flb_put_incoming(&cpupr_flb);
 
 	return 0;
 }
