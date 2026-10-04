@@ -10,37 +10,9 @@
 #include <asm/sev.h>
 #include <asm/traps.h>
 #include <asm/kdebug.h>
+#include <asm/extable_handlers.h>
 #include <asm/insn-eval.h>
 #include <asm/sgx.h>
-
-static inline unsigned long *pt_regs_nr(struct pt_regs *regs, int nr)
-{
-	int reg_offset = pt_regs_offset(regs, nr);
-	static unsigned long __dummy;
-
-	if (WARN_ON_ONCE(reg_offset < 0))
-		return &__dummy;
-
-	return (unsigned long *)((unsigned long)regs + reg_offset);
-}
-
-static inline unsigned long
-ex_fixup_addr(const struct exception_table_entry *x)
-{
-	return (unsigned long)&x->fixup + x->fixup;
-}
-
-static bool ex_handler_default(const struct exception_table_entry *e,
-			       struct pt_regs *regs)
-{
-	if (e->data & EX_FLAG_CLEAR_AX)
-		regs->ax = 0;
-	if (e->data & EX_FLAG_CLEAR_DX)
-		regs->dx = 0;
-
-	regs->ip = ex_fixup_addr(e);
-	return true;
-}
 
 /*
  * This is the *very* rare case where we do a "load_unaligned_zeropad()"
@@ -93,13 +65,6 @@ static bool ex_handler_zeropad(const struct exception_table_entry *e,
 
 	*reg = *(unsigned long *)addr >> (offset * 8);
 	return ex_handler_default(e, regs);
-}
-
-static bool ex_handler_fault(const struct exception_table_entry *fixup,
-			     struct pt_regs *regs, int trapnr)
-{
-	regs->ax = trapnr;
-	return ex_handler_default(fixup, regs);
 }
 
 static bool ex_handler_sgx(const struct exception_table_entry *fixup,
@@ -179,16 +144,7 @@ static bool ex_handler_msr(const struct exception_table_entry *fixup,
 		show_stack_regs(regs);
 	}
 
-	if (!wrmsr) {
-		/* Pretend that the read succeeded and returned 0. */
-		regs->ax = 0;
-		regs->dx = 0;
-	}
-
-	if (safe)
-		*pt_regs_nr(regs, reg) = -EIO;
-
-	return ex_handler_default(fixup, regs);
+	return ex_handler_msr_common(fixup, regs, wrmsr, safe, reg);
 }
 
 static bool ex_handler_clear_fs(const struct exception_table_entry *fixup,
@@ -197,13 +153,6 @@ static bool ex_handler_clear_fs(const struct exception_table_entry *fixup,
 	if (cpu_feature_enabled(X86_BUG_NULL_SEG))
 		asm volatile ("mov %0, %%fs" : : "rm" (__USER_DS));
 	asm volatile ("mov %0, %%fs" : : "rm" (0));
-	return ex_handler_default(fixup, regs);
-}
-
-static bool ex_handler_imm_reg(const struct exception_table_entry *fixup,
-			       struct pt_regs *regs, int reg, int imm)
-{
-	*pt_regs_nr(regs, reg) = (long)imm;
 	return ex_handler_default(fixup, regs);
 }
 
@@ -324,13 +273,10 @@ int fixup_exception(struct pt_regs *regs, int trapnr, unsigned long error_code,
 	reg  = FIELD_GET(EX_DATA_REG_MASK,  e->data);
 	imm  = FIELD_GET_SIGNED(EX_DATA_IMM_MASK, e->data);
 
+	if (ex_fixup_basic(e, regs, type, trapnr, reg, imm))
+		return 1;
+
 	switch (type) {
-	case EX_TYPE_DEFAULT:
-	case EX_TYPE_DEFAULT_MCE_SAFE:
-		return ex_handler_default(e, regs);
-	case EX_TYPE_FAULT:
-	case EX_TYPE_FAULT_MCE_SAFE:
-		return ex_handler_fault(e, regs, trapnr);
 	case EX_TYPE_UACCESS:
 		return ex_handler_uaccess(e, regs, trapnr, fault_addr);
 	case EX_TYPE_CLEAR_FS:
@@ -353,11 +299,6 @@ int fixup_exception(struct pt_regs *regs, int trapnr, unsigned long error_code,
 	case EX_TYPE_RDMSR_IN_MCE:
 		ex_handler_msr_mce(regs, false);
 		break;
-	case EX_TYPE_POP_REG:
-		regs->sp += sizeof(long);
-		fallthrough;
-	case EX_TYPE_IMM_REG:
-		return ex_handler_imm_reg(e, regs, reg, imm);
 	case EX_TYPE_FAULT_SGX:
 		return ex_handler_sgx(e, regs, trapnr);
 	case EX_TYPE_UCOPY_LEN:

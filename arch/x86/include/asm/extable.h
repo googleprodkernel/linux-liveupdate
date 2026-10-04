@@ -57,4 +57,16 @@ static inline bool ex_handler_bpf(const struct exception_table_entry *x,
 				  struct pt_regs *regs) { return false; }
 #endif
 
+static __always_inline unsigned long
+ex_insn_addr(const struct exception_table_entry *x)
+{
+	return (unsigned long)&x->insn + x->insn;
+}
+
+static __always_inline unsigned long
+ex_fixup_addr(const struct exception_table_entry *x)
+{
+	return (unsigned long)&x->fixup + x->fixup;
+}
+
 #endif

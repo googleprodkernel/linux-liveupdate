@@ -16,7 +16,36 @@
 #define INSN_CODE_SEG_OPND_SZ(params) (params & 0xf)
 #define INSN_CODE_SEG_PARAMS(oper_sz, addr_sz) (oper_sz | (addr_sz << 4))
 
-int pt_regs_offset(struct pt_regs *regs, int regno);
+static inline int pt_regs_offset(struct pt_regs *regs, int regno)
+{
+	switch (regno) {
+	case 0: return offsetof(struct pt_regs, ax);
+	case 1: return offsetof(struct pt_regs, cx);
+	case 2: return offsetof(struct pt_regs, dx);
+	case 3: return offsetof(struct pt_regs, bx);
+	case 4: return offsetof(struct pt_regs, sp);
+	case 5: return offsetof(struct pt_regs, bp);
+	case 6: return offsetof(struct pt_regs, si);
+	case 7: return offsetof(struct pt_regs, di);
+#ifdef CONFIG_X86_64
+	case 8: return offsetof(struct pt_regs, r8);
+	case 9: return offsetof(struct pt_regs, r9);
+	case 10: return offsetof(struct pt_regs, r10);
+	case 11: return offsetof(struct pt_regs, r11);
+	case 12: return offsetof(struct pt_regs, r12);
+	case 13: return offsetof(struct pt_regs, r13);
+	case 14: return offsetof(struct pt_regs, r14);
+	case 15: return offsetof(struct pt_regs, r15);
+#else
+	case 8: return offsetof(struct pt_regs, ds);
+	case 9: return offsetof(struct pt_regs, es);
+	case 10: return offsetof(struct pt_regs, fs);
+	case 11: return offsetof(struct pt_regs, gs);
+#endif
+	default:
+		return -EDOM;
+	}
+}
 
 bool insn_has_rep_prefix(struct insn *insn);
 void __user *insn_get_addr_ref(struct insn *insn, struct pt_regs *regs);

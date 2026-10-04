@@ -411,42 +411,9 @@ static short get_segment_selector(struct pt_regs *regs, int seg_reg_idx)
 #endif /* CONFIG_X86_64 */
 }
 
-static const int pt_regoff[] = {
-	offsetof(struct pt_regs, ax),
-	offsetof(struct pt_regs, cx),
-	offsetof(struct pt_regs, dx),
-	offsetof(struct pt_regs, bx),
-	offsetof(struct pt_regs, sp),
-	offsetof(struct pt_regs, bp),
-	offsetof(struct pt_regs, si),
-	offsetof(struct pt_regs, di),
-#ifdef CONFIG_X86_64
-	offsetof(struct pt_regs, r8),
-	offsetof(struct pt_regs, r9),
-	offsetof(struct pt_regs, r10),
-	offsetof(struct pt_regs, r11),
-	offsetof(struct pt_regs, r12),
-	offsetof(struct pt_regs, r13),
-	offsetof(struct pt_regs, r14),
-	offsetof(struct pt_regs, r15),
-#else
-	offsetof(struct pt_regs, ds),
-	offsetof(struct pt_regs, es),
-	offsetof(struct pt_regs, fs),
-	offsetof(struct pt_regs, gs),
-#endif
-};
-
-int pt_regs_offset(struct pt_regs *regs, int regno)
-{
-	if ((unsigned)regno < ARRAY_SIZE(pt_regoff))
-		return pt_regoff[regno];
-	return -EDOM;
-}
-
 static int get_regno(struct insn *insn, enum reg_type type)
 {
-	int nr_registers = ARRAY_SIZE(pt_regoff);
+	int nr_registers = IS_ENABLED(CONFIG_X86_64) ? 16 : 12;
 	int regno = 0;
 
 	/*
