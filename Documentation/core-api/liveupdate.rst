@@ -35,6 +35,7 @@ The following types of file descriptors can be preserved
 
    ../mm/shmem_preservation
    ../liveupdate/vmm
+   ../liveupdate/cpu_preservation
 
 Public API
 ==========
