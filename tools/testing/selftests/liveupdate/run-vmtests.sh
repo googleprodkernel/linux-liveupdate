@@ -21,6 +21,7 @@ TEST_NAMES=(
 	"luo_stress_files"
 	"luo_stress_sessions"
 	"luo_tmpfs"
+	"luo_cpu_preserve"
 )
 
 function usage() {
