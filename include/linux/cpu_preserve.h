@@ -115,6 +115,7 @@ struct cpupr_stack_context *cpupr_get_sctx(int cpu);
 
 struct page;
 struct cpupr_session;
+struct liveupdate_session;
 
 /**
  * arch_cpupr_setup_buffer - Prepare the copy of the preserved runtime
@@ -135,6 +136,8 @@ int arch_cpupr_setup_buffer(struct page *text_page, unsigned int text_nr_pages,
 void *cpupr_as_alloc_page(void *arg);
 void *cpupr_as_alloc_buffer(struct cpupr_session *ps, size_t size);
 int cpupr_as_adopt_page(struct cpupr_session *ps, struct page *page);
+
+const struct cpumask *cpupr_session_cpus(struct cpupr_session *ps);
 
 /**
  * arch_cpupr_as_map - Add one range to a preserved address space

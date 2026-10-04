@@ -227,17 +227,29 @@
 
 /**
  * struct cpupr_session - The preserved CPUs of one LUO session
+ * @node: Entry on cpupr_sessions while @lsession can find it.
+ * @lsession: The outgoing LUO session, or %NULL.
+ * @cpus: CPUs of the session that are preserved and parked.
  * @as: Isolated address space of the CPUs.
  * @incoming: Whether the previous kernel created the session.
  * @as_lock: Serializes the allocations and mappings of an outgoing @as.
  */
 struct cpupr_session {
+	struct list_head node;
+	struct liveupdate_session *lsession;
+	struct cpumask cpus;
 	struct cpupr_as_ser *as;
 	bool incoming;
 	struct mutex as_lock;
 };
 
+/*
+ * Lock order: lock_device_hotplug(), cpupr_sessions_lock,
+ * cpupr_lock, cpupr_session.as_lock.
+ */
 static DEFINE_MUTEX(cpupr_lock);
+static DEFINE_MUTEX(cpupr_sessions_lock);
+static LIST_HEAD(cpupr_sessions);
 
 /*
  * A preserved CPU is either incoming, handed over by the previous kernel, or
@@ -248,6 +260,7 @@ static struct cpumask cpupr_mask;
 static struct cpumask cpupr_incoming_mask;
 static struct cpumask cpupr_outgoing_mask;
 static DEFINE_PER_CPU(struct cpupr_ser *, cpupr_cpu_ser);
+static DEFINE_PER_CPU(struct cpupr_session *, cpupr_cpu_session);
 
 /* The session whose address space adopted each page, indexed by PFN */
 static DEFINE_XARRAY(cpupr_adopted);
@@ -670,4 +683,140 @@ bool cpu_is_preserved(int cpu)
 const struct cpumask *cpu_get_preserved_mask(void)
 {
 	return &cpupr_mask;
+}
+
+static struct cpupr_session *cpupr_session_alloc(void)
+{
+	struct cpupr_session *ps;
+
+	lockdep_assert_held(&cpupr_sessions_lock);
+
+	ps = kzalloc_obj(*ps);
+	if (!ps)
+		return NULL;
+
+	INIT_LIST_HEAD(&ps->node);
+	mutex_init(&ps->as_lock);
+	return ps;
+}
+
+static void cpupr_session_release(struct cpupr_session *ps)
+{
+	cpupr_as_unpreserve(ps);
+	kfree(ps);
+}
+
+/*
+ * Look up the preserved CPU session of @s, or create it with its isolated
+ * address space.  Return the session, or an ERR_PTR() on failure.
+ */
+static struct cpupr_session *cpupr_session_get(struct liveupdate_session *s)
+{
+	struct cpupr_session *ps;
+	int ret;
+
+	if (!s)
+		return ERR_PTR(-EINVAL);
+
+	guard(mutex)(&cpupr_sessions_lock);
+	list_for_each_entry(ps, &cpupr_sessions, node) {
+		if (ps->lsession == s)
+			return ps;
+	}
+
+	ps = cpupr_session_alloc();
+	if (!ps)
+		return ERR_PTR(-ENOMEM);
+
+	ret = cpupr_as_create(ps);
+	if (ret) {
+		kfree(ps);
+		return ERR_PTR(ret);
+	}
+
+	ps->lsession = s;
+	list_add(&ps->node, &cpupr_sessions);
+
+	return ps;
+}
+
+/*
+ * Release @ps if it has no preserved CPUs: the error path of cpupr_preserve()
+ * calls this when preserving a CPU fails without leaving the CPU wedged.
+ */
+static void cpupr_session_put_if_empty(struct cpupr_session *ps)
+{
+	bool empty;
+
+	if (!ps || IS_ERR(ps))
+		return;
+
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		empty = cpumask_empty(&ps->cpus);
+		if (empty)
+			list_del_init(&ps->node);
+	}
+
+	if (empty)
+		cpupr_session_release(ps);
+}
+
+/*
+ * A CPU of @ps failed to stop and stays in @ps->cpus for good, so @ps can
+ * outlive its LUO session.  Make sure that no later session can find @ps
+ * through the stale pointer.
+ */
+static void cpupr_session_detach(struct cpupr_session *ps)
+{
+	if (!ps)
+		return;
+
+	guard(mutex)(&cpupr_sessions_lock);
+	list_del_init(&ps->node);
+	ps->lsession = NULL;
+}
+
+/**
+ * cpupr_session_cpus - Return the cpumask of preserved CPUs in @ps
+ * @ps: Preserved CPU session.
+ *
+ * Return: Read-only cpumask of physical CPUs currently preserved in @ps, or
+ *         %cpu_none_mask if @ps is %NULL or an ERR_PTR().
+ */
+const struct cpumask *cpupr_session_cpus(struct cpupr_session *ps)
+{
+	if (!ps || IS_ERR(ps))
+		return cpu_none_mask;
+
+	return &ps->cpus;
+}
+
+/* The session of a preserved CPU */
+static struct cpupr_session *cpupr_session_of(unsigned int cpu)
+{
+	if (cpu >= nr_cpu_ids)
+		return NULL;
+
+	guard(mutex)(&cpupr_lock);
+	return per_cpu(cpupr_cpu_session, cpu);
+}
+
+static void cpupr_session_remove_cpu(struct cpupr_session *ps,
+				     unsigned int cpu)
+{
+	bool empty;
+
+	if (!ps)
+		return;
+
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		if (!cpumask_test_and_clear_cpu(cpu, &ps->cpus))
+			return;
+		empty = cpumask_empty(&ps->cpus);
+		if (empty)
+			list_del_init(&ps->node);
+	}
+
+	if (empty)
+		cpupr_session_release(ps);
 }
