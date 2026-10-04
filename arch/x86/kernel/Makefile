@@ -86,7 +86,7 @@ preserved-obj-$(CONFIG_LIVEUPDATE_CPU) += cpu_preserve_runtime.preserved.o \
 include $(srctree)/scripts/Makefile.cpu_preserve
 $(obj)/lib-%.preserved.raw.o: $(srctree)/arch/x86/lib/%.S FORCE
 	$(call if_changed_rule,as_o_S)
-obj-y				+= $(preserved-obj-y)
+obj-$(CONFIG_LIVEUPDATE_CPU)	+= cpu_preserve.o $(preserved-obj-y)
 obj-$(CONFIG_X86_64)	+= sys_x86_64.o
 obj-$(CONFIG_X86_ESPFIX64)	+= espfix_64.o
 obj-$(CONFIG_SYSFS)	+= ksysfs.o

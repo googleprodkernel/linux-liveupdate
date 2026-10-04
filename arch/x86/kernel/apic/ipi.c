@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/cpu_preserve.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/smp.h>
@@ -35,6 +36,7 @@ void apic_smt_update(void)
 	 * Do not switch to broadcast mode if:
 	 * - Disabled on the command line
 	 * - Only a single CPU is online
+	 * - A CPU is parked for Live Update, which must not get broadcasts
 	 * - Not all present CPUs have been at least booted once
 	 *
 	 * The latter is important as the local APIC might be in some
@@ -42,7 +44,8 @@ void apic_smt_update(void)
 	 * especially true for NMI broadcasting.
 	 */
 	if (apic_ipi_shorthand_off || num_online_cpus() == 1 ||
-	    !cpumask_equal(cpu_present_mask, &cpus_booted_once_mask)) {
+	    !cpumask_equal(cpu_present_mask, &cpus_booted_once_mask) ||
+	    !cpumask_empty(cpu_get_preserved_mask())) {
 		static_branch_disable(&apic_use_ipi_shorthand);
 	} else {
 		static_branch_enable(&apic_use_ipi_shorthand);

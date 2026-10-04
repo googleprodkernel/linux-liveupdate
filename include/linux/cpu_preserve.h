@@ -299,6 +299,7 @@ int arch_cpupr_as_map(struct cpupr_session *ps, void *pgd, phys_addr_t pa,
 
 static inline bool cpu_is_preserved(int cpu) { return false; }
 static inline void cpupr_report_dead(void) {}
+static inline int arch_cpupr_wakeup_ap(unsigned int cpu) { return -ENODEV; }
 static inline const struct cpumask *cpu_get_preserved_mask(void)
 {
 	return cpu_none_mask;

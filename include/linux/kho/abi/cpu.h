@@ -45,9 +45,15 @@
  */
 
 /* The compatibility string for preserved CPU FLB */
+#if defined(CONFIG_X86_64)
+#include <linux/kho/abi/cpu_x86.h>
+#define CPUPR_LUO_FLB_COMPATIBLE	"cpu_flb_x86_v1"
+#else
 #define CPUPR_LUO_FLB_COMPATIBLE	"cpu_flb_v1"
-
-struct cpupr_arch_mode_ser;
+struct cpupr_arch_mode_ser {
+	u8 reserved[8];
+};
+#endif
 
 /* The compatibility string for preserved CPU file handler */
 #define CPUPR_LUO_FH_COMPATIBLE		"cpu_fh_v1"
@@ -73,12 +79,6 @@ enum cpupr_workload {
 	CPUPR_DETACHING = 6,
 	CPUPR_NR_STATES
 };
-
-#ifndef _LINUX_KHO_ABI_CPU_X86_H
-struct cpupr_arch_mode_ser {
-	u8 reserved[8];
-};
-#endif
 
 /**
  * struct cpupr_global_ser - Global FLB serialization header

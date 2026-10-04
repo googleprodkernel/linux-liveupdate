@@ -59,6 +59,7 @@
 #include <linux/overflow.h>
 #include <linux/stackprotector.h>
 #include <linux/cpuhotplug.h>
+#include <linux/cpu_preserve.h>
 #include <linux/mc146818rtc.h>
 #include <linux/acpi.h>
 
@@ -1037,6 +1038,12 @@ static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 
 	/* So we see what's up */
 	announce_cpu(cpu, apicid);
+
+	smp_mb();
+
+	if (!apic->wakeup_secondary_cpu_64 && !apic->wakeup_secondary_cpu &&
+	    !arch_cpupr_wakeup_ap(cpu))
+		return 0;
 
 	/*
 	 * This grunge runs the startup process for

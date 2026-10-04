@@ -66,8 +66,10 @@ extern struct desc_ptr x86_preserved_idt_desc
 	__cpupr_sym_asm(x86_preserved_idt_desc);
 
 void arch_cpupr_load_desc(void) __cpupr_sym_asm(arch_cpupr_load_desc);
+int arch_cpupr_wakeup_ap(unsigned int cpu);
 #else
 static inline void arch_cpupr_load_desc(void) {}
+static inline int arch_cpupr_wakeup_ap(unsigned int cpu) { return -ENODEV; }
 #endif
 
 #endif /* __ASM_X86_CPU_PRESERVE_H */
