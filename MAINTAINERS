@@ -15198,14 +15198,21 @@ L:	linux-kernel@vger.kernel.org
 S:	Maintained
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/liveupdate/linux.git
 F:	Documentation/core-api/liveupdate.rst
+F:	Documentation/liveupdate/cpu_preservation.rst
 F:	Documentation/mm/shmem_preservation.rst
 F:	Documentation/userspace-api/liveupdate.rst
+F:	arch/*/include/asm/cpu_preserve.h
+F:	arch/*/kernel/cpu_preserve*
+F:	arch/*/kernel/preserve_cpu.S
+F:	include/linux/cpu_preserve*
 F:	include/linux/kho/abi/
 F:	include/linux/liveupdate.h
 F:	include/uapi/linux/liveupdate.h
 F:	kernel/liveupdate/
 F:	lib/tests/liveupdate.c
 F:	mm/shmem_luo.c
+F:	scripts/Makefile.cpu_preserve
+F:	scripts/preserved.lds
 F:	tools/testing/selftests/liveupdate/
 
 LLC (802.2)
