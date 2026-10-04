@@ -619,4 +619,335 @@ TEST_F(liveupdate_device, preserve_memfd_with_arg)
 	ASSERT_EQ(close(mem_fd2), 0);
 }
 
+static int find_hotplug_cpu(void)
+{
+	char path[128];
+	int cpu;
+
+	for (cpu = 1; cpu < 256; cpu++) {
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", cpu);
+		if (access(path, R_OK) == 0) {
+			snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+			if (access(path, R_OK) == 0)
+				return cpu;
+		}
+	}
+	return -1;
+}
+
+static int read_cpu_online(int cpu)
+{
+	char path[128], buf[16];
+	int fd, val;
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	memset(buf, 0, sizeof(buf));
+	if (read(fd, buf, sizeof(buf) - 1) <= 0) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	val = atoi(buf);
+	return val;
+}
+
+static int write_cpu_online(int cpu, int val)
+{
+	char path[128], buf[16];
+	int fd, ret;
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -errno;
+	snprintf(buf, sizeof(buf), "%d\n", val);
+	ret = write(fd, buf, strlen(buf));
+	if (ret < 0) {
+		ret = -errno;
+		close(fd);
+		return ret;
+	}
+	close(fd);
+	return 0;
+}
+
+static int read_cpu_preserve(int cpu)
+{
+	char path[128], buf[16];
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", cpu);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	memset(buf, 0, sizeof(buf));
+	if (read(fd, buf, sizeof(buf) - 1) <= 0) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return atoi(buf);
+}
+
+static int read_preserved_mask(char *buf, size_t sz)
+{
+	int fd;
+	ssize_t n;
+
+	fd = open("/sys/devices/system/cpu/preserved", O_RDONLY);
+	if (fd < 0)
+		return -1;
+	memset(buf, 0, sz);
+	n = read(fd, buf, sz - 1);
+	close(fd);
+	return n > 0 ? 0 : -1;
+}
+
+/*
+ * Test Case: CPU Preservation Basic
+ *
+ * Verifies that a CPU preserve sysfs file descriptor can be preserved in a
+ * LUO session, offlining the CPU from scheduler and returning it online upon
+ * session teardown.
+ */
+TEST_F(liveupdate_device, cpu_preserve_basic)
+{
+	char path[128], mask[64], expected[16];
+	int target_cpu;
+	int session_fd, cpu_fd;
+
+	self->fd1 = open(LIVEUPDATE_DEV, O_RDWR);
+	if (self->fd1 < 0 && errno == ENOENT)
+		SKIP(return, "%s does not exist", LIVEUPDATE_DEV);
+	ASSERT_GE(self->fd1, 0);
+
+	target_cpu = find_hotplug_cpu();
+	if (target_cpu < 0)
+		SKIP(return, "No hotpluggable CPU with preserve attribute found");
+
+	ASSERT_EQ(read_cpu_preserve(target_cpu), 0);
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", target_cpu);
+	cpu_fd = open(path, O_RDONLY);
+	ASSERT_GE(cpu_fd, 0);
+
+	session_fd = luo_create_session(self->fd1, "cpu-preserve-test");
+	ASSERT_GE(session_fd, 0);
+
+	ASSERT_EQ(luo_session_preserve_fd(session_fd, cpu_fd, 0x42), 0);
+	close(cpu_fd);
+
+	/* Verify target CPU is now offline and marked preserved */
+	ASSERT_EQ(read_cpu_online(target_cpu), 0);
+	ASSERT_EQ(read_cpu_preserve(target_cpu), 1);
+	ASSERT_EQ(read_preserved_mask(mask, sizeof(mask)), 0);
+	snprintf(expected, sizeof(expected), "%d\n", target_cpu);
+	EXPECT_STREQ(mask, expected);
+
+	/* Closing session unpreserves and brings CPU back online */
+	ASSERT_EQ(close(session_fd), 0);
+	ASSERT_EQ(read_cpu_online(target_cpu), 1);
+	ASSERT_EQ(read_cpu_preserve(target_cpu), 0);
+	ASSERT_EQ(read_preserved_mask(mask, sizeof(mask)), 0);
+	EXPECT_STREQ(mask, "\n");
+}
+
+/*
+ * Test Case: CPU Preservation Freeze and Unfreeze
+ *
+ * Verifies that freezing a session containing a preserved CPU succeeds and
+ * closing the frozen session unfreezes and unpreserves the CPU cleanly.
+ */
+TEST_F(liveupdate_device, cpu_preserve_freeze_unfreeze)
+{
+	char path[128];
+	int target_cpu;
+	int session_fd, cpu_fd;
+
+	self->fd1 = open(LIVEUPDATE_DEV, O_RDWR);
+	if (self->fd1 < 0 && errno == ENOENT)
+		SKIP(return, "%s does not exist", LIVEUPDATE_DEV);
+	ASSERT_GE(self->fd1, 0);
+
+	target_cpu = find_hotplug_cpu();
+	if (target_cpu < 0)
+		SKIP(return, "No hotpluggable CPU with preserve attribute found");
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", target_cpu);
+	cpu_fd = open(path, O_RDONLY);
+	ASSERT_GE(cpu_fd, 0);
+
+	session_fd = luo_create_session(self->fd1, "cpu-preserve-freeze");
+	ASSERT_GE(session_fd, 0);
+
+	ASSERT_EQ(luo_session_preserve_fd(session_fd, cpu_fd, 0x43), 0);
+	close(cpu_fd);
+
+	ASSERT_EQ(luo_session_freeze(session_fd), 0);
+	ASSERT_EQ(read_cpu_preserve(target_cpu), 1);
+
+	ASSERT_EQ(close(session_fd), 0);
+	ASSERT_EQ(read_cpu_online(target_cpu), 1);
+	ASSERT_EQ(read_cpu_preserve(target_cpu), 0);
+}
+
+/*
+ * Test Case: CPU Preservation Sysfs Online/Offline Rejection
+ *
+ * Verifies that while a CPU is preserved, attempting to bring it online
+ * via sysfs fails with -EBUSY. After session closure, normal online/offline
+ * hotplug operations succeed.
+ */
+TEST_F(liveupdate_device, cpu_preserve_sysfs_online_offline)
+{
+	char path[128];
+	int target_cpu;
+	int session_fd, cpu_fd;
+
+	self->fd1 = open(LIVEUPDATE_DEV, O_RDWR);
+	if (self->fd1 < 0 && errno == ENOENT)
+		SKIP(return, "%s does not exist", LIVEUPDATE_DEV);
+	ASSERT_GE(self->fd1, 0);
+
+	target_cpu = find_hotplug_cpu();
+	if (target_cpu < 0)
+		SKIP(return, "No hotpluggable CPU with preserve attribute found");
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", target_cpu);
+	cpu_fd = open(path, O_RDONLY);
+	ASSERT_GE(cpu_fd, 0);
+
+	session_fd = luo_create_session(self->fd1, "cpu-preserve-sysfs");
+	ASSERT_GE(session_fd, 0);
+
+	ASSERT_EQ(luo_session_preserve_fd(session_fd, cpu_fd, 0x100), 0);
+	close(cpu_fd);
+
+	/* Target CPU is offline while preserved */
+	ASSERT_EQ(read_cpu_online(target_cpu), 0);
+
+	/* Attempting to bring the preserved CPU online via sysfs must fail with EBUSY */
+	EXPECT_EQ(write_cpu_online(target_cpu, 1), -EBUSY);
+	ASSERT_EQ(read_cpu_online(target_cpu), 0);
+
+	/* Writing 0 to online (offline) should succeed since it is already offline */
+	EXPECT_EQ(write_cpu_online(target_cpu, 0), 0);
+
+	/* Close session -> unpreserve and restore online */
+	ASSERT_EQ(close(session_fd), 0);
+	ASSERT_EQ(read_cpu_online(target_cpu), 1);
+
+	/* Verify normal offline and online now succeed */
+	ASSERT_EQ(write_cpu_online(target_cpu, 0), 0);
+	ASSERT_EQ(read_cpu_online(target_cpu), 0);
+	ASSERT_EQ(write_cpu_online(target_cpu, 1), 0);
+	ASSERT_EQ(read_cpu_online(target_cpu), 1);
+}
+
+/*
+ * Test Case: Prevent Double CPU Preservation
+ *
+ * Verifies that a CPU cannot be preserved twice across the same or different
+ * sessions simultaneously.
+ */
+TEST_F(liveupdate_device, cpu_preserve_prevent_double)
+{
+	char path[128];
+	int target_cpu;
+	int session_fd1, session_fd2, cpu_fd1, cpu_fd2;
+
+	self->fd1 = open(LIVEUPDATE_DEV, O_RDWR);
+	if (self->fd1 < 0 && errno == ENOENT)
+		SKIP(return, "%s does not exist", LIVEUPDATE_DEV);
+	ASSERT_GE(self->fd1, 0);
+
+	target_cpu = find_hotplug_cpu();
+	if (target_cpu < 0)
+		SKIP(return, "No hotpluggable CPU with preserve attribute found");
+
+	session_fd1 = luo_create_session(self->fd1, "cpu-double-1");
+	ASSERT_GE(session_fd1, 0);
+	session_fd2 = luo_create_session(self->fd1, "cpu-double-2");
+	ASSERT_GE(session_fd2, 0);
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", target_cpu);
+	cpu_fd1 = open(path, O_RDONLY);
+	ASSERT_GE(cpu_fd1, 0);
+
+	ASSERT_EQ(luo_session_preserve_fd(session_fd1, cpu_fd1, 0x10), 0);
+	close(cpu_fd1);
+
+	/* Attempting to preserve the same CPU in session2 must fail with -EBUSY */
+	cpu_fd2 = open(path, O_RDONLY);
+	ASSERT_GE(cpu_fd2, 0);
+	EXPECT_EQ(luo_session_preserve_fd(session_fd2, cpu_fd2, 0x20), -EBUSY);
+	close(cpu_fd2);
+
+	/* Attempting to preserve again in session1 must also fail with -EBUSY */
+	cpu_fd2 = open(path, O_RDONLY);
+	ASSERT_GE(cpu_fd2, 0);
+	EXPECT_EQ(luo_session_preserve_fd(session_fd1, cpu_fd2, 0x30), -EBUSY);
+	close(cpu_fd2);
+
+	ASSERT_EQ(close(session_fd1), 0);
+	ASSERT_EQ(close(session_fd2), 0);
+	ASSERT_EQ(read_cpu_online(target_cpu), 1);
+}
+
+/*
+ * Test Case: Multiple Preserved CPUs
+ *
+ * Verifies preserving multiple distinct CPUs simultaneously in the same session.
+ */
+TEST_F(liveupdate_device, cpu_preserve_multiple_cpus)
+{
+	char path[128];
+	int target_cpus[8];
+	int num_targets = 0;
+	int session_fd, cpu_fd, cpu, i;
+
+	self->fd1 = open(LIVEUPDATE_DEV, O_RDWR);
+	if (self->fd1 < 0 && errno == ENOENT)
+		SKIP(return, "%s does not exist", LIVEUPDATE_DEV);
+	ASSERT_GE(self->fd1, 0);
+
+	for (cpu = 1; cpu < 256 && num_targets < 8; cpu++) {
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", cpu);
+		if (access(path, R_OK) == 0) {
+			snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+			if (access(path, R_OK) == 0)
+				target_cpus[num_targets++] = cpu;
+		}
+	}
+
+	if (num_targets < 2)
+		SKIP(return, "Need at least 2 hotpluggable CPUs for multiple CPU preserve test");
+
+	session_fd = luo_create_session(self->fd1, "multi-cpu-preserve");
+	ASSERT_GE(session_fd, 0);
+
+	for (i = 0; i < num_targets; i++) {
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/preserve", target_cpus[i]);
+		cpu_fd = open(path, O_RDONLY);
+		ASSERT_GE(cpu_fd, 0);
+		ASSERT_EQ(luo_session_preserve_fd(session_fd, cpu_fd, 0x1000 + i), 0);
+		close(cpu_fd);
+	}
+
+	/* Verify all targets are offline and reject sysfs online */
+	for (i = 0; i < num_targets; i++) {
+		ASSERT_EQ(read_cpu_online(target_cpus[i]), 0);
+		EXPECT_EQ(write_cpu_online(target_cpus[i], 1), -EBUSY);
+	}
+
+	/* Close session and verify all targets return online */
+	ASSERT_EQ(close(session_fd), 0);
+	for (i = 0; i < num_targets; i++)
+		ASSERT_EQ(read_cpu_online(target_cpus[i]), 1);
+}
+
 TEST_HARNESS_MAIN
