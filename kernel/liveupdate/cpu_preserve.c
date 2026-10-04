@@ -218,8 +218,11 @@
 
 #define pr_fmt(fmt) "cpu_preserve: " fmt
 
+#include <linux/capability.h>
 #include <linux/cpu.h>
 #include <linux/cpu_preserve.h>
+#include <linux/file.h>
+#include <linux/fs_struct.h>
 #include <linux/iopoll.h>
 #include <linux/kexec.h>
 #include <linux/kexec_handover.h>
@@ -622,6 +625,36 @@ static bool cpupr_is_incoming(int cpu)
 	if ((unsigned int)cpu >= nr_cpu_ids)
 		return false;
 	return cpumask_test_cpu(cpu, &cpupr_incoming_mask);
+}
+
+static noinline void cpupr_build_hwid_map(struct xarray *xa)
+{
+	static DEFINE_MUTEX(hwid_lock);
+	unsigned int cpu;
+
+	guard(mutex)(&hwid_lock);
+	if (!xa_empty(xa))
+		return;
+
+	for_each_present_cpu(cpu)
+		xa_store(xa, arch_cpupr_hwid(cpu), xa_mk_value(cpu), GFP_KERNEL);
+}
+
+static int cpupr_find_cpu_by_hwid(u64 hwid)
+{
+	static DEFINE_XARRAY(hwid_to_cpu);
+	void *entry;
+
+	if (unlikely(xa_empty(&hwid_to_cpu))) {
+		cpupr_build_hwid_map(&hwid_to_cpu);
+		BUG_ON(xa_empty(&hwid_to_cpu));
+	}
+
+	entry = xa_load(&hwid_to_cpu, hwid);
+	if (!entry)
+		return -ENODEV;
+
+	return xa_to_value(entry);
 }
 
 /*
@@ -1147,3 +1180,198 @@ err_put:
 	cpupr_session_put_if_empty(ps);
 	return ret;
 }
+
+static ssize_t preserved_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(cpu_get_preserved_mask()));
+}
+static DEVICE_ATTR_RO(preserved);
+
+static struct attribute *cpu_preserve_root_attrs[] = {
+	&dev_attr_preserved.attr,
+	NULL
+};
+
+/* Attributes of the CPU subsystem root, /sys/devices/system/cpu */
+const struct attribute_group cpu_preserve_root_attr_group = {
+	.attrs = cpu_preserve_root_attrs,
+};
+
+static ssize_t preserve_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", cpu_is_preserved(dev->id));
+}
+static DEVICE_ATTR_RO(preserve);
+
+static struct attribute *cpu_preserve_attrs[] = {
+	&dev_attr_preserve.attr,
+	NULL
+};
+
+/* Attributes of each hotpluggable CPU device */
+const struct attribute_group cpu_preserve_attr_group = {
+	.attrs = cpu_preserve_attrs,
+};
+
+/* Return the CPU of a cpu<N>/preserve sysfs file, or -EINVAL. */
+static int file_to_cpu(struct file *file)
+{
+	struct kernfs_node *kn, *parent;
+	int cpu;
+
+	if (!file)
+		return -EINVAL;
+
+	kn = kernfs_node_from_dentry(file->f_path.dentry);
+	if (!kn || kn->priv != &dev_attr_preserve.attr)
+		return -EINVAL;
+
+	parent = kernfs_get_parent(kn);
+	if (!parent)
+		return -EINVAL;
+
+	cpu = parent->priv ? kobj_to_dev(parent->priv)->id : -EINVAL;
+	kernfs_put(parent);
+	return cpu;
+}
+
+static bool cpupr_can_preserve_cb(struct liveupdate_file_handler *handler,
+				      struct file *file)
+{
+	return file_to_cpu(file) >= 0;
+}
+
+static int cpupr_preserve_cb(struct liveupdate_file_op_args *args)
+{
+	int cpu, ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	cpu = file_to_cpu(args->file);
+	if (cpu < 0)
+		return cpu;
+
+	ret = cpupr_preserve(cpu, args->session);
+	if (ret)
+		return ret;
+
+	args->serialized_data = virt_to_phys(cpupr_get_ser(cpu));
+	return 0;
+}
+
+static void cpupr_unpreserve_cb(struct liveupdate_file_op_args *args)
+{
+	struct cpupr_session *ps;
+	struct cpupr_ser *ser;
+	unsigned int cpu;
+
+	if (!args->serialized_data)
+		return;
+
+	ser = phys_to_virt(args->serialized_data);
+	cpu = ser->cpu;
+	ps = cpupr_session_of(cpu);
+
+	if (cpupr_unpreserve(cpu)) {
+		cpupr_session_detach(ps);
+		return;
+	}
+
+	cpupr_session_remove_cpu(ps, cpu);
+}
+
+/* The CPU that the previous kernel handed over with @ser, or -ENOENT */
+static int cpupr_incoming_cpu(u64 data)
+{
+	struct cpupr_ser *ser;
+	int cpu;
+
+	if (!data)
+		return -ENOENT;
+
+	ser = phys_to_virt(data);
+	guard(mutex)(&cpupr_lock);
+	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+	if (cpu >= 0 && cpumask_test_cpu(cpu, &cpupr_incoming_mask) &&
+	    per_cpu(cpupr_cpu_ser, cpu) == ser)
+		return cpu;
+
+	pr_err("preserved CPU state 0x%llx not in handover data\n", data);
+	return -ENOENT;
+}
+
+static int cpupr_retrieve_cb(struct liveupdate_file_op_args *args)
+{
+	struct file *file;
+	char path[64];
+	int cpu;
+
+	cpu = cpupr_incoming_cpu(args->serialized_data);
+	if (cpu < 0)
+		return cpu;
+
+	/* Open the attribute under the root of init, not of the caller. */
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/preserve", cpu);
+	scoped_with_init_fs()
+		file = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	if (file_to_cpu(file) != cpu) {
+		fput(file);
+		return -ENOENT;
+	}
+
+	args->file = file;
+	return 0;
+}
+
+static void cpupr_finish_cb(struct liveupdate_file_op_args *args)
+{
+	struct cpupr_session *ps;
+	int cpu;
+
+	cpu = cpupr_incoming_cpu(args->serialized_data);
+	if (cpu < 0)
+		return;
+
+	ps = cpupr_session_of(cpu);
+	if (cpupr_unpreserve(cpu))
+		return;
+
+	cpupr_session_remove_cpu(ps, cpu);
+}
+
+static const struct liveupdate_file_ops cpu_preserve_file_ops = {
+	.can_preserve = cpupr_can_preserve_cb,
+	.preserve     = cpupr_preserve_cb,
+	.retrieve     = cpupr_retrieve_cb,
+	.unpreserve   = cpupr_unpreserve_cb,
+	.finish       = cpupr_finish_cb,
+	.owner        = THIS_MODULE,
+};
+
+static struct liveupdate_file_handler cpu_preserve_handler = {
+	.ops        = &cpu_preserve_file_ops,
+	.compatible = CPUPR_LUO_FH_COMPATIBLE,
+};
+
+static int __init cpu_preserve_early_init(void)
+{
+	int err;
+
+	if (!liveupdate_enabled())
+		return 0;
+
+	err = liveupdate_register_file_handler(&cpu_preserve_handler);
+	if (err) {
+		pr_err("Could not register cpupr_preserve file handler: %pe\n",
+		       ERR_PTR(err));
+		return err;
+	}
+
+	return 0;
+}
+early_initcall(cpu_preserve_early_init);

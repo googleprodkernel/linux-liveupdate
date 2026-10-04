@@ -115,6 +115,10 @@ static __always_inline void cpupr_clean_sz(const void *p, size_t sz)
 const struct cpumask *cpu_get_preserved_mask(void);
 struct cpupr_stack_context *cpupr_get_sctx(int cpu);
 
+struct attribute_group;
+extern const struct attribute_group cpu_preserve_attr_group;
+extern const struct attribute_group cpu_preserve_root_attr_group;
+
 /**
  * cpupr_report_dead - Park preserved CPU when reporting dead in hotplug
  *

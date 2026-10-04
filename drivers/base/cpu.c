@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/sched.h>
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
 #include <linux/topology.h>
 #include <linux/device.h>
 #include <linux/node.h>
@@ -199,6 +200,9 @@ static const struct attribute_group *common_cpu_attr_groups[] = {
 static const struct attribute_group *hotplugable_cpu_attr_groups[] = {
 #ifdef CONFIG_CRASH_DUMP
 	&crash_note_cpu_attr_group,
+#endif
+#ifdef CONFIG_LIVEUPDATE_CPU
+	&cpu_preserve_attr_group,
 #endif
 	NULL
 };
@@ -541,6 +545,9 @@ static const struct attribute_group cpu_root_attr_group = {
 
 static const struct attribute_group *cpu_root_attr_groups[] = {
 	&cpu_root_attr_group,
+#ifdef CONFIG_LIVEUPDATE_CPU
+	&cpu_preserve_root_attr_group,
+#endif
 	NULL,
 };
 
