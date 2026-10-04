@@ -827,6 +827,7 @@ enum mismatch {
 	ANY_INIT_TO_ANY_EXIT,
 	ANY_EXIT_TO_ANY_INIT,
 	EXTABLE_TO_NON_TEXT,
+	PRESERVED_TO_NON_PRESERVED,
 };
 
 /**
@@ -850,6 +851,12 @@ struct sectioncheck {
 };
 
 static const struct sectioncheck sectioncheck[] = {
+/* Do not reference non-preserved code/data from preserved sections */
+{
+	.fromsec = { ".preserved.*", NULL },
+	.good_tosec = { ".preserved.*", NULL },
+	.mismatch = PRESERVED_TO_NON_PRESERVED,
+},
 /* Do not reference init/exit code/data from
  * normal code and data
  */
@@ -960,6 +967,9 @@ static const struct sectioncheck *section_mismatch(
 static int secref_whitelist(const char *fromsec, const char *fromsym,
 			    const char *tosec, const char *tosym)
 {
+	if (match(fromsec, PATTERNS(".preserved.*")))
+		return 1;
+
 	/* Check for pattern 1 */
 	if (match(tosec, PATTERNS(ALL_INIT_DATA_SECTIONS)) &&
 	    match(fromsec, PATTERNS(DATA_SECTIONS)) &&
@@ -1061,6 +1071,9 @@ static void default_mismatch_handler(struct module *mod, struct elf_info *elf,
 		 fromsym, fromsym[0] ? "+" : "",
 		 (unsigned int)(faddr - (fromsym[0] ? from->st_value : 0)),
 		 fromsec, tosym[0] ? tosym : taddr_str, tosec);
+
+	if (mismatch->mismatch == PRESERVED_TO_NON_PRESERVED)
+		error("%s must only reference the preserved runtime\n", fromsec);
 
 	if (mismatch->mismatch == EXTABLE_TO_NON_TEXT) {
 		if (match(tosec, mismatch->bad_tosec))
