@@ -569,6 +569,7 @@
 		__cpuidle_text_start = .;				\
 		*(.cpuidle.text)					\
 		__cpuidle_text_end = .;					\
+		CPUPR_TEXT						\
 		__noinstr_text_end = .;
 
 #define TEXT_SPLIT							\
@@ -654,6 +655,41 @@
 		__static_call_text_start = .;				\
 		*(.static_call.text)					\
 		__static_call_text_end = .;
+
+/*
+ * Page-aligned text and data sections for preserved CPUs.
+ * This code and data are KHO preserved when CPUs are preserved across
+ * live update.  The data range starts with the read-only data, which the
+ * preserved CPUs map read-only; the host still writes it before use.
+ * .preserved.bss is placed inside CPUPR_DATA so a single contiguous range
+ * covers both initialized and zero-initialized runtime data.
+ */
+#ifdef CONFIG_LIVEUPDATE_CPU
+#define CPUPR_TEXT						\
+		. = ALIGN(PAGE_SIZE);					\
+		__preserved_text_start = .;				\
+		*(.preserved.text)					\
+		. = ALIGN(PAGE_SIZE);					\
+		__preserved_text_end = .;
+
+#define CPUPR_DATA						\
+		. = ALIGN(PAGE_SIZE);					\
+		__preserved_data_start = .;				\
+		*(.preserved.rodata)					\
+		. = ALIGN(4);						\
+		__preserved_ex_table_start = .;				\
+		*(.preserved.ex_table)					\
+		__preserved_ex_table_end = .;				\
+		. = ALIGN(PAGE_SIZE);					\
+		__preserved_rodata_end = .;				\
+		*(.preserved.data)					\
+		*(.preserved.bss)					\
+		. = ALIGN(PAGE_SIZE);					\
+		__preserved_data_end = .;
+#else
+#define CPUPR_TEXT
+#define CPUPR_DATA
+#endif
 
 /* Section used for early init (in .S files) */
 #define HEAD_TEXT  KEEP(*(.head.text))
@@ -1155,6 +1191,7 @@
 		INIT_TASK_DATA(inittask)				\
 		NOSAVE_DATA						\
 		PAGE_ALIGNED_DATA(pagealigned)				\
+		CPUPR_DATA					\
 		CACHE_HOT_DATA(cacheline)				\
 		CACHELINE_ALIGNED_DATA(cacheline)			\
 		READ_MOSTLY_DATA(cacheline)				\

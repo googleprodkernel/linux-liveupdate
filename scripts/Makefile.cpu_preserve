@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Build rules for compiling isolated preserved-runtime objects (*.preserved.o).
+# Modeled after arch/arm64/kvm/hyp/nvhe/Makefile.
+#
+# Usage in a subsystem Makefile:
+#   preserved-obj-y += foo.preserved.o bar.preserved.o
+#   include $(srctree)/scripts/Makefile.cpu_preserve
+#   obj-y += $(preserved-obj-y)
+
+PRESERVED_CFLAGS_REMOVE := $(CC_FLAGS_FTRACE) $(CC_FLAGS_SCS) $(CC_FLAGS_LTO) \
+			   $(CC_FLAGS_CFI) $(PADDING_CFLAGS) \
+			   $(RETPOLINE_CFLAGS) \
+			   -fstack-protector -fstack-protector-strong \
+			   -fprofile-sample-use=% -fprofile-use=%
+
+PRESERVED_COMPAT := -include $(srctree)/include/linux/cpu_preserve_compat.h
+
+# __DISABLE_EXPORTS suppresses EXPORT_SYMBOL, and on x86 keeps RET as a plain
+# ret instruction (no return thunk) and disables function padding.
+PRESERVED_CFLAGS := -D__CPUPR_RUNTIME__ -D__DISABLE_EXPORTS \
+		    $(PRESERVED_COMPAT) \
+		    -D__DISABLE_TRACE_MMIO__ -D__NO_FORTIFY \
+		    -fno-stack-protector -DDISABLE_BRANCH_PROFILING \
+		    $(DISABLE_KSTACK_ERASE) \
+		    $(DISABLE_STACKLEAK_PLUGIN) \
+		    $(DISABLE_LATENT_ENTROPY_PLUGIN) \
+		    $(call cc-option,-ftrivial-auto-var-init=uninitialized) \
+		    $(call cc-option,-fno-jump-tables) \
+		    -fno-asynchronous-unwind-tables -fno-unwind-tables \
+		    $(if $(CONFIG_X86),$(call cc-option,-mindirect-branch=keep) \
+				       $(call cc-option,-mfunction-return=keep)) \
+		    $(if $(CONFIG_ARM64),$(call cc-option,-mbranch-protection=none)) \
+		    $(PRESERVED_EXTRA_CFLAGS)
+
+PRESERVED_AFLAGS := -D__CPUPR_RUNTIME__ -D__DISABLE_EXPORTS \
+		    $(PRESERVED_COMPAT) $(PRESERVED_EXTRA_AFLAGS)
+
+ifneq ($(strip $(preserved-obj-m)),)
+$(error .preserved.o objects cannot be built into loadable modules: $(preserved-obj-m))
+endif
+
+PRESERVED_RAW_OBJS := $(patsubst %.preserved.o,%.preserved.raw.o,$(preserved-obj-y))
+
+# %.preserved.raw.o is not in $(real-obj-y), so Kbuild's is-kernel-object is
+# empty and KASAN/KCSAN/KMSAN/UBSAN/KCOV/GCOV/AUTOFDO/objtool are already off.
+$(obj)/%.preserved.raw.o: private ccflags-remove-y += $(PRESERVED_CFLAGS_REMOVE)
+$(obj)/%.preserved.raw.o: private ccflags-y += $(PRESERVED_CFLAGS)
+$(obj)/%.preserved.raw.o: private asflags-y += $(PRESERVED_AFLAGS)
+
+$(obj)/%.preserved.raw.o: $(src)/%.c FORCE
+	$(call if_changed_rule,cc_o_c)
+
+$(obj)/%.preserved.raw.o: $(src)/%.S FORCE
+	$(call if_changed_rule,as_o_S)
+
+# Check every preserved object with objtool, whatever objtool does with
+# vmlinux.o, but never let it modify the object. --ibt needs --link, IBT is
+# validated on vmlinux.o.
+ifdef CONFIG_OBJTOOL
+cmd_cpupr_objtool = ; $(objtool) $(filter-out --ibt,$(objtool-args-y)) \
+		    --werror --dry-run $@
+endif
+
+# Kbuild runs commands with 'set -e': separate the steps with ';', as a failure
+# before the last command of a '&&' list would be ignored.
+quiet_cmd_cpupr_o = PRESERVE $@
+      cmd_cpupr_o = \
+	$(LD) $(ld_flags) -r -T $(srctree)/scripts/preserved.lds \
+		-o $(tmp-target) $<; \
+	$(OBJCOPY) --prefix-symbols=__preserved_ $(tmp-target) $@; \
+	rm -f $(tmp-target) $(cmd_cpupr_objtool)
+
+$(obj)/%.preserved.o: $(obj)/%.preserved.raw.o $(srctree)/scripts/preserved.lds $(if $(CONFIG_OBJTOOL),$(objtool)) FORCE
+	$(call if_changed,cpupr_o)
+
+targets += $(preserved-obj-y) $(PRESERVED_RAW_OBJS)
