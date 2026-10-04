@@ -111,4 +111,34 @@ config LIVEUPDATE_GUEST_MEMFD
 
 	  If unsure, say N.
 
+config ARCH_SUPPORTS_LIVEUPDATE_CPU
+	bool
+
+config LIVEUPDATE_CPU
+	bool "Live update support for preserved CPUs"
+	depends on LIVEUPDATE
+	depends on ARCH_SUPPORTS_LIVEUPDATE_CPU
+	depends on HOTPLUG_CPU
+	depends on HOTPLUG_CORE_SYNC_DEAD
+	help
+	  Enable live update support for physical CPU preservation.
+
+	  This feature allows physical CPU cores to keep running across
+	  kexec-based live updates, without a hardware reset.
+
+	  When a core is preserved, it is taken down through CPU hotplug
+	  and parked in a small runtime in preserved memory. Its stack and
+	  page tables are handed over across kexec using KHO. The incoming
+	  kernel finds preserved cores during early boot and does not
+	  bring them up; they are returned to Linux when userspace retrieves
+	  and finishes the LUO session.
+
+	  Preservation lifecycle is managed from userspace via LUO sessions
+	  associated with /sys/devices/system/cpu/cpu<N>/preserve file
+	  descriptors, and monitored via sysfs.
+
+	  Orphaned jobs can be submitted to run on the preserved CPUs.
+
+	  If unsure, say N.
+
 endmenu
