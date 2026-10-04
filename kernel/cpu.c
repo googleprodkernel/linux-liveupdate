@@ -14,6 +14,7 @@
 #include <linux/sched/smt.h>
 #include <linux/unistd.h>
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
 #include <linux/oom.h>
 #include <linux/rcupdate.h>
 #include <linux/delay.h>
@@ -349,6 +350,7 @@ static inline void cpuhp_ap_update_sync_state(enum cpuhp_sync_state state) { }
 void cpuhp_ap_report_dead(void)
 {
 	cpuhp_ap_update_sync_state(SYNC_STATE_DEAD);
+	cpupr_report_dead();
 }
 
 void __weak arch_cpuhp_cleanup_dead_cpu(unsigned int cpu) { }
@@ -1626,6 +1628,11 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
 		goto out;
 	}
 
+	if (cpu_is_preserved(cpu)) {
+		ret = -EBUSY;
+		goto out;
+	}
+
 	/*
 	 * The caller of cpu_up() might have raced with another
 	 * caller. Nothing to do.
@@ -2710,6 +2717,8 @@ int cpuhp_smt_enable(void)
 		if (cpu_online(cpu) || !node_online(cpu_to_node(cpu)))
 			continue;
 		if (!cpu_smt_thread_allowed(cpu) || !topology_is_core_online(cpu))
+			continue;
+		if (cpu_is_preserved(cpu))
 			continue;
 		ret = _cpu_up(cpu, 0, CPUHP_ONLINE);
 		if (ret)

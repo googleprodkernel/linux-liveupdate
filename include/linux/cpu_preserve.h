@@ -12,6 +12,7 @@
 #include <linux/bug.h>
 #include <linux/compiler.h>
 #include <linux/cpumask.h>
+#include <linux/smp.h>
 #include <linux/types.h>
 
 #ifndef __CPUPR_RUNTIME__
@@ -85,6 +86,7 @@ static __always_inline bool cpupr_state_is_stopped(u32 state)
 bool cpu_is_preserved(int cpu);
 void cpupr_set_dead(void) __cpupr_sym_asm(cpupr_set_dead);
 void cpupr_park_loop(int cpu) __cpupr_sym_asm(cpupr_park_loop);
+void cpupr_park(int cpu);
 
 /**
  * arch_cpupr_park_wait - Wait in a low-power state until kicked
@@ -112,6 +114,77 @@ static __always_inline void cpupr_clean_sz(const void *p, size_t sz)
 
 const struct cpumask *cpu_get_preserved_mask(void);
 struct cpupr_stack_context *cpupr_get_sctx(int cpu);
+
+/**
+ * cpupr_report_dead - Park preserved CPU when reporting dead in hotplug
+ *
+ * Invoked by cpuhp_ap_report_dead() after CPU hotplug offline synchronization
+ * is complete. If the calling CPU is marked for preservation across live update,
+ * transition it into the preserved parking loop instead of powering down.
+ */
+static inline void cpupr_report_dead(void)
+{
+	if (cpu_is_preserved(raw_smp_processor_id()))
+		cpupr_park(raw_smp_processor_id());
+}
+
+/**
+ * arch_cpupr_kick - Signal or wake up a preserved physical CPU
+ * @cpu: Logical CPU identifier.
+ *
+ * Architecture backend hook to wake a preserved CPU from arch_cpupr_park_wait().
+ *
+ * Executed in normal text context.
+ */
+void arch_cpupr_kick(int cpu);
+
+/**
+ * arch_cpupr_hwid - Hardware identifier of a CPU
+ * @cpu: Logical CPU identifier.
+ *
+ * Architecture backend hook that returns the hardware identifier of @cpu.
+ * The incoming kernel matches the hardware identifier of each handed-over CPU
+ * against its present CPUs, and refuses the handover otherwise.
+ *
+ * Return: The hardware identifier of @cpu.
+ */
+u64 arch_cpupr_hwid(unsigned int cpu);
+
+/**
+ * arch_cpupr_park_finish - Architecture cleanup on park loop exit
+ * @cpu: Logical CPU identifier.
+ *
+ * Architecture backend hook invoked when @cpu exits the preserved parking loop
+ * (or on the fallback path if parking fails). May power down the CPU and not
+ * return.
+ */
+void arch_cpupr_park_finish(int cpu) __cpupr_sym_asm(arch_cpupr_park_finish);
+
+/**
+ * arch_cpupr_park_on_stack - Switch stack and enter park loop
+ * @cpu: Logical CPU identifier.
+ * @stack_top: Top of the dedicated preserved stack.
+ *
+ * Architecture backend hook to switch to the preserved CPU stack and
+ * invoke cpupr_park_loop(). Does not return.
+ *
+ * Executed in normal text context during CPU teardown.
+ */
+void arch_cpupr_park_on_stack(int cpu, unsigned long stack_top);
+
+/**
+ * arch_cpupr_wait_dead - Finish stopping a preserved CPU
+ * @cpu: Logical CPU identifier.
+ * @ser: Preserved CPU descriptor, or %NULL on bringup fallback.
+ * @bringup: True if @cpu is about to be brought back online via CPU hotplug.
+ *
+ * Architecture backend hook called once @cpu has reported %CPUPR_DEAD
+ * or %CPUPR_FAULTED, to report what the runtime recorded and to prepare
+ * @cpu for hotplug bringup or wait for it to be fully stopped.
+ *
+ * Executed in normal text context during CPU teardown.
+ */
+void arch_cpupr_wait_dead(int cpu, struct cpupr_ser *ser, bool bringup);
 
 struct page;
 struct cpupr_session;
@@ -161,6 +234,7 @@ int arch_cpupr_as_map(struct cpupr_session *ps, void *pgd, phys_addr_t pa,
 #else /* !CONFIG_LIVEUPDATE_CPU */
 
 static inline bool cpu_is_preserved(int cpu) { return false; }
+static inline void cpupr_report_dead(void) {}
 static inline const struct cpumask *cpu_get_preserved_mask(void)
 {
 	return cpu_none_mask;

@@ -29,6 +29,7 @@
 #include <linux/bitfield.h>
 #include <trace/events/power.h>
 #include <linux/units.h>
+#include <linux/cpu_preserve.h>
 
 #include <asm/cpu.h>
 #include <asm/div64.h>
@@ -2971,7 +2972,7 @@ static int intel_cpufreq_cpu_offline(struct cpufreq_policy *policy)
 
 	pr_debug("CPU %d going offline\n", cpu->cpu);
 
-	if (cpu->suspended)
+	if (cpu->suspended || cpu_is_preserved(policy->cpu))
 		return 0;
 
 	/*

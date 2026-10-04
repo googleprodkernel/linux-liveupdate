@@ -220,6 +220,7 @@
 
 #include <linux/cpu.h>
 #include <linux/cpu_preserve.h>
+#include <linux/iopoll.h>
 #include <linux/kexec.h>
 #include <linux/kexec_handover.h>
 #include <linux/liveupdate.h>
@@ -685,6 +686,142 @@ const struct cpumask *cpu_get_preserved_mask(void)
 	return &cpupr_mask;
 }
 
+static void cpupr_signal_exit_ser(struct cpupr_ser *ser)
+{
+	u32 old_state;
+
+	if (!ser)
+		return;
+
+	cpupr_clean(ser);
+	old_state = READ_ONCE(ser->state);
+	while (!cpupr_state_is_stopped(old_state) && old_state != CPUPR_EXITING) {
+		if (try_cmpxchg(&ser->state, &old_state, CPUPR_EXITING))
+			break;
+	}
+	cpupr_clean(ser);
+}
+
+static void cpupr_signal_exit(int cpu)
+{
+	cpupr_signal_exit_ser(cpupr_get_ser(cpu));
+}
+
+/*
+ * Parking and stopping take microseconds once the CPU runs, so the timeouts
+ * only catch a wedged CPU: parking gets 100 ms after the CPU has reported
+ * dead, and stopping gets 1s to allow any running workload slice to yield.
+ */
+#define CPUPR_WAIT_PARKED_TIMEOUT_US	(100 * USEC_PER_MSEC)
+#define CPUPR_WAIT_DEAD_TIMEOUT_US	USEC_PER_SEC
+#define CPUPR_WAIT_POLL_US		10
+
+static u32 cpupr_read_state(struct cpupr_ser *ser)
+{
+	cpupr_clean(ser);
+	/* Pairs with the release cmpxchg()es of the preserved CPU */
+	return smp_load_acquire(&ser->state);
+}
+
+static int cpupr_wait_parked(int cpu)
+{
+	struct cpupr_ser *ser = cpupr_get_ser(cpu);
+	u32 state;
+	int ret;
+
+	if (!ser)
+		return -ENODEV;
+
+	ret = read_poll_timeout(cpupr_read_state, state, state != CPUPR_PARKING,
+				CPUPR_WAIT_POLL_US, CPUPR_WAIT_PARKED_TIMEOUT_US,
+				false, ser);
+	if (!ret && state == CPUPR_PARKED)
+		return 0;
+
+	pr_err("Preserved cpu %d failed to park (state=%u)\n", cpu, state);
+
+	return ret ?: -EIO;
+}
+
+static int cpupr_wait_dead_ser(int cpu, struct cpupr_ser *ser,
+			       u64 timeout_us, bool bringup)
+{
+	u32 state;
+	int ret;
+
+	if (!ser)
+		return -ENODEV;
+
+	ret = read_poll_timeout(cpupr_read_state, state, cpupr_state_is_stopped(state),
+				CPUPR_WAIT_POLL_US, timeout_us, false, ser);
+	if (ret) {
+		if (IS_ENABLED(CONFIG_X86)) {
+			pr_debug("Forcing preserved cpu %d stop via INIT reset (state=%u)\n",
+				 cpu, state);
+		} else {
+			pr_err("Timed out waiting for preserved cpu %d to stop (state=%u)\n",
+			       cpu, state);
+			return ret;
+		}
+	}
+
+	if (state == CPUPR_FAULTED)
+		pr_err("Preserved cpu %d stopped on a fault\n", cpu);
+
+	arch_cpupr_wait_dead(cpu, ser, bringup);
+	return 0;
+}
+
+static int cpupr_wait_dead_timeout(int cpu, u64 timeout_us)
+{
+	return cpupr_wait_dead_ser(cpu, cpupr_get_ser(cpu), timeout_us, false);
+}
+
+static int cpupr_wait_dead(int cpu)
+{
+	return cpupr_wait_dead_ser(cpu, cpupr_get_ser(cpu), 100, true);
+}
+
+/**
+ * cpupr_park - Main execution and parking loop for a preserved CPU
+ * @cpu: Logical CPU identifier of the calling core.
+ */
+void cpupr_park(int cpu)
+{
+	struct cpupr_stack_context *sctx = cpupr_get_sctx(cpu);
+
+	if (!sctx || !sctx->session_pgd_pa) {
+		struct cpupr_ser *ser = cpupr_get_ser(cpu);
+
+		if (ser) {
+			/* Pairs with the acquire in cpupr_read_state() */
+			smp_store_release(&ser->state, CPUPR_DEAD);
+			cpupr_clean(ser);
+		}
+		arch_cpupr_park_finish(cpu);
+		return;
+	}
+
+	arch_cpupr_park_on_stack(cpu, (unsigned long)sctx + CPUPR_STACK_SIZE);
+}
+
+/*
+ * Drop @cpu out of the preserved state.  The caller holds cpupr_lock,
+ * and the core either never parked or has stopped.  Its stack and descriptor
+ * stay with the address space of its session, which frees them once every CPU
+ * of the session has left it.
+ */
+static void cpupr_unpreserve_locked(unsigned int cpu)
+{
+	lockdep_assert_held(&cpupr_lock);
+
+	WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), NULL);
+	per_cpu(cpupr_cpu_session, cpu) = NULL;
+	cpumask_clear_cpu(cpu, &cpupr_outgoing_mask);
+	cpumask_clear_cpu(cpu, &cpupr_incoming_mask);
+	cpumask_clear_cpu(cpu, &cpupr_mask);
+}
+
 static struct cpupr_session *cpupr_session_alloc(void)
 {
 	struct cpupr_session *ps;
@@ -819,4 +956,194 @@ static void cpupr_session_remove_cpu(struct cpupr_session *ps,
 
 	if (empty)
 		cpupr_session_release(ps);
+}
+
+/* Map the context block and the stack, but not the guard page between them. */
+static int cpupr_map_stack(struct cpupr_session *ps, void *stack)
+{
+	unsigned long va = (unsigned long)stack;
+	phys_addr_t pa = virt_to_phys(stack);
+	int ret;
+
+	ret = cpupr_as_map(ps, pa, va, CPUPR_STACK_CTX_SIZE, PAGE_KERNEL);
+	if (ret)
+		return ret;
+
+	return cpupr_as_map(ps, pa + CPUPR_STACK_BASE, va + CPUPR_STACK_BASE,
+			    THREAD_SIZE, PAGE_KERNEL);
+}
+
+/**
+ * cpupr_unpreserve - Unpreserve a physical CPU and restore it to online state
+ * @cpu: Logical CPU identifier.
+ *
+ * Signals the CPU to exit the parking loop, waits for it to stop, drops it out
+ * of the preserved state, and brings it back online through CPU hotplug.  If
+ * bringing the CPU online fails after it has stopped, it remains offline so
+ * userspace can manage it.  Its stack stays with the address space of its
+ * session, which frees it once every CPU of the session has left.
+ *
+ * Return: 0 on success, or a negative errno if the CPU did not stop.  If it
+ *         did not stop, the CPU stays preserved and everything it can reach
+ *         stays allocated.
+ */
+static int cpupr_unpreserve(unsigned int cpu)
+{
+	struct device *dev = get_cpu_device(cpu);
+	int ret;
+
+	scoped_guard(mutex, &cpupr_lock) {
+		if (!cpu_is_preserved(cpu))
+			return 0;
+		if (!dev)
+			return -ENODEV;
+
+		cpupr_signal_exit(cpu);
+		arch_cpupr_kick(cpu);
+	}
+
+	/*
+	 * Do not hold cpupr_lock across the wait: it only reads the
+	 * CPU's ser, which stays valid for as long as the CPU is preserved.
+	 */
+	ret = cpupr_wait_dead(cpu);
+	if (WARN_ON_ONCE(ret))
+		return ret;
+
+	lock_device_hotplug();
+	scoped_guard(mutex, &cpupr_lock)
+		cpupr_unpreserve_locked(cpu);
+	ret = device_online(dev);
+	unlock_device_hotplug();
+
+	if (ret < 0) {
+		arch_cpupr_wait_dead(cpu, NULL, false);
+		pr_warn("Failed to bring unpreserved cpu %u back online: %d\n",
+			cpu, ret);
+	}
+	return 0;
+}
+
+/*
+ * Allocate and map the preserved stack and descriptor for @cpu in @ps's
+ * isolated address space, which owns and frees them when @ps is released.
+ */
+static struct cpupr_ser *cpupr_alloc_cpu(struct cpupr_session *ps,
+					 unsigned int cpu)
+{
+	struct cpupr_stack_context *sctx;
+	struct cpupr_ser *ser;
+	void *stack;
+	int ret;
+
+	stack = cpupr_as_alloc_folio(ps, CPUPR_STACK_ORDER);
+	if (IS_ERR(stack))
+		return stack;
+
+	ser = cpupr_as_alloc_buffer(ps, sizeof(*ser));
+	if (IS_ERR(ser))
+		return ser;
+
+	ret = cpupr_map_stack(ps, stack);
+	if (ret)
+		return ERR_PTR(ret);
+
+	ser->size = sizeof(*ser);
+	ser->hwid = arch_cpupr_hwid(cpu);
+	ser->state = CPUPR_PARKING;
+	ser->stack_pa = virt_to_phys(stack);
+	KHOSER_STORE_PTR(ser->as, ps->as);
+	cpupr_clean(ser);
+
+	sctx = stack;
+	sctx->magic = CPUPR_STACK_MAGIC;
+	sctx->session_pgd_pa = ps->as->pgd_pa;
+	sctx->ser = ser;
+	cpupr_clean(sctx);
+
+	return ser;
+}
+
+/*
+ * Hold the device hotplug lock from the online check until the CPU is offline,
+ * so that no other path can take the CPU down (it would park on this stack) or
+ * bring it up in between.
+ */
+static int cpupr_offline_cpu(unsigned int cpu, struct device *dev,
+			     struct cpupr_session *ps, struct cpupr_ser *ser)
+{
+	int ret = 0;
+
+	lock_device_hotplug();
+	scoped_guard(mutex, &cpupr_lock) {
+		if (cpu_is_preserved(cpu) || !cpu_online(cpu)) {
+			ret = -EBUSY;
+		} else {
+			cpumask_set_cpu(cpu, &cpupr_outgoing_mask);
+			cpumask_set_cpu(cpu, &cpupr_mask);
+			WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), ser);
+			per_cpu(cpupr_cpu_session, cpu) = ps;
+		}
+	}
+	if (!ret) {
+		ret = device_offline(dev);
+		if (ret < 0) {
+			pr_err("Failed to offline preserved cpu %u: %d\n",
+			       cpu, ret);
+			scoped_guard(mutex, &cpupr_lock)
+				cpupr_unpreserve_locked(cpu);
+		}
+	}
+	unlock_device_hotplug();
+
+	return ret < 0 ? ret : 0;
+}
+
+static int cpupr_preserve(unsigned int cpu, struct liveupdate_session *session)
+{
+	struct device *dev = get_cpu_device(cpu);
+	struct cpupr_session *ps;
+	struct cpupr_ser *ser;
+	int ret;
+
+	if (!dev)
+		return -ENODEV;
+
+	/* Do not grow the address space for a CPU that cannot be preserved */
+	if (cpu_is_preserved(cpu) || !cpu_online(cpu))
+		return -EBUSY;
+
+	ps = cpupr_session_get(session);
+	if (IS_ERR(ps))
+		return PTR_ERR(ps);
+
+	ser = cpupr_alloc_cpu(ps, cpu);
+	if (IS_ERR(ser)) {
+		ret = PTR_ERR(ser);
+		goto err_put;
+	}
+
+	ret = cpupr_offline_cpu(cpu, dev, ps, ser);
+	if (ret)
+		goto err_put;
+
+	ret = cpupr_wait_parked(cpu);
+	if (ret)
+		goto err_unpreserve;
+
+	scoped_guard(mutex, &cpupr_sessions_lock)
+		cpumask_set_cpu(cpu, &ps->cpus);
+	return 0;
+
+err_unpreserve:
+	/* A CPU that fails to stop keeps its session alive */
+	if (cpupr_unpreserve(cpu)) {
+		scoped_guard(mutex, &cpupr_sessions_lock)
+			cpumask_set_cpu(cpu, &ps->cpus);
+		cpupr_session_detach(ps);
+		return ret;
+	}
+err_put:
+	cpupr_session_put_if_empty(ps);
+	return ret;
 }
