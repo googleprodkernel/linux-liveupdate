@@ -21,10 +21,12 @@ function get_arch_conf() {
 		QEMU_CMD="qemu-system-aarch64 -M virt -cpu max"
 		KERNEL_IMAGE="Image"
 		KERNEL_CMDLINE="console=ttyAMA0"
+		ARCH_CFLAGS="-mno-outline-atomics"
 	elif [[ "$arch" == "x86" ]]; then
-		QEMU_CMD="qemu-system-x86_64"
+		QEMU_CMD="qemu-system-x86_64 -M q35 -cpu max -device intel-iommu,intremap=on,eim=on"
 		KERNEL_IMAGE="bzImage"
 		KERNEL_CMDLINE="console=ttyS0"
+		ARCH_CFLAGS=""
 	else
 		echo "Unsupported architecture: $arch"
 		exit 1
@@ -46,10 +48,17 @@ EOF
 }
 
 function cleanup() {
+	local exit_code=$?
+
 	if [ "$KEEP_WORKSPACE" -eq 1 ]; then
 		echo "# Workspace preserved at: $workspace_dir"
 	else
 		rm -fr "$workspace_dir"
+	fi
+
+	if [ "$exit_code" -eq "$KSFT_SKIP" ]; then
+		ktap_print_totals
+		exit "$KSFT_SKIP"
 	fi
 
 	ktap_finished
@@ -128,7 +137,7 @@ function mkinitrd() {
 	local test_name=$3
 
 	# Compile the test binary and the init process
-	"$CROSS_COMPILE"gcc -static -O2 -nostdinc -nostdlib \
+	"$CROSS_COMPILE"gcc -static -O2 -nostdinc -nostdlib $ARCH_CFLAGS \
 		-I "$headers_dir/include" \
 		-I "$kernel_dir/tools/include/nolibc" \
 		-I "$test_dir/lib/include" \
@@ -145,6 +154,7 @@ function mkinitrd() {
 	cat > "$workspace_dir/cpio_list_inner" <<EOF
 dir /dev 0755 0 0
 dir /proc 0755 0 0
+dir /sys 0755 0 0
 dir /debugfs 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
@@ -157,6 +167,7 @@ EOF
 	cat > "$workspace_dir/cpio_list" <<EOF
 dir /dev 0755 0 0
 dir /proc 0755 0 0
+dir /sys 0755 0 0
 dir /debugfs 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
@@ -179,12 +190,16 @@ function run_qemu() {
 
 	echo "# Serial Log: $serial"
 	timeout 30s \
-	$qemu_cmd -m 1G -smp 2 -no-reboot -nographic -nodefaults \
+	$qemu_cmd -m 1G -smp 4 -no-reboot -nographic -nodefaults \
 		  -accel tcg -accel hvf -accel kvm \
 		  -serial file:"$serial" \
 		  -append "$cmdline" \
 		  -kernel "$kernel_path" \
 		  -initrd "$initrd"
+
+	if grep "TEST SKIPPED" "$serial" &> /dev/null; then
+		skip "Test skipped"
+	fi
 
 	grep "TEST PASSED" "$serial" &> /dev/null || fail "Liveupdate failed"
 }
@@ -256,7 +271,13 @@ function main() {
 	local final_kernel="$build_dir/arch/$arch/boot/$KERNEL_IMAGE"
 	mkinitrd "$build_dir" "$final_kernel" "$test_name"
 
-	run_qemu "$QEMU_CMD" "$KERNEL_CMDLINE" "$final_kernel"
+	# kselftest harness tests run once, without kexec
+	local cmdline="$KERNEL_CMDLINE"
+	if grep -q kselftest_harness.h "$test_dir/$test_name.c"; then
+		cmdline="$cmdline luo_harness"
+	fi
+
+	run_qemu "$QEMU_CMD" "$cmdline" "$final_kernel"
 	ktap_test_pass "$test_name succeeded"
 }
 

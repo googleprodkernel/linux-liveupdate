@@ -27,6 +27,11 @@ static int mount_filesystems(void)
 		return -1;
 	}
 
+	if (mount("sysfs", "/sys", "sysfs", 0, NULL) < 0) {
+		fprintf(stderr, "INIT: Failed to mount sysfs\n");
+		return -1;
+	}
+
 	if (mount("debugfs", "/debugfs", "debugfs", 0, NULL) < 0) {
 		fprintf(stderr, "INIT: Failed to mount debugfs\n");
 		return -1;
@@ -109,17 +114,22 @@ static int run_test(int stage)
 
 	if (!pid) {
 		char *const argv[] = {TEST_BINARY, "-s", stage_arg, NULL};
+		char *const harness_argv[] = {TEST_BINARY, NULL};
 
-		execve(TEST_BINARY, argv, NULL);
+		execve(TEST_BINARY, stage ? argv : harness_argv, NULL);
 		fprintf(stderr, "INIT: execve failed\n");
 		_exit(1);
 	}
 
 	waitpid(pid, &status, 0);
 
-	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+/*
+ * Return the stage of a kexec test, or 0 for a kselftest harness test, which
+ * runs once, without -s and without kexec.
+ */
 static int get_current_stage(void)
 {
 	char cmdline[COMMAND_LINE_SIZE];
@@ -137,6 +147,9 @@ static int get_current_stage(void)
 		return -1;
 
 	cmdline[len] = 0;
+
+	if (strstr(cmdline, "luo_harness"))
+		return 0;
 
 	return strstr(cmdline, "luo_stage=2") ? 2 : 1;
 }
@@ -162,12 +175,21 @@ int main(int argc, char *argv[])
 		goto err_reboot;
 	}
 
-	if (run_test(current_stage)) {
+	err = run_test(current_stage);
+	if (err == 4) {
+		printf("\n--- TEST SKIPPED ---\n");
+		reboot(RB_AUTOBOOT);
+		return 0;
+	}
+	if (err) {
 		fprintf(stderr, "INIT: Test binary returned failure\n");
 		goto err_reboot;
 	}
 
 	printf("INIT: Stage %d completed successfully.\n", current_stage);
+	/* Kexec tests report their own result in stage 2 */
+	if (!current_stage)
+		printf("\n--- TEST PASSED ---\n");
 	reboot(current_stage == 1 ? RB_KEXEC : RB_AUTOBOOT);
 
 	return 0;
