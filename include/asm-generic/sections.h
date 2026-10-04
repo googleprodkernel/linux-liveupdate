@@ -56,6 +56,11 @@ extern char __start_opd[], __end_opd[];
 /* Start and end of instrumentation protected text section */
 extern char __noinstr_text_start[], __noinstr_text_end[];
 
+/* Start and end of preserved runtime text and data sections */
+extern char __preserved_text_start[], __preserved_text_end[];
+extern char __preserved_data_start[], __preserved_data_end[];
+extern char __preserved_rodata_end[];
+
 extern __visible const void __nosave_begin, __nosave_end;
 
 /* Function descriptor handling (if any).  Override in asm/sections.h */
