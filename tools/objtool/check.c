@@ -419,6 +419,9 @@ static int decode_instructions(struct objtool_file *file)
 		u8 prev_len = 0;
 		u8 idx = 0;
 
+		if (!strncmp(sec->name, ".preserved.", 11))
+			sec->preserved = true;
+
 		if (!is_text_sec(sec))
 			continue;
 
@@ -460,6 +463,7 @@ static int decode_instructions(struct objtool_file *file)
 			insn->sec = sec;
 			insn->offset = offset;
 			insn->prev_len = prev_len;
+			insn->retpoline_safe = sec->preserved;
 
 			if (arch_decode_instruction(file, sec, offset, sec_size(sec) - offset, insn))
 				return -1;
@@ -1418,6 +1422,7 @@ static int annotate_call_site(struct objtool_file *file,
 	}
 
 	if (insn->type == INSN_CALL && !insn->sec->init &&
+	    !insn->sec->preserved && !sym->sec->preserved &&
 	    !insn->_call_dest->embedded_insn)
 		list_add_tail(&insn->call_node, &file->call_list);
 
@@ -1817,6 +1822,7 @@ static int handle_group_alt(struct objtool_file *file,
 		last_new_insn = insn;
 
 		insn->alt_group = new_alt_group;
+		insn->retpoline_safe = orig_insn->retpoline_safe;
 
 		/*
 		 * Since alternative replacement code is copy/pasted by the
@@ -4653,6 +4659,7 @@ static int validate_ibt(struct objtool_file *file)
 		    !strcmp(sec->name, "_kprobe_blacklist")		||
 		    !strcmp(sec->name, "__bug_table")			||
 		    !strcmp(sec->name, "__ex_table")			||
+		    !strcmp(sec->name, ".preserved.ex_table")		||
 		    !strcmp(sec->name, "__jump_table")			||
 		    !strcmp(sec->name, ".init.klp_funcs")		||
 		    !strcmp(sec->name, "__mcount_loc")			||
