@@ -1731,9 +1731,9 @@ static int kvm_vcpu_set_target(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
-					 struct kvm_vcpu_init *init)
+int kvm_arm_vcpu_init(struct kvm_vcpu *vcpu, const struct kvm_vcpu_init *init)
 {
+	struct kvm_vcpu_init local_init = *init;
 	bool power_off = false;
 	int ret;
 
@@ -1742,12 +1742,12 @@ static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
 	 * reflecting it in the finalized feature set, thus limiting its scope
 	 * to a single KVM_ARM_VCPU_INIT call.
 	 */
-	if (init->features[0] & BIT(KVM_ARM_VCPU_POWER_OFF)) {
-		init->features[0] &= ~BIT(KVM_ARM_VCPU_POWER_OFF);
+	if (local_init.features[0] & BIT(KVM_ARM_VCPU_POWER_OFF)) {
+		local_init.features[0] &= ~BIT(KVM_ARM_VCPU_POWER_OFF);
 		power_off = true;
 	}
 
-	ret = kvm_vcpu_set_target(vcpu, init);
+	ret = kvm_vcpu_set_target(vcpu, &local_init);
 	if (ret)
 		return ret;
 
@@ -1782,6 +1782,12 @@ static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
 	spin_unlock(&vcpu->arch.mp_state_lock);
 
 	return 0;
+}
+
+static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
+					 struct kvm_vcpu_init *init)
+{
+	return kvm_arm_vcpu_init(vcpu, init);
 }
 
 static int kvm_arm_vcpu_set_attr(struct kvm_vcpu *vcpu,

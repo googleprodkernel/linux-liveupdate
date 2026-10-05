@@ -1543,6 +1543,7 @@ void __init kvm_hyp_reserve(void);
 static inline void kvm_hyp_reserve(void) { }
 #endif
 
+int kvm_arm_vcpu_init(struct kvm_vcpu *vcpu, const struct kvm_vcpu_init *init);
 void kvm_arm_vcpu_power_off(struct kvm_vcpu *vcpu);
 bool kvm_arm_vcpu_stopped(struct kvm_vcpu *vcpu);
 
