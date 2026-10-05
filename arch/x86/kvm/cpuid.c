@@ -170,8 +170,8 @@ static int kvm_check_cpuid(struct kvm_vcpu *vcpu)
 	return fpu_enable_guest_xfd_features(&vcpu->arch.guest_fpu, xfeatures);
 }
 
-static u32 kvm_apply_cpuid_pv_features_quirk(struct kvm_vcpu *vcpu);
 static void kvm_update_cpuid_runtime(struct kvm_vcpu *vcpu);
+static u32 kvm_apply_cpuid_pv_features_quirk(struct kvm_vcpu *vcpu);
 
 /* Check whether the supplied CPUID data is equal to what is already set for the vCPU. */
 static int kvm_cpuid_check_equal(struct kvm_vcpu *vcpu, struct kvm_cpuid_entry2 *e2,
@@ -507,8 +507,8 @@ u64 kvm_vcpu_reserved_gpa_bits_raw(struct kvm_vcpu *vcpu)
 	return rsvd_bits(cpuid_maxphyaddr(vcpu), 63);
 }
 
-static int kvm_set_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid_entry2 *e2,
-                        int nent)
+int kvm_set_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid_entry2 *e2,
+		  int nent)
 {
 	u32 vcpu_caps[NR_KVM_CPU_CAPS];
 	int r;
@@ -671,6 +671,21 @@ int kvm_vcpu_ioctl_get_cpuid2(struct kvm_vcpu *vcpu,
 
 	cpuid->nent = vcpu->arch.cpuid_nent;
 	return 0;
+}
+
+void kvm_get_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid)
+{
+	u32 nent = vcpu->arch.cpuid_entries ? vcpu->arch.cpuid_nent : 0;
+
+	cpuid->nent = nent;
+	cpuid->padding = 0;
+	if (!nent)
+		return;
+
+	if (vcpu->arch.cpuid_dynamic_bits_dirty)
+		kvm_update_cpuid_runtime(vcpu);
+	memcpy(cpuid->entries, vcpu->arch.cpuid_entries,
+	       flex_array_size(cpuid, entries, nent));
 }
 
 static __always_inline u32 raw_cpuid_get(struct cpuid_reg cpuid)
