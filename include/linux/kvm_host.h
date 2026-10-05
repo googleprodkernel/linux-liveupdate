@@ -398,6 +398,7 @@ struct kvm_vcpu {
 	 */
 	struct kvm_memory_slot *last_used_slot;
 	u64 last_used_slot_gen;
+	bool luo_preserved;
 };
 
 /*
@@ -2667,8 +2668,33 @@ long kvm_arch_vcpu_pre_fault_memory(struct kvm_vcpu *vcpu,
 				    struct kvm_pre_fault_memory *range);
 #endif
 
+#ifdef CONFIG_LIVEUPDATE_GUEST_MEMFD
 struct kvm_luo_ser;
+struct kvm_vcpu_ser;
 
 int kvm_arch_vm_luo_preserve(struct kvm *kvm, struct kvm_luo_ser *ser);
+
+#ifdef CONFIG_HAVE_KVM_ARCH_VCPU_PRESERVE
+int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser);
+int kvm_arch_vcpu_luo_retrieve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser);
+void kvm_arch_vcpu_luo_unpreserve(struct kvm_vcpu_ser *ser);
+void kvm_arch_vcpu_luo_finish(struct kvm_vcpu_ser *ser);
+#else
+static inline int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu,
+					     struct kvm_vcpu_ser *ser)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kvm_arch_vcpu_luo_retrieve(struct kvm_vcpu *vcpu,
+					     struct kvm_vcpu_ser *ser)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kvm_arch_vcpu_luo_unpreserve(struct kvm_vcpu_ser *ser) {}
+static inline void kvm_arch_vcpu_luo_finish(struct kvm_vcpu_ser *ser) {}
+#endif
+#endif /* CONFIG_LIVEUPDATE_GUEST_MEMFD */
 
 #endif

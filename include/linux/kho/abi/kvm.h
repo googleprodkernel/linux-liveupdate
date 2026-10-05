@@ -18,13 +18,13 @@
  * KVM and guest_memfd use the ABI defined below for preserving their states
  * across a kexec reboot using the LUO.
  *
- * The state is serialized into packed structures (struct kvm_luo_ser and
- * struct guest_memfd_luo_ser) which are handed over to the next kernel via
- * the KHO mechanism.
+ * The state is serialized into packed structures (struct kvm_luo_ser,
+ * struct kvm_vcpu_ser, and struct guest_memfd_luo_ser) which are handed over
+ * to the next kernel via the KHO mechanism.
  *
  * This interface is a contract. Any modification to the structure layouts
  * constitutes a breaking change. Such changes require incrementing the
- * version number in the KVM_LUO_FH_COMPATIBLE or
+ * version number in the KVM_LUO_FH_COMPATIBLE, KVM_VCPU_LUO_FH_COMPATIBLE, or
  * GUEST_MEMFD_LUO_FH_COMPATIBLE compatibility strings.
  */
 
@@ -38,6 +38,31 @@ struct kvm_luo_ser {
 
 /* The compatibility string for KVM VM file handler */
 #define KVM_LUO_FH_COMPATIBLE	"kvm_vm_luo_v1"
+
+struct kvm_vcpu_arch_ser;
+
+/**
+ * struct kvm_vcpu_ser - Main serialization structure for a KVM vCPU.
+ * @vcpu_id:    The ID of the virtual CPU.
+ * @reserved:   Must be zero.
+ * @vm_token:   Token of the associated KVM VM instance.
+ * @arch_state: Preservation pointer to vCPU architectural state.
+ */
+struct kvm_vcpu_ser {
+	u32 vcpu_id;
+	u32 reserved;
+	u64 vm_token;
+	DECLARE_KHOSER_PTR(arch_state, struct kvm_vcpu_arch_ser *);
+} __packed;
+
+/* The compatibility string for KVM vCPU file handler */
+#if defined(CONFIG_X86_64)
+#define KVM_VCPU_LUO_FH_COMPATIBLE	"kvm_vcpu_luo_x86_v1"
+#elif defined(CONFIG_ARM64)
+#define KVM_VCPU_LUO_FH_COMPATIBLE	"kvm_vcpu_luo_arm64_v1"
+#else
+#define KVM_VCPU_LUO_FH_COMPATIBLE	"kvm_vcpu_luo_v1"
+#endif
 
 /**
  * struct guest_memfd_luo_folio_ser - Serialization layout for a single folio in guest_memfd.

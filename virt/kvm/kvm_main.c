@@ -4504,6 +4504,10 @@ static long kvm_vcpu_ioctl(struct file *filp,
 
 	if (mutex_lock_killable(&vcpu->mutex))
 		return -EINTR;
+	if (vcpu->luo_preserved) {
+		r = -EBUSY;
+		goto out;
+	}
 	switch (ioctl) {
 	case KVM_RUN: {
 		struct pid *oldpid;
