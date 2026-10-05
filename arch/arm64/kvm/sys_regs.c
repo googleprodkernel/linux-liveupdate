@@ -5496,11 +5496,8 @@ id_to_sys_reg_desc(struct kvm_vcpu *vcpu, u64 id,
 	return r;
 }
 
-static int demux_c15_get(struct kvm_vcpu *vcpu, u64 id, void __user *uaddr)
+static int demux_c15_validate_id(u64 id, u32 *idx)
 {
-	u32 val;
-	u32 __user *uval = uaddr;
-
 	/* Fail if we have unknown bits set. */
 	if (id & ~(KVM_REG_ARCH_MASK|KVM_REG_SIZE_MASK|KVM_REG_ARM_COPROC_MASK
 		   | ((1 << KVM_REG_ARM_COPROC_SHIFT)-1)))
@@ -5510,43 +5507,57 @@ static int demux_c15_get(struct kvm_vcpu *vcpu, u64 id, void __user *uaddr)
 	case KVM_REG_ARM_DEMUX_ID_CCSIDR:
 		if (KVM_REG_SIZE(id) != 4)
 			return -ENOENT;
-		val = (id & KVM_REG_ARM_DEMUX_VAL_MASK)
+		*idx = (id & KVM_REG_ARM_DEMUX_VAL_MASK)
 			>> KVM_REG_ARM_DEMUX_VAL_SHIFT;
-		if (val >= CSSELR_MAX)
+		if (*idx >= CSSELR_MAX)
 			return -ENOENT;
 
-		return put_user(get_ccsidr(vcpu, val), uval);
+		return 0;
 	default:
 		return -ENOENT;
 	}
 }
 
+static int demux_c15_get_val(struct kvm_vcpu *vcpu, u64 id, u32 *val)
+{
+	u32 idx;
+	int ret;
+
+	ret = demux_c15_validate_id(id, &idx);
+	if (ret)
+		return ret;
+
+	*val = get_ccsidr(vcpu, idx);
+	return 0;
+}
+
+static int demux_c15_get(struct kvm_vcpu *vcpu, u64 id, void __user *uaddr)
+{
+	u32 __user *uval = uaddr;
+	u32 val;
+	int ret;
+
+	ret = demux_c15_get_val(vcpu, id, &val);
+	if (!ret)
+		ret = put_user(val, uval);
+
+	return ret;
+}
+
 static int demux_c15_set(struct kvm_vcpu *vcpu, u64 id, void __user *uaddr)
 {
-	u32 val, newval;
 	u32 __user *uval = uaddr;
+	u32 newval, idx;
+	int ret;
 
-	/* Fail if we have unknown bits set. */
-	if (id & ~(KVM_REG_ARCH_MASK|KVM_REG_SIZE_MASK|KVM_REG_ARM_COPROC_MASK
-		   | ((1 << KVM_REG_ARM_COPROC_SHIFT)-1)))
-		return -ENOENT;
+	ret = demux_c15_validate_id(id, &idx);
+	if (ret)
+		return ret;
 
-	switch (id & KVM_REG_ARM_DEMUX_ID_MASK) {
-	case KVM_REG_ARM_DEMUX_ID_CCSIDR:
-		if (KVM_REG_SIZE(id) != 4)
-			return -ENOENT;
-		val = (id & KVM_REG_ARM_DEMUX_VAL_MASK)
-			>> KVM_REG_ARM_DEMUX_VAL_SHIFT;
-		if (val >= CSSELR_MAX)
-			return -ENOENT;
+	if (get_user(newval, uval))
+		return -EFAULT;
 
-		if (get_user(newval, uval))
-			return -EFAULT;
-
-		return set_ccsidr(vcpu, val, newval);
-	default:
-		return -ENOENT;
-	}
+	return set_ccsidr(vcpu, idx, newval);
 }
 
 static u64 kvm_one_reg_to_id(const struct kvm_one_reg *reg)
