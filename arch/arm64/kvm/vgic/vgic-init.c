@@ -470,8 +470,10 @@ int vgic_init(struct kvm *kvm)
 			return ret;
 	}
 
-	kvm_for_each_vcpu(idx, vcpu, kvm)
-		kvm_vgic_vcpu_reset(vcpu);
+	kvm_for_each_vcpu(idx, vcpu, kvm) {
+		if (!vcpu->arch.vgic_cpu.vgic_cpu_luo_restored)
+			kvm_vgic_vcpu_reset(vcpu);
+	}
 
 	ret = kvm_vgic_setup_default_irq_routing(kvm);
 	if (ret)

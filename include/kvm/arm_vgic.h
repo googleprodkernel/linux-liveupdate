@@ -534,6 +534,8 @@ struct vgic_cpu {
 
 	/* Cache guest interrupt ID bits */
 	u32 num_id_bits;
+
+	bool vgic_cpu_luo_restored;
 };
 
 extern struct static_key_false vgic_v2_cpuif_trap;
