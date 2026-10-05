@@ -18,7 +18,7 @@ source "$test_dir/../kselftest/ktap_helpers.sh"
 function get_arch_conf() {
 	local arch=$1
 	if [[ "$arch" == "arm64" ]]; then
-		QEMU_CMD="qemu-system-aarch64 -M virt -cpu max"
+		QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -cpu max"
 		KERNEL_IMAGE="Image"
 		KERNEL_CMDLINE="console=ttyAMA0"
 		ARCH_CFLAGS="-mno-outline-atomics"
