@@ -56,6 +56,11 @@ bool psci_tos_resident_on(int cpu)
 	return cpu == resident_cpu;
 }
 
+enum arm_smccc_conduit psci_get_conduit(void)
+{
+	return psci_conduit;
+}
+
 typedef unsigned long (psci_fn)(unsigned long, unsigned long,
 				unsigned long, unsigned long);
 static psci_fn *invoke_psci_fn;

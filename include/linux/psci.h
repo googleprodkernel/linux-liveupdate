@@ -45,8 +45,13 @@ struct psci_0_1_function_ids get_psci_0_1_function_ids(void);
 
 #if defined(CONFIG_ARM_PSCI_FW)
 int __init psci_dt_init(void);
+enum arm_smccc_conduit psci_get_conduit(void);
 #else
 static inline int psci_dt_init(void) { return 0; }
+static inline enum arm_smccc_conduit psci_get_conduit(void)
+{
+	return SMCCC_CONDUIT_NONE;
+}
 #endif
 
 #if defined(CONFIG_ARM_PSCI_FW) && defined(CONFIG_ACPI)
