@@ -1384,11 +1384,8 @@ static bool vcpu_exists(struct kvm_vm *vm, u32 vcpu_id)
 	return false;
 }
 
-/*
- * Adds a virtual CPU to the VM specified by vm with the ID given by vcpu_id.
- * No additional vCPU setup is done.  Returns the vCPU.
- */
-struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
+struct kvm_vcpu *vm_vcpu_add_from_fd(struct kvm_vm *vm, u32 vcpu_id,
+				     int vcpu_fd)
 {
 	struct kvm_vcpu *vcpu;
 
@@ -1401,8 +1398,7 @@ struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
 
 	vcpu->vm = vm;
 	vcpu->id = vcpu_id;
-	vcpu->fd = __vm_ioctl(vm, KVM_CREATE_VCPU, (void *)(unsigned long)vcpu_id);
-	TEST_ASSERT_VM_VCPU_IOCTL(vcpu->fd >= 0, KVM_CREATE_VCPU, vcpu->fd, vm);
+	vcpu->fd = vcpu_fd;
 
 	TEST_ASSERT(vcpu_mmap_sz() >= sizeof(*vcpu->run), "vcpu mmap size "
 		"smaller than expected, vcpu_mmap_sz: %zi expected_min: %zi",
@@ -1419,6 +1415,23 @@ struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
 	list_add(&vcpu->list, &vm->vcpus);
 
 	return vcpu;
+}
+
+/*
+ * Adds a virtual CPU to the VM specified by vm with the ID given by vcpu_id.
+ * No additional vCPU setup is done.  Returns the vCPU.
+ */
+struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
+{
+	int vcpu_fd;
+
+	/* Confirm a vcpu with the specified id doesn't already exist. */
+	TEST_ASSERT(!vcpu_exists(vm, vcpu_id), "vCPU%d already exists", vcpu_id);
+
+	vcpu_fd = __vm_ioctl(vm, KVM_CREATE_VCPU, (void *)(unsigned long)vcpu_id);
+	TEST_ASSERT_VM_VCPU_IOCTL(vcpu_fd >= 0, KVM_CREATE_VCPU, vcpu_fd, vm);
+
+	return vm_vcpu_add_from_fd(vm, vcpu_id, vcpu_fd);
 }
 
 /*
