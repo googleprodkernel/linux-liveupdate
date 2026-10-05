@@ -150,6 +150,10 @@ KVM_NVHE_ALIAS(kvm_protected_mode_initialized);
 
 #endif /* CONFIG_KVM */
 
+#ifdef CONFIG_LIVEUPDATE_CPU
+PROVIDE(__preserved_alt_cb_patch_nops = alt_cb_patch_nops);
+#endif
+
 #ifdef CONFIG_EFI_ZBOOT
 _kernel_codesize = ABSOLUTE(__inittext_end - _text);
 #endif

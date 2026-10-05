@@ -70,6 +70,14 @@ obj-$(CONFIG_ARM_SDE_INTERFACE)		+= sdei.o
 obj-$(CONFIG_ARM64_PTR_AUTH)		+= pointer_auth.o
 obj-$(CONFIG_ARM64_MPAM)		+= mpam.o
 obj-$(CONFIG_ARM64_MTE)			+= mte.o
+preserved-obj-$(CONFIG_LIVEUPDATE_CPU) += cpu_preserve_runtime.preserved.o \
+					  preserve_cpu.preserved.o \
+					  lib-memcpy.preserved.o \
+					  lib-memset.preserved.o
+include $(srctree)/scripts/Makefile.cpu_preserve
+$(obj)/lib-%.preserved.raw.o: $(srctree)/arch/arm64/lib/%.S FORCE
+	$(call if_changed_rule,as_o_S)
+obj-y					+= $(preserved-obj-y)
 obj-y					+= vdso-wrap.o
 obj-$(CONFIG_COMPAT_VDSO)		+= vdso32-wrap.o
 
