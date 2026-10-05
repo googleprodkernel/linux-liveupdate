@@ -48,6 +48,9 @@
 #if defined(CONFIG_X86_64)
 #include <linux/kho/abi/cpu_x86.h>
 #define CPUPR_LUO_FLB_COMPATIBLE	"cpu_flb_x86_v1"
+#elif defined(CONFIG_ARM64)
+#include <linux/kho/abi/cpu_arm64.h>
+#define CPUPR_LUO_FLB_COMPATIBLE	"cpu_flb_arm64_v1"
 #else
 #define CPUPR_LUO_FLB_COMPATIBLE	"cpu_flb_v1"
 struct cpupr_arch_mode_ser {

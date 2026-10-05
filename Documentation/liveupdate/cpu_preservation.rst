@@ -22,6 +22,8 @@ CPU Preservation ABI
 
 .. kernel-doc:: include/linux/kho/abi/cpu_x86.h
 
+.. kernel-doc:: include/linux/kho/abi/cpu_arm64.h
+
 See Also
 ========
 

@@ -77,7 +77,7 @@ preserved-obj-$(CONFIG_LIVEUPDATE_CPU) += cpu_preserve_runtime.preserved.o \
 include $(srctree)/scripts/Makefile.cpu_preserve
 $(obj)/lib-%.preserved.raw.o: $(srctree)/arch/arm64/lib/%.S FORCE
 	$(call if_changed_rule,as_o_S)
-obj-y					+= $(preserved-obj-y)
+obj-$(CONFIG_LIVEUPDATE_CPU)		+= cpu_preserve.o $(preserved-obj-y)
 obj-y					+= vdso-wrap.o
 obj-$(CONFIG_COMPAT_VDSO)		+= vdso32-wrap.o
 
