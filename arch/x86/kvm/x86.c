@@ -1693,7 +1693,7 @@ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
 	put_cpu();
 }
 
-static void get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
+void kvm_get_clock(struct kvm *kvm, struct kvm_clock_data *data)
 {
 	struct kvm_arch *ka = &kvm->arch;
 	unsigned seq;
@@ -1708,7 +1708,7 @@ u64 get_kvmclock_ns(struct kvm *kvm)
 {
 	struct kvm_clock_data data;
 
-	get_kvmclock(kvm, &data);
+	kvm_get_clock(kvm, &data);
 	return data.clock;
 }
 
@@ -2688,8 +2688,8 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
 	vcpu->arch.last_host_tsc = rdtsc();
 }
 
-static int kvm_vcpu_ioctl_get_lapic(struct kvm_vcpu *vcpu,
-				    struct kvm_lapic_state *s)
+int kvm_vcpu_ioctl_get_lapic(struct kvm_vcpu *vcpu,
+			     struct kvm_lapic_state *s)
 {
 	if (vcpu->arch.apic->guest_apic_protected)
 		return -EINVAL;
@@ -2699,8 +2699,8 @@ static int kvm_vcpu_ioctl_get_lapic(struct kvm_vcpu *vcpu,
 	return kvm_apic_get_state(vcpu, s);
 }
 
-static int kvm_vcpu_ioctl_set_lapic(struct kvm_vcpu *vcpu,
-				    struct kvm_lapic_state *s)
+int kvm_vcpu_ioctl_set_lapic(struct kvm_vcpu *vcpu,
+			     struct kvm_lapic_state *s)
 {
 	int r;
 
@@ -2959,8 +2959,8 @@ void kvm_handle_exception_payload_quirk(struct kvm_vcpu *vcpu)
 		kvm_deliver_exception_payload(vcpu, ex);
 }
 
-static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
-					       struct kvm_vcpu_events *events)
+void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+					struct kvm_vcpu_events *events)
 {
 	struct kvm_queued_exception *ex = kvm_get_exception_to_save(vcpu);
 
@@ -3028,8 +3028,8 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
 	}
 }
 
-static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
-					      struct kvm_vcpu_events *events)
+int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+				       struct kvm_vcpu_events *events)
 {
 	if (events->flags & ~(KVM_VCPUEVENT_VALID_NMI_PENDING
 			      | KVM_VCPUEVENT_VALID_SIPI_VECTOR
@@ -3167,15 +3167,15 @@ static int kvm_vcpu_ioctl_x86_get_xsave2(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int kvm_vcpu_ioctl_x86_get_xsave(struct kvm_vcpu *vcpu,
-					struct kvm_xsave *guest_xsave)
+int kvm_vcpu_ioctl_x86_get_xsave(struct kvm_vcpu *vcpu,
+				 struct kvm_xsave *guest_xsave)
 {
 	return kvm_vcpu_ioctl_x86_get_xsave2(vcpu, (void *)guest_xsave->region,
 					     sizeof(guest_xsave->region));
 }
 
-static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
-					struct kvm_xsave *guest_xsave)
+int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
+				 struct kvm_xsave *guest_xsave)
 {
 	union fpregs_state *xstate = (union fpregs_state *)guest_xsave->region;
 
@@ -3195,8 +3195,8 @@ static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
 					      &vcpu->arch.pkru);
 }
 
-static int kvm_vcpu_ioctl_x86_get_xcrs(struct kvm_vcpu *vcpu,
-				       struct kvm_xcrs *guest_xcrs)
+int kvm_vcpu_ioctl_x86_get_xcrs(struct kvm_vcpu *vcpu,
+				struct kvm_xcrs *guest_xcrs)
 {
 	if (vcpu->kvm->arch.has_protected_state &&
 	    vcpu->arch.guest_state_protected)
@@ -3214,8 +3214,8 @@ static int kvm_vcpu_ioctl_x86_get_xcrs(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
-				       struct kvm_xcrs *guest_xcrs)
+int kvm_vcpu_ioctl_x86_set_xcrs(struct kvm_vcpu *vcpu,
+				struct kvm_xcrs *guest_xcrs)
 {
 	int i, r = 0;
 
@@ -4305,27 +4305,24 @@ static int kvm_vm_ioctl_get_clock(struct kvm *kvm, void __user *argp)
 {
 	struct kvm_clock_data data = { 0 };
 
-	get_kvmclock(kvm, &data);
+	kvm_get_clock(kvm, &data);
 	if (copy_to_user(argp, &data, sizeof(data)))
 		return -EFAULT;
 
 	return 0;
 }
 
-static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
+int kvm_set_clock(struct kvm *kvm, struct kvm_clock_data *data)
 {
 	struct kvm_arch *ka = &kvm->arch;
-	struct kvm_clock_data data;
+	u64 delta = 0;
 	u64 now_raw_ns;
-
-	if (copy_from_user(&data, argp, sizeof(data)))
-		return -EFAULT;
 
 	/*
 	 * Only KVM_CLOCK_REALTIME is used, but allow passing the
 	 * result of KVM_GET_CLOCK back to KVM_SET_CLOCK.
 	 */
-	if (data.flags & ~KVM_CLOCK_VALID_FLAGS)
+	if (data->flags & ~KVM_CLOCK_VALID_FLAGS)
 		return -EINVAL;
 
 	kvm_hv_request_tsc_page_update(kvm);
@@ -4337,25 +4334,35 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
 	 * in use, we use master_kernel_ns + kvmclock_offset to set
 	 * unsigned 'system_time' so if we use get_kvmclock_ns() (which
 	 * is slightly ahead) here we risk going negative on unsigned
-	 * 'system_time' when 'data.clock' is very small.
+	 * 'system_time' when 'data->clock' is very small.
 	 */
-	if (data.flags & KVM_CLOCK_REALTIME) {
+	if (data->flags & KVM_CLOCK_REALTIME) {
 		u64 now_real_ns = ktime_get_real_ns();
 
 		/*
 		 * Avoid stepping the kvmclock backwards.
 		 */
-		if (now_real_ns > data.realtime)
-			data.clock += now_real_ns - data.realtime;
+		if (now_real_ns > data->realtime)
+			delta = now_real_ns - data->realtime;
 	}
 
 	if (ka->use_master_clock)
 		now_raw_ns = ka->master_kernel_ns;
 	else
 		now_raw_ns = get_kvmclock_base_ns();
-	ka->kvmclock_offset = data.clock - now_raw_ns;
+	ka->kvmclock_offset = data->clock + delta - now_raw_ns;
 	kvm_end_pvclock_update(kvm);
 	return 0;
+}
+
+static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
+{
+	struct kvm_clock_data data;
+
+	if (copy_from_user(&data, argp, sizeof(data)))
+		return -EFAULT;
+
+	return kvm_set_clock(kvm, &data);
 }
 
 long kvm_arch_vcpu_unlocked_ioctl(struct file *filp, unsigned int ioctl,
