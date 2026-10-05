@@ -1095,7 +1095,12 @@ void kvm_get_kvm(struct kvm *kvm);
 bool kvm_get_kvm_safe(struct kvm *kvm);
 void kvm_put_kvm(struct kvm *kvm);
 bool file_is_kvm(struct file *file);
+bool file_is_kvm_vcpu(struct file *file);
 struct file *kvm_create_vm_file(unsigned long type, const char *fdname);
+struct file *kvm_create_vcpu_file(struct kvm *kvm, unsigned long id,
+				  int (*init_vcpu)(struct kvm_vcpu *vcpu,
+						   void *data),
+				  void *data);
 void kvm_put_kvm_no_destroy(struct kvm *kvm);
 void kvm_uevent_notify_vm_create(struct kvm *kvm);
 
