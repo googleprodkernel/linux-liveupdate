@@ -339,6 +339,23 @@ static u32 msr_based_features[ARRAY_SIZE(msr_based_features_all_except_vmx) +
 			      (KVM_LAST_EMULATED_VMX_MSR - KVM_FIRST_EMULATED_VMX_MSR + 1)];
 static unsigned int num_msr_based_features;
 
+unsigned int kvm_num_msrs_to_save(void)
+{
+	return num_msrs_to_save + num_emulated_msrs + 1;
+}
+
+static u32 kvm_get_msr_to_save_index(unsigned int i)
+{
+	if (i < num_msrs_to_save)
+		return msrs_to_save[i];
+	i -= num_msrs_to_save;
+	if (i < num_emulated_msrs)
+		return emulated_msrs[i];
+	if (i == num_emulated_msrs)
+		return MSR_KVM_INTERNAL_GUEST_SSP;
+	return 0;
+}
+
 int kvm_get_msr_index_list(struct kvm_msr_list __user *user_msr_list)
 {
 	struct kvm_msr_list msr_list;
@@ -599,8 +616,8 @@ static bool __kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
 		return false;
 
 	return true;
-
 }
+
 bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
 {
 	if (efer & ~kvm_caps.supported_efer_bits)
@@ -2313,6 +2330,65 @@ int kvm_set_msrs(struct kvm_vcpu *vcpu, struct kvm_msrs __user *user_msrs)
 	guard(srcu)(&vcpu->kvm->srcu);
 
 	return msr_io(vcpu, user_msrs, do_set_msr, 0);
+}
+
+void kvm_msrs_save(struct kvm_vcpu *vcpu, struct kvm_msrs *msrs)
+{
+	unsigned int i, max_msrs = kvm_num_msrs_to_save();
+	bool fpu_loaded = false;
+
+	guard(srcu)(&vcpu->kvm->srcu);
+
+	msrs->nmsrs = 0;
+	msrs->pad = 0;
+	for (i = 0; i < max_msrs; i++) {
+		u32 index = kvm_get_msr_to_save_index(i);
+		u64 data;
+
+		if (!fpu_loaded && is_xstate_managed_msr(vcpu, index)) {
+			kvm_load_guest_fpu(vcpu);
+			fpu_loaded = true;
+		}
+		if (__kvm_get_msr(vcpu, index, &data, true))
+			continue;
+
+		msrs->entries[msrs->nmsrs].index = index;
+		msrs->entries[msrs->nmsrs].reserved = 0;
+		msrs->entries[msrs->nmsrs].data = data;
+		msrs->nmsrs++;
+	}
+	if (fpu_loaded)
+		kvm_put_guest_fpu(vcpu);
+}
+
+void kvm_msrs_restore(struct kvm_vcpu *vcpu, const struct kvm_msrs *msrs,
+		      bool early)
+{
+	bool fpu_loaded = false;
+	unsigned int i;
+
+	guard(srcu)(&vcpu->kvm->srcu);
+
+	for (i = 0; i < msrs->nmsrs; i++) {
+		u32 index = msrs->entries[i].index;
+		u64 data = msrs->entries[i].data;
+		bool is_early = kvm_is_immutable_feature_msr(index) ||
+				index == MSR_IA32_UCODE_REV ||
+				index == MSR_IA32_XFD ||
+				index == MSR_IA32_XFD_ERR ||
+				index == MSR_IA32_XSS;
+
+		if (is_early != early)
+			continue;
+
+		if (!fpu_loaded && is_xstate_managed_msr(vcpu, index)) {
+			kvm_load_guest_fpu(vcpu);
+			fpu_loaded = true;
+		}
+		do_set_msr(vcpu, index, &data);
+	}
+	if (fpu_loaded)
+		kvm_put_guest_fpu(vcpu);
 }
 
 static int kvm_get_one_msr(struct kvm_vcpu *vcpu, u32 msr, u64 __user *user_val)

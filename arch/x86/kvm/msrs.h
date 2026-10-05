@@ -52,6 +52,9 @@ int kvm_get_feature_msrs(struct kvm_msrs __user *user_msrs);
 
 int kvm_get_msrs(struct kvm_vcpu *vcpu, struct kvm_msrs __user *user_msrs);
 int kvm_set_msrs(struct kvm_vcpu *vcpu, struct kvm_msrs __user *user_msrs);
+void kvm_msrs_save(struct kvm_vcpu *vcpu, struct kvm_msrs *msrs);
+void kvm_msrs_restore(struct kvm_vcpu *vcpu, const struct kvm_msrs *msrs,
+		      bool early);
 
 int kvm_get_set_one_reg(struct kvm_vcpu *vcpu, unsigned int ioctl,
 			void __user *argp);
@@ -65,6 +68,7 @@ int __kvm_emulate_msr_read(struct kvm_vcpu *vcpu, u32 index, u64 *data);
 int __kvm_emulate_msr_write(struct kvm_vcpu *vcpu, u32 index, u64 data);
 int kvm_msr_read(struct kvm_vcpu *vcpu, u32 index, u64 *data);
 int kvm_msr_write(struct kvm_vcpu *vcpu, u32 index, u64 data);
+unsigned int kvm_num_msrs_to_save(void);
 int kvm_emulate_rdmsr(struct kvm_vcpu *vcpu);
 int kvm_emulate_rdmsr_imm(struct kvm_vcpu *vcpu, u32 msr, int reg);
 int kvm_emulate_wrmsr(struct kvm_vcpu *vcpu);
