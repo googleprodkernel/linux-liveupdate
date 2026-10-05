@@ -18,6 +18,33 @@ static __always_inline void arm64_flush_host_tlb_local(void)
 }
 
 #ifdef CONFIG_LIVEUPDATE_CPU
+/**
+ * struct arm64_preserved_fault - Exceptions taken by a preserved CPU
+ * @count: Number of exceptions; the first one stopped the CPU.
+ * @kind:  Vector table entry of the first exception, 0 to 15.
+ * @esr:   Its exception syndrome.
+ * @elr:   Its exception link address.
+ * @far:   Its fault address.
+ * @spsr:  Its saved program status.
+ *
+ * Private to the runtime, reported by arch_cpupr_wait_dead().
+ */
+struct arm64_preserved_fault {
+	unsigned long count;
+	unsigned long kind;
+	unsigned long esr;
+	unsigned long elr;
+	unsigned long far;
+	unsigned long spsr;
+};
+
+extern char arm64_preserved_vectors[]
+	__cpupr_sym_asm(arm64_preserved_vectors);
+asmlinkage unsigned long arm64_preserved_stack_top(unsigned long sp)
+	__cpupr_sym_asm(arm64_preserved_stack_top);
+asmlinkage void arm64_preserved_handle_exception(unsigned long kind)
+	__cpupr_sym_asm(arm64_preserved_handle_exception);
+
 void gicv3_cpupr_clear_active_priorities(void)
 	__cpupr_sym_asm(gicv3_cpupr_clear_active_priorities);
 void gicv3_cpupr_enable_sgi(void)

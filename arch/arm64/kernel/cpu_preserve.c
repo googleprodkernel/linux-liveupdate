@@ -214,7 +214,18 @@ void arch_cpupr_park_on_stack(int cpu, unsigned long stack_top)
 
 void arch_cpupr_wait_dead(int cpu, struct cpupr_ser *ser, bool bringup)
 {
+	struct cpupr_stack_context *sctx = cpupr_get_sctx(cpu);
 	const struct cpu_operations *ops = get_cpu_ops(cpu);
+
+	if (sctx) {
+		cpupr_clean(&sctx->fault);
+		if (READ_ONCE(sctx->fault.count)) {
+			const struct arm64_preserved_fault *f = &sctx->fault;
+
+			pr_err("cpu_preserve: CPU %d unhandled fault kind=%lu esr=0x%lx elr=0x%lx far=0x%lx spsr=0x%lx\n",
+			       cpu, f->kind, f->esr, f->elr, f->far, f->spsr);
+		}
+	}
 
 	if (ops && ops->cpu_kill)
 		ops->cpu_kill(cpu);
