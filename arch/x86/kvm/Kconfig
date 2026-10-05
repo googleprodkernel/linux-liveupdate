@@ -48,6 +48,7 @@ config KVM_X86
 	select KVM_GENERIC_PRE_FAULT_MEMORY
 	select KVM_WERROR if WERROR
 	select KVM_GUEST_MEMFD if X86_64
+	select HAVE_KVM_ARCH_VCPU_PRESERVE
 
 config KVM
 	tristate "Kernel-based Virtual Machine (KVM) support"
