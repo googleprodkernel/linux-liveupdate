@@ -21,6 +21,7 @@
 #include <linux/mm.h>
 #include <linux/err.h>
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
 #include <linux/smp.h>
 #include <linux/seq_file.h>
 #include <linux/irq.h>
@@ -327,7 +328,12 @@ int __cpu_disable(void)
 
 static int op_cpu_kill(unsigned int cpu)
 {
-	const struct cpu_operations *ops = get_cpu_ops(cpu);
+	const struct cpu_operations *ops;
+
+	if (cpu_is_preserved(cpu))
+		return 0;
+
+	ops = get_cpu_ops(cpu);
 
 	/*
 	 * If we have no means of synchronising with the dying CPU, then assume
