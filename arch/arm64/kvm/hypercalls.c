@@ -429,6 +429,11 @@ int kvm_arm_copy_fw_reg_indices(struct kvm_vcpu *vcpu, u64 __user *uindices)
 	return 0;
 }
 
+void kvm_arm_copy_fw_reg_indices_kern(struct kvm_vcpu *vcpu, u64 *indices)
+{
+	memcpy(indices, kvm_arm_fw_reg_ids, sizeof(kvm_arm_fw_reg_ids));
+}
+
 #define KVM_REG_FEATURE_LEVEL_MASK	GENMASK(3, 0)
 
 /*
@@ -480,36 +485,47 @@ static int get_kernel_wa_level(struct kvm_vcpu *vcpu, u64 regid)
 	return -EINVAL;
 }
 
-int kvm_arm_get_fw_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
+int kvm_arm_get_fw_reg_val(struct kvm_vcpu *vcpu, u64 reg_id, u64 *val)
 {
 	struct kvm_smccc_features *smccc_feat = &vcpu->kvm->arch.smccc_feat;
-	void __user *uaddr = (void __user *)(long)reg->addr;
-	u64 val;
 
-	switch (reg->id) {
+	switch (reg_id) {
 	case KVM_REG_ARM_PSCI_VERSION:
-		val = kvm_psci_version(vcpu);
+		*val = kvm_psci_version(vcpu);
 		break;
 	case KVM_REG_ARM_SMCCC_ARCH_WORKAROUND_1:
 	case KVM_REG_ARM_SMCCC_ARCH_WORKAROUND_2:
 	case KVM_REG_ARM_SMCCC_ARCH_WORKAROUND_3:
-		val = get_kernel_wa_level(vcpu, reg->id) & KVM_REG_FEATURE_LEVEL_MASK;
+		*val = get_kernel_wa_level(vcpu, reg_id) & KVM_REG_FEATURE_LEVEL_MASK;
 		break;
 	case KVM_REG_ARM_STD_BMAP:
-		val = READ_ONCE(smccc_feat->std_bmap);
+		*val = READ_ONCE(smccc_feat->std_bmap);
 		break;
 	case KVM_REG_ARM_STD_HYP_BMAP:
-		val = READ_ONCE(smccc_feat->std_hyp_bmap);
+		*val = READ_ONCE(smccc_feat->std_hyp_bmap);
 		break;
 	case KVM_REG_ARM_VENDOR_HYP_BMAP:
-		val = READ_ONCE(smccc_feat->vendor_hyp_bmap);
+		*val = READ_ONCE(smccc_feat->vendor_hyp_bmap);
 		break;
 	case KVM_REG_ARM_VENDOR_HYP_BMAP_2:
-		val = READ_ONCE(smccc_feat->vendor_hyp_bmap_2);
+		*val = READ_ONCE(smccc_feat->vendor_hyp_bmap_2);
 		break;
 	default:
 		return -ENOENT;
 	}
+
+	return 0;
+}
+
+int kvm_arm_get_fw_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
+{
+	void __user *uaddr = (void __user *)(long)reg->addr;
+	u64 val;
+	int ret;
+
+	ret = kvm_arm_get_fw_reg_val(vcpu, reg->id, &val);
+	if (ret)
+		return ret;
 
 	if (copy_to_user(uaddr, &val, KVM_REG_SIZE(reg->id)))
 		return -EFAULT;
@@ -562,18 +578,14 @@ out:
 	return ret;
 }
 
-int kvm_arm_set_fw_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
+int kvm_arm_set_fw_reg_val(struct kvm_vcpu *vcpu, u64 reg_id, u64 val)
 {
-	void __user *uaddr = (void __user *)(long)reg->addr;
-	u64 val;
 	int wa_level;
 
-	if (KVM_REG_SIZE(reg->id) != sizeof(val))
+	if (KVM_REG_SIZE(reg_id) != sizeof(val))
 		return -ENOENT;
-	if (copy_from_user(&val, uaddr, KVM_REG_SIZE(reg->id)))
-		return -EFAULT;
 
-	switch (reg->id) {
+	switch (reg_id) {
 	case KVM_REG_ARM_PSCI_VERSION:
 	{
 		bool wants_02;
@@ -604,7 +616,7 @@ int kvm_arm_set_fw_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
 		if (val & ~KVM_REG_FEATURE_LEVEL_MASK)
 			return -EINVAL;
 
-		if (get_kernel_wa_level(vcpu, reg->id) < val)
+		if (get_kernel_wa_level(vcpu, reg_id) < val)
 			return -EINVAL;
 
 		return 0;
@@ -640,7 +652,7 @@ int kvm_arm_set_fw_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
 		 * We can deal with NOT_AVAIL on NOT_REQUIRED, but not the
 		 * other way around.
 		 */
-		if (get_kernel_wa_level(vcpu, reg->id) < wa_level)
+		if (get_kernel_wa_level(vcpu, reg_id) < wa_level)
 			return -EINVAL;
 
 		return 0;
@@ -648,12 +660,25 @@ int kvm_arm_set_fw_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
 	case KVM_REG_ARM_STD_HYP_BMAP:
 	case KVM_REG_ARM_VENDOR_HYP_BMAP:
 	case KVM_REG_ARM_VENDOR_HYP_BMAP_2:
-		return kvm_arm_set_fw_reg_bmap(vcpu, reg->id, val);
+		return kvm_arm_set_fw_reg_bmap(vcpu, reg_id, val);
 	default:
 		return -ENOENT;
 	}
 
 	return -EINVAL;
+}
+
+int kvm_arm_set_fw_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
+{
+	void __user *uaddr = (void __user *)(long)reg->addr;
+	u64 val;
+
+	if (KVM_REG_SIZE(reg->id) != sizeof(val))
+		return -ENOENT;
+	if (copy_from_user(&val, uaddr, KVM_REG_SIZE(reg->id)))
+		return -EFAULT;
+
+	return kvm_arm_set_fw_reg_val(vcpu, reg->id, val);
 }
 
 int kvm_vm_smccc_has_attr(struct kvm *kvm, struct kvm_device_attr *attr)
