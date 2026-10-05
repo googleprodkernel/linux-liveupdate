@@ -59,6 +59,8 @@ struct cpupr_arch_mode_ser;
  * @CPUPR_EXITING: Host requested the preserved CPU to exit the park loop.
  * @CPUPR_DEAD: Preserved CPU has exited the park loop and stopped cleanly.
  * @CPUPR_FAULTED: Preserved CPU stopped on an unexpected exception or fault.
+ * @CPUPR_WORKLOAD: Preserved CPU is executing an attached workload.
+ * @CPUPR_DETACHING: Host requested the running workload to return to the park loop.
  * @CPUPR_NR_STATES: Total number of preserved CPU states.
  */
 enum cpupr_workload {
@@ -67,6 +69,8 @@ enum cpupr_workload {
 	CPUPR_EXITING = 2,
 	CPUPR_DEAD = 3,
 	CPUPR_FAULTED = 4,
+	CPUPR_WORKLOAD = 5,
+	CPUPR_DETACHING = 6,
 	CPUPR_NR_STATES
 };
 

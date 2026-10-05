@@ -28,6 +28,7 @@
 #include <linux/kho/abi/cpu.h>
 #include <asm/cpu_preserve.h>
 #include <asm/page.h>
+#include <asm/sections.h>
 
 /*
  * The preserved stack area holds the context block, one unmapped guard page,
@@ -48,17 +49,21 @@ struct cpupr_ser;
 /**
  * struct cpupr_stack_context - Context header at base of preserved CPU stack
  * @magic: Validation signature (%CPUPR_STACK_MAGIC).
+ * @workload_context: Opaque owning workload or session context.
  * @session_pgd_pa: Session root page table physical address, or 0.
  * @ser: Preserved CPU descriptor in isolated address space.
+ * @entry_fn: Workload entry function to run.
  *
  * This structure lives at the base of a preserved CPU's dedicated stack and is
- * accessed by the preserved CPU during parking. It is private to the preserved
- * CPU execution context of the kernel that allocated it.
+ * accessed by the preserved CPU during parking and workload execution. It is
+ * private to the preserved CPU execution context of the kernel that allocated it.
  */
 struct cpupr_stack_context {
 	u64 magic;
+	u64 workload_context;
 	u64 session_pgd_pa;
 	struct cpupr_ser *ser;
+	void (*entry_fn)(void *data);
 };
 
 /**
@@ -83,7 +88,17 @@ static __always_inline bool cpupr_state_is_stopped(u32 state)
 	return state == CPUPR_DEAD || state == CPUPR_FAULTED;
 }
 
+static inline bool cpupr_is_runtime_text(const void *fn)
+{
+	unsigned long addr = (unsigned long)fn;
+
+	return addr >= (unsigned long)__preserved_text_start &&
+	       addr < (unsigned long)__preserved_text_end;
+}
+
 bool cpu_is_preserved(int cpu);
+u32 cpupr_state(int cpu);
+bool cpupr_should_exit(void) __cpupr_sym_asm(cpupr_should_exit);
 void cpupr_set_dead(void) __cpupr_sym_asm(cpupr_set_dead);
 void cpupr_park_loop(int cpu) __cpupr_sym_asm(cpupr_park_loop);
 void cpupr_park(int cpu);
@@ -114,6 +129,10 @@ static __always_inline void cpupr_clean_sz(const void *p, size_t sz)
 
 const struct cpumask *cpu_get_preserved_mask(void);
 struct cpupr_stack_context *cpupr_get_sctx(int cpu);
+int cpupr_attach_workload(int cpu,
+			  void (*entry_fn)(void *data), void *data);
+int cpupr_detach_workload(int cpu);
+void cpupr_set_workload_context(int cpu, void *ctx);
 
 struct attribute_group;
 extern const struct attribute_group cpu_preserve_attr_group;
