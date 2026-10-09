@@ -21,8 +21,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <libliveupdate.h>
@@ -948,6 +950,113 @@ TEST_F(liveupdate_device, cpu_preserve_multiple_cpus)
 	ASSERT_EQ(close(session_fd), 0);
 	for (i = 0; i < num_targets; i++)
 		ASSERT_EQ(read_cpu_online(target_cpus[i]), 1);
+}
+
+struct cpu_job_data {
+	uint64_t input;
+	uint64_t output;
+};
+
+extern const char __start_cpu_job_test[];
+extern const char __stop_cpu_job_test[];
+
+static void __attribute__((noinline, used, section("cpu_job_test")))
+cpu_job_entry_fn(void *arg)
+{
+	struct cpu_job_data *data = arg;
+
+	__atomic_store_n(&data->output, ~data->input, __ATOMIC_RELEASE);
+}
+
+/*
+ * Test Case: CPU Preservation User Job on Freeze
+ *
+ * Verifies that preserving a CPU with struct liveupdate_cpu_preserve_arg
+ * validates the argument and, upon session freeze, executes the job at
+ * entry_offset in the identity-mapped preserved memfd with arg_offset.
+ */
+TEST_F(liveupdate_device, cpu_preserve_job_on_freeze)
+{
+	const uint64_t magic = 0x52505550435f4b4fULL;
+	struct liveupdate_cpu_preserve_arg job_arg = {};
+	size_t code_size = __stop_cpu_job_test - __start_cpu_job_test;
+	size_t data_offset = (code_size + 63) & ~63UL;
+	long page_size = getpagesize();
+	int session_fd, cpu_fd, mem_fd;
+	struct cpu_job_data *job_data;
+	int target_cpu, i;
+	char path[128];
+	void *map;
+
+	self->fd1 = open(LIVEUPDATE_DEV, O_RDWR);
+	if (self->fd1 < 0 && errno == ENOENT)
+		SKIP(return, "%s does not exist", LIVEUPDATE_DEV);
+	ASSERT_GE(self->fd1, 0);
+
+	target_cpu = find_hotplug_cpu();
+	if (target_cpu < 0)
+		SKIP(return, "No hotpluggable CPU with preserve attribute found");
+
+	session_fd = luo_create_session(self->fd1, "cpu-job-on-freeze");
+	ASSERT_GE(session_fd, 0);
+
+	mem_fd = memfd_create("cpu-job-mem", 0);
+	ASSERT_GE(mem_fd, 0);
+	ASSERT_EQ(ftruncate(mem_fd, page_size), 0);
+
+	map = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0);
+	ASSERT_NE(map, MAP_FAILED);
+	ASSERT_LT(data_offset + sizeof(*job_data), (size_t)page_size);
+	memcpy(map, __start_cpu_job_test, code_size);
+	job_data = (struct cpu_job_data *)((char *)map + data_offset);
+	job_data->input = magic;
+	job_data->output = 0;
+
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/preserve", target_cpu);
+	cpu_fd = open(path, O_RDONLY);
+	ASSERT_GE(cpu_fd, 0);
+
+	/* Unpreserved mem_token must fail with -ENOENT */
+	job_arg.size = sizeof(job_arg);
+	job_arg.mem_token = 0x100;
+	job_arg.entry_offset = (uintptr_t)cpu_job_entry_fn -
+			       (uintptr_t)__start_cpu_job_test;
+	job_arg.arg_offset = data_offset;
+	EXPECT_EQ(luo_session_preserve_fd_arg(session_fd, cpu_fd, 0x200,
+					      (uintptr_t)&job_arg), -ENOENT);
+
+	ASSERT_EQ(luo_session_preserve_fd(session_fd, mem_fd, 0x100), 0);
+
+	/* Non-zero flags must fail with -EOPNOTSUPP */
+	job_arg.flags = 1;
+	EXPECT_EQ(luo_session_preserve_fd_arg(session_fd, cpu_fd, 0x200,
+					      (uintptr_t)&job_arg), -EOPNOTSUPP);
+	job_arg.flags = 0;
+
+	/* Out-of-bounds offset must fail with -EINVAL */
+	job_arg.entry_offset = page_size;
+	EXPECT_EQ(luo_session_preserve_fd_arg(session_fd, cpu_fd, 0x200,
+					      (uintptr_t)&job_arg), -EINVAL);
+	job_arg.entry_offset = (uintptr_t)cpu_job_entry_fn -
+			       (uintptr_t)__start_cpu_job_test;
+
+	ASSERT_EQ(luo_session_preserve_fd_arg(session_fd, cpu_fd, 0x200,
+					      (uintptr_t)&job_arg), 0);
+	close(cpu_fd);
+
+	/* Job must not run before session freeze */
+	EXPECT_EQ(__atomic_load_n(&job_data->output, __ATOMIC_ACQUIRE), 0ULL);
+
+	ASSERT_EQ(luo_session_freeze(session_fd), 0);
+
+	for (i = 0; i < 1000 && !__atomic_load_n(&job_data->output, __ATOMIC_ACQUIRE); i++)
+		usleep(1000);
+	EXPECT_EQ(__atomic_load_n(&job_data->output, __ATOMIC_ACQUIRE), ~magic);
+
+	ASSERT_EQ(close(session_fd), 0);
+	ASSERT_EQ(munmap(map, page_size), 0);
+	ASSERT_EQ(close(mem_fd), 0);
+	ASSERT_EQ(read_cpu_online(target_cpu), 1);
 }
 
 TEST_HARNESS_MAIN
