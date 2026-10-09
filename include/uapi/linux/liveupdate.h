@@ -307,4 +307,23 @@ struct liveupdate_shmem_retrieve_arg {
 	__aligned_u64	mode;
 };
 
+/**
+ * struct liveupdate_cpu_preserve_arg - Optional argument for CPU preservation
+ * @size:         Input; sizeof(struct liveupdate_cpu_preserve_arg)
+ * @flags:        Input; Reserved for future extensions, must be 0.
+ * @mem_token:    Input; Token of the preserved memory file in the same session
+ *                to identity-map into the CPU's isolated address space.
+ * @entry_offset: Input; Byte offset within the preserved memory for the entry
+ *                point, executed on freeze.
+ * @arg_offset:   Input; Byte offset within the preserved memory for the
+ *                argument passed to the entry point.
+ */
+struct liveupdate_cpu_preserve_arg {
+	__u32		size;
+	__u32		flags;
+	__aligned_u64	mem_token;
+	__aligned_u64	entry_offset;
+	__aligned_u64	arg_offset;
+};
+
 #endif /* _UAPI_LIVEUPDATE_H */

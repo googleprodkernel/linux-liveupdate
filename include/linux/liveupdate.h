@@ -320,6 +320,10 @@ int liveupdate_get_file_incoming(struct liveupdate_session *s, u64 token,
 int liveupdate_get_token_outgoing(struct liveupdate_session *s,
 				  struct file *file, u64 *tokenp);
 
+/* Get an outgoing preserved file by token, or -ENOENT if not found */
+int liveupdate_get_file_outgoing(struct liveupdate_session *s, u64 token,
+				 struct file **filep);
+
 #else /* CONFIG_LIVEUPDATE */
 
 static inline bool liveupdate_enabled(void)
@@ -380,6 +384,12 @@ static inline int liveupdate_get_file_incoming(struct liveupdate_session *s,
 
 static inline int liveupdate_get_token_outgoing(struct liveupdate_session *s,
 						struct file *file, u64 *tokenp)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int liveupdate_get_file_outgoing(struct liveupdate_session *s,
+					       u64 token, struct file **filep)
 {
 	return -EOPNOTSUPP;
 }

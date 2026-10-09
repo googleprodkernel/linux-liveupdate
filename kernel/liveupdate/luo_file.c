@@ -1157,6 +1157,40 @@ int liveupdate_get_token_outgoing(struct liveupdate_session *s,
 EXPORT_SYMBOL_GPL(liveupdate_get_token_outgoing);
 
 /**
+ * liveupdate_get_file_outgoing - Get a preserved file by token in an outgoing session.
+ * @s:     The outgoing liveupdate session.
+ * @token: The unique token identifying the preserved file.
+ * @filep: On success, populated with a new reference to the 'struct file'.
+ *
+ * Searches the list of preserved files in an outgoing session for a matching
+ * token. The caller receives a new reference to the file and must call fput()
+ * when it is no longer needed.
+ *
+ * Return: 0 on success, -ENOENT if no file with the matching token is found.
+ */
+int liveupdate_get_file_outgoing(struct liveupdate_session *s, u64 token,
+				 struct file **filep)
+{
+	struct luo_session *session = (struct luo_session *)s;
+	struct luo_file_set *file_set;
+	struct luo_file *luo_file;
+
+	guard(mutex)(&session->mutex);
+	file_set = luo_file_set_from_session_locked(s);
+
+	list_for_each_entry(luo_file, &file_set->files_list, list) {
+		if (luo_file->token == token) {
+			get_file(luo_file->file);
+			*filep = luo_file->file;
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+EXPORT_SYMBOL_GPL(liveupdate_get_file_outgoing);
+
+/**
  * liveupdate_get_file_incoming - Retrieves a preserved file for in-kernel use.
  * @s:      The incoming liveupdate session (restored from the previous kernel).
  * @token:  The unique token identifying the file to retrieve.

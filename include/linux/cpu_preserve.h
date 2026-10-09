@@ -96,9 +96,20 @@ static inline bool cpupr_is_runtime_text(const void *fn)
 	       addr < (unsigned long)__preserved_text_end;
 }
 
+/**
+ * struct cpupr_job_ctx - Context for a user job launched on freeze
+ * @entry_pa: Physical address of the entry point in identity-mapped memory.
+ * @arg_pa:   Physical address of the argument in identity-mapped memory.
+ */
+struct cpupr_job_ctx {
+	u64 entry_pa;
+	u64 arg_pa;
+};
+
 bool cpu_is_preserved(int cpu);
 u32 cpupr_state(int cpu);
 bool cpupr_should_exit(void) __cpupr_sym_asm(cpupr_should_exit);
+void cpupr_job_entry(void *data) __cpupr_sym_asm(cpupr_job_entry);
 void cpupr_set_dead(void) __cpupr_sym_asm(cpupr_set_dead);
 void cpupr_park_loop(int cpu) __cpupr_sym_asm(cpupr_park_loop);
 void cpupr_park(int cpu);

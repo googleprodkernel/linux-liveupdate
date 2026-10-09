@@ -240,6 +240,7 @@
 #include <linux/kexec.h>
 #include <linux/kexec_handover.h>
 #include <linux/liveupdate.h>
+#include <linux/pagemap.h>
 #include <linux/reboot.h>
 #include <linux/suspend.h>
 
@@ -251,6 +252,8 @@
  * @as: Isolated address space of the CPUs.
  * @incoming: Whether the previous kernel created the session.
  * @as_lock: Serializes the allocations and mappings of an outgoing @as.
+ * @mapped_mem_file: Last job mem_file mapped into @as.
+ * @cleaned_mem_file: Last job mem_file cache-cleaned on freeze.
  */
 struct cpupr_session {
 	struct list_head node;
@@ -259,6 +262,8 @@ struct cpupr_session {
 	struct cpupr_as_ser *as;
 	bool incoming;
 	struct mutex as_lock;
+	struct file *mapped_mem_file;
+	struct file *cleaned_mem_file;
 };
 
 /*
@@ -1773,37 +1778,146 @@ static bool cpupr_can_preserve_cb(struct liveupdate_file_handler *handler,
 	return file_to_cpu(file) >= 0;
 }
 
-static int cpupr_preserve_cb(struct liveupdate_file_op_args *args)
+struct cpupr_job {
+	struct file *mem_file;
+	u64 entry_offset;
+	u64 arg_offset;
+	struct cpupr_job_ctx *ctx;
+};
+
+static void cpupr_free_job(struct cpupr_job *job)
 {
-	int cpu, ret;
+	if (!job)
+		return;
 
-	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
+	fput(job->mem_file);
+	kfree(job);
+}
 
-	cpu = file_to_cpu(args->file);
-	if (cpu < 0)
-		return cpu;
+static int cpupr_parse_job_arg(struct liveupdate_session *s,
+			       const struct liveupdate_cpu_preserve_arg *uarg,
+			       struct cpupr_job **jobp)
+{
+	struct file *mem_file;
+	struct cpupr_job *job;
+	loff_t size;
+	int ret;
 
-	ret = cpupr_preserve(cpu, args->session);
+	if (uarg->flags)
+		return -EOPNOTSUPP;
+
+	ret = liveupdate_get_file_outgoing(s, uarg->mem_token, &mem_file);
 	if (ret)
 		return ret;
 
-	args->serialized_data = virt_to_phys(cpupr_get_ser(cpu));
+	size = i_size_read(file_inode(mem_file));
+	if (size <= 0 || !PAGE_ALIGNED(size) ||
+	    uarg->entry_offset >= size || uarg->arg_offset >= size ||
+	    !mem_file->f_mapping) {
+		fput(mem_file);
+		return -EINVAL;
+	}
+
+	job = kzalloc_obj(*job);
+	if (!job) {
+		fput(mem_file);
+		return -ENOMEM;
+	}
+
+	job->mem_file = mem_file;
+	job->entry_offset = uarg->entry_offset;
+	job->arg_offset = uarg->arg_offset;
+	*jobp = job;
 	return 0;
 }
 
-static void cpupr_unpreserve_cb(struct liveupdate_file_op_args *args)
+static phys_addr_t cpupr_job_offset_pa(struct address_space *mapping,
+				       u64 offset)
 {
-	struct cpupr_session *ps;
-	struct cpupr_ser *ser;
-	unsigned int cpu;
+	pgoff_t pgoff = offset >> PAGE_SHIFT;
+	struct folio *folio = filemap_get_folio(mapping, pgoff);
+	phys_addr_t pa;
 
-	if (!args->serialized_data)
-		return;
+	if (IS_ERR(folio))
+		return 0;
 
-	ser = phys_to_virt(args->serialized_data);
-	cpu = ser->cpu;
-	ps = cpupr_session_of(cpu);
+	pa = PFN_PHYS(folio_pfn(folio) + (pgoff - folio->index)) +
+	     offset_in_page(offset);
+	folio_put(folio);
+	return pa;
+}
+
+static int cpupr_setup_job(unsigned int cpu, struct cpupr_job *job)
+{
+	struct address_space *mapping = job->mem_file->f_mapping;
+	struct cpupr_session *ps = cpupr_session_of(cpu);
+	loff_t size = i_size_read(file_inode(job->mem_file));
+	pgoff_t index = 0, end_index = size >> PAGE_SHIFT;
+	phys_addr_t entry_pa, arg_pa;
+	struct cpupr_job_ctx *ctx;
+	int ret;
+
+	if (!ps || !mapping)
+		return -EINVAL;
+
+	ctx = cpupr_as_alloc_buffer(ps, sizeof(*ctx));
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	if (ps->mapped_mem_file != job->mem_file) {
+		while (index < end_index) {
+			struct folio *folio = filemap_get_folio(mapping, index);
+			phys_addr_t pa;
+			size_t fsize;
+
+			if (IS_ERR(folio))
+				return -EINVAL;
+
+			pa = PFN_PHYS(folio_pfn(folio));
+			fsize = folio_size(folio);
+			index = folio->index + folio_nr_pages(folio);
+			folio_put(folio);
+
+			ret = cpupr_as_map(ps, pa, pa, fsize, PAGE_KERNEL_EXEC);
+			if (ret)
+				return ret;
+		}
+		ps->mapped_mem_file = job->mem_file;
+	}
+
+	entry_pa = cpupr_job_offset_pa(mapping, job->entry_offset);
+	arg_pa = cpupr_job_offset_pa(mapping, job->arg_offset);
+	if (!entry_pa || !arg_pa)
+		return -EINVAL;
+
+	ctx->entry_pa = entry_pa;
+	ctx->arg_pa = arg_pa;
+	cpupr_clean(ctx);
+	job->ctx = ctx;
+	return 0;
+}
+
+static void cpupr_clean_job_mem(struct cpupr_job *job)
+{
+	struct address_space *mapping = job->mem_file->f_mapping;
+	loff_t size = i_size_read(file_inode(job->mem_file));
+	pgoff_t index = 0, end_index = size >> PAGE_SHIFT;
+
+	while (index < end_index) {
+		struct folio *folio = filemap_get_folio(mapping, index);
+
+		if (IS_ERR(folio))
+			break;
+
+		cpupr_clean_sz(folio_address(folio), folio_size(folio));
+		index = folio->index + folio_nr_pages(folio);
+		folio_put(folio);
+	}
+}
+
+static void cpupr_release_cpu(unsigned int cpu)
+{
+	struct cpupr_session *ps = cpupr_session_of(cpu);
 
 	if (cpupr_unpreserve(cpu)) {
 		cpupr_session_detach(ps);
@@ -1813,55 +1927,152 @@ static void cpupr_unpreserve_cb(struct liveupdate_file_op_args *args)
 	cpupr_session_remove_cpu(ps, cpu);
 }
 
-/*
- * Put the CPU of a frozen file on the list of CPUs handed over to the next
- * kernel, in O(1).
- */
-static int cpupr_freeze_cb(struct liveupdate_file_op_args *args)
+static int cpupr_preserve_cb(struct liveupdate_file_op_args *args)
 {
-	struct cpupr_global_ser *gser;
-	struct cpupr_ser *ser, *first;
-	unsigned int cpu;
+	struct cpupr_job *job = NULL;
+	int cpu, ret;
 
-	if (!args->serialized_data)
-		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
-	ser = phys_to_virt(args->serialized_data);
-	cpu = ser->cpu;
+	cpu = file_to_cpu(args->file);
+	if (cpu < 0)
+		return cpu;
 
-	guard(mutex)(&cpupr_lock);
-	gser = cpupr_global_ser;
-	if (WARN_ON_ONCE(!gser || cpu >= nr_cpu_ids ||
-			 !cpumask_test_cpu(cpu, &cpupr_outgoing_mask) ||
-			 per_cpu(cpupr_cpu_ser, cpu) != ser ||
-			 cpupr_is_frozen(cpu)))
-		return -EINVAL;
+	if (args->arg) {
+		ret = cpupr_parse_job_arg(args->session, args->arg, &job);
+		if (ret)
+			return ret;
+	}
 
-	/* Insert @ser at the head of the list, see cpupr_handover_del() */
-	first = KHOSER_LOAD_PTR(gser->cpus);
-	ser->next.phys = gser->cpus.phys;
-	if (first)
-		per_cpu(cpupr_cpu_link, first->cpu) = &ser->next.phys;
-	KHOSER_STORE_PTR(gser->cpus, ser);
-	per_cpu(cpupr_cpu_link, cpu) = &gser->cpus.phys;
-	cpupr_clean(ser);
-	cpupr_clean(gser);
+	ret = cpupr_preserve(cpu, args->session);
+	if (ret) {
+		cpupr_free_job(job);
+		return ret;
+	}
+
+	if (job) {
+		ret = cpupr_setup_job(cpu, job);
+		if (ret) {
+			cpupr_release_cpu(cpu);
+			cpupr_free_job(job);
+			return ret;
+		}
+	}
+
+	args->private_data = job;
+	args->serialized_data = virt_to_phys(cpupr_get_ser(cpu));
 	return 0;
 }
 
-static void cpupr_unfreeze_cb(struct liveupdate_file_op_args *args)
+static void cpupr_unpreserve_cb(struct liveupdate_file_op_args *args)
 {
+	struct cpupr_session *ps;
 	struct cpupr_ser *ser;
-	unsigned int cpu;
+	int cpu;
 
 	if (!args->serialized_data)
 		return;
 
 	ser = phys_to_virt(args->serialized_data);
-	cpu = ser->cpu;
+	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+	if (WARN_ON_ONCE(cpu < 0))
+		return;
+
+	if (args->private_data) {
+		ps = cpupr_session_of(cpu);
+		if (ps) {
+			ps->mapped_mem_file = NULL;
+			ps->cleaned_mem_file = NULL;
+		}
+	}
+	cpupr_release_cpu(cpu);
+	cpupr_free_job(args->private_data);
+}
+
+/*
+ * Put the CPU of a frozen file on the list of CPUs handed over to the next
+ * kernel, in O(1), and start its user job if one was configured.
+ */
+static int cpupr_freeze_cb(struct liveupdate_file_op_args *args)
+{
+	struct cpupr_job *job = args->private_data;
+	struct cpupr_global_ser *gser;
+	struct cpupr_ser *ser, *first;
+	int cpu, ret;
+
+	if (!args->serialized_data)
+		return -EINVAL;
+
+	ser = phys_to_virt(args->serialized_data);
+	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+
+	scoped_guard(mutex, &cpupr_lock) {
+		gser = cpupr_global_ser;
+		if (WARN_ON_ONCE(!gser || cpu < 0 ||
+				 !cpumask_test_cpu(cpu, &cpupr_outgoing_mask) ||
+				 per_cpu(cpupr_cpu_ser, cpu) != ser ||
+				 cpupr_is_frozen(cpu)))
+			return -EINVAL;
+
+		/* Insert @ser at the head of the list, see cpupr_handover_del() */
+		first = KHOSER_LOAD_PTR(gser->cpus);
+		ser->next.phys = gser->cpus.phys;
+		if (first) {
+			int first_cpu = cpupr_find_cpu_by_hwid(first->hwid);
+
+			if (!WARN_ON_ONCE(first_cpu < 0))
+				per_cpu(cpupr_cpu_link, first_cpu) = &ser->next.phys;
+		}
+		KHOSER_STORE_PTR(gser->cpus, ser);
+		per_cpu(cpupr_cpu_link, cpu) = &gser->cpus.phys;
+		cpupr_clean(ser);
+		cpupr_clean(gser);
+	}
+
+	if (job) {
+		struct cpupr_session *ps = cpupr_session_of(cpu);
+
+		if (!ps || ps->cleaned_mem_file != job->mem_file) {
+			cpupr_clean_job_mem(job);
+			if (ps)
+				ps->cleaned_mem_file = job->mem_file;
+		}
+		ret = cpupr_attach_workload(cpu, cpupr_job_entry, job->ctx);
+		if (ret) {
+			guard(mutex)(&cpupr_lock);
+			cpupr_handover_del(cpu);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static void cpupr_unfreeze_cb(struct liveupdate_file_op_args *args)
+{
+	struct cpupr_job *job = args->private_data;
+	struct cpupr_ser *ser;
+	int cpu;
+
+	if (!args->serialized_data)
+		return;
+
+	ser = phys_to_virt(args->serialized_data);
+	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+	if (WARN_ON_ONCE(cpu < 0))
+		return;
+
+	if (job) {
+		struct cpupr_session *ps = cpupr_session_of(cpu);
+
+		if (ps)
+			ps->cleaned_mem_file = NULL;
+		cpupr_detach_workload(cpu);
+	}
 
 	guard(mutex)(&cpupr_lock);
-	if (cpu < nr_cpu_ids && cpupr_is_frozen(cpu) &&
+	if (cpupr_is_frozen(cpu) &&
 	    !WARN_ON_ONCE(per_cpu(cpupr_cpu_ser, cpu) != ser))
 		cpupr_handover_del(cpu);
 }
@@ -1936,6 +2147,8 @@ static const struct liveupdate_file_ops cpu_preserve_file_ops = {
 	.freeze       = cpupr_freeze_cb,
 	.unfreeze     = cpupr_unfreeze_cb,
 	.finish       = cpupr_finish_cb,
+	.parg         = LIVEUPDATE_ARG(struct liveupdate_cpu_preserve_arg,
+				       arg_offset),
 	.owner        = THIS_MODULE,
 };
 

@@ -45,6 +45,26 @@ bool cpupr_should_exit(void)
 	return smp_load_acquire(&sctx->ser->state) != CPUPR_WORKLOAD;
 }
 
+/**
+ * cpupr_job_entry - Invoke an identity-mapped user job on a preserved CPU
+ * @data: Pointer to &struct cpupr_job_ctx in the session's address space.
+ *
+ * Passes @ctx->arg_pa in both the first and second argument registers so
+ * both standard C entry points (%rdi / x0) and the x86_64 kernel boot entry
+ * (%rsi) receive the argument physical address.
+ */
+void cpupr_job_entry(void *data)
+{
+	const struct cpupr_job_ctx *ctx = data;
+	void (*fn)(unsigned long arg0, unsigned long arg1);
+
+	if (!ctx || !ctx->entry_pa)
+		return;
+
+	fn = (void (*)(unsigned long, unsigned long))(uintptr_t)ctx->entry_pa;
+	fn(ctx->arg_pa, ctx->arg_pa);
+}
+
 static void cpupr_run_workload(struct cpupr_stack_context *sctx)
 {
 	struct cpupr_ser *ser = sctx->ser;
