@@ -129,7 +129,7 @@ static inline int cpuset_do_page_mem_spread(void)
 
 extern bool current_cpuset_is_being_rebound(void);
 
-extern void dl_rebuild_rd_accounting(void);
+void dl_rebuild_rd_accounting(void);
 extern void rebuild_sched_domains(void);
 
 extern void cpuset_print_current_mems_allowed(void);
@@ -196,9 +196,20 @@ static inline void cpuset_update_active_cpus(void)
 
 static inline void inc_dl_tasks_cs(struct task_struct *task) { }
 static inline void dec_dl_tasks_cs(struct task_struct *task) { }
-static inline void cpuset_lock(void) { }
-static inline void cpuset_unlock(void) { }
-static inline void lockdep_assert_cpuset_lock_held(void) { }
+static inline void cpuset_lock(void)
+{
+	sched_domains_mutex_lock();
+}
+
+static inline void cpuset_unlock(void)
+{
+	sched_domains_mutex_unlock();
+}
+
+static inline void lockdep_assert_cpuset_lock_held(void)
+{
+	lockdep_assert_held(&sched_domains_mutex);
+}
 
 static inline void cpuset_cpus_allowed_locked(struct task_struct *p,
 					struct cpumask *mask)
@@ -273,9 +284,7 @@ static inline bool current_cpuset_is_being_rebound(void)
 	return false;
 }
 
-static inline void dl_rebuild_rd_accounting(void)
-{
-}
+void dl_rebuild_rd_accounting(void);
 
 static inline void rebuild_sched_domains(void)
 {
