@@ -799,8 +799,8 @@ static void pci_setup_bridge_io(struct pci_dev *bridge)
 	struct pci_bus_region region;
 	unsigned long io_mask;
 	u8 io_base_lo, io_limit_lo;
-	u16 l;
-	u32 io_upper16;
+	u16 l, cur_l, l_mask;
+	u32 io_upper16, cur_io_upper16;
 
 	io_mask = PCI_IO_RANGE_MASK;
 	if (bridge->io_window_1k)
@@ -823,6 +823,18 @@ static void pci_setup_bridge_io(struct pci_dev *bridge)
 		io_upper16 = 0;
 		l = 0x00f0;
 	}
+
+	/*
+	 * Leave the I/O range alone if it is already programmed as needed,
+	 * rather than temporarily disabling it below. The low bits of the I/O
+	 * Base and Limit registers are read-only.
+	 */
+	pci_read_config_word(bridge, PCI_IO_BASE, &cur_l);
+	pci_read_config_dword(bridge, PCI_IO_BASE_UPPER16, &cur_io_upper16);
+	l_mask = ((u8)io_mask << 8) | (u8)io_mask;
+	if (!((cur_l ^ l) & l_mask) && cur_io_upper16 == io_upper16)
+		return;
+
 	/* Temporarily disable the I/O range before updating PCI_IO_BASE */
 	pci_write_config_dword(bridge, PCI_IO_BASE_UPPER16, 0x0000ffff);
 	/* Update lower 16 bits of I/O base/limit */
@@ -836,7 +848,7 @@ static void pci_setup_bridge_mmio(struct pci_dev *bridge)
 	struct resource *res;
 	const char *res_name;
 	struct pci_bus_region region;
-	u32 l;
+	u32 l, cur_l;
 
 	/* Set up the top and bottom of the PCI Memory segment for this bus */
 	res = &bridge->resource[PCI_BRIDGE_MEM_WINDOW];
@@ -849,6 +861,12 @@ static void pci_setup_bridge_mmio(struct pci_dev *bridge)
 	} else {
 		l = 0x0000fff0;
 	}
+
+	/* The low bits of the Memory Base and Limit registers are read-only */
+	pci_read_config_dword(bridge, PCI_MEMORY_BASE, &cur_l);
+	if (!((cur_l ^ l) & 0xfff0fff0))
+		return;
+
 	pci_write_config_dword(bridge, PCI_MEMORY_BASE, l);
 }
 
@@ -857,14 +875,7 @@ static void pci_setup_bridge_mmio_pref(struct pci_dev *bridge)
 	struct resource *res;
 	const char *res_name;
 	struct pci_bus_region region;
-	u32 l, bu, lu;
-
-	/*
-	 * Clear out the upper 32 bits of PREF limit.  If
-	 * PCI_PREF_BASE_UPPER32 was non-zero, this temporarily disables
-	 * PREF range, which is ok.
-	 */
-	pci_write_config_dword(bridge, PCI_PREF_LIMIT_UPPER32, 0);
+	u32 l, bu, lu, cur_l, cur_bu, cur_lu;
 
 	/* Set up PREF base/limit */
 	bu = lu = 0;
@@ -882,6 +893,25 @@ static void pci_setup_bridge_mmio_pref(struct pci_dev *bridge)
 	} else {
 		l = 0x0000fff0;
 	}
+
+	/*
+	 * Leave the PREF range alone if it is already programmed as needed,
+	 * rather than temporarily disabling it below. The low bits of the
+	 * Prefetchable Memory Base and Limit registers are read-only.
+	 */
+	pci_read_config_dword(bridge, PCI_PREF_MEMORY_BASE, &cur_l);
+	pci_read_config_dword(bridge, PCI_PREF_BASE_UPPER32, &cur_bu);
+	pci_read_config_dword(bridge, PCI_PREF_LIMIT_UPPER32, &cur_lu);
+	if (!((cur_l ^ l) & 0xfff0fff0) && cur_bu == bu && cur_lu == lu)
+		return;
+
+	/*
+	 * Clear out the upper 32 bits of PREF limit.  If
+	 * PCI_PREF_BASE_UPPER32 was non-zero, this temporarily disables
+	 * PREF range, which is ok.
+	 */
+	pci_write_config_dword(bridge, PCI_PREF_LIMIT_UPPER32, 0);
+
 	pci_write_config_dword(bridge, PCI_PREF_MEMORY_BASE, l);
 
 	/* Set the upper 32 bits of PREF base & limit */
