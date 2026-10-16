@@ -6770,6 +6770,16 @@ void pci_reassigndev_resource_alignment(struct pci_dev *dev)
 		return;
 	}
 
+	/*
+	 * Reassigning resources disables decoding and moves BARs and bridge
+	 * windows, which would break devices preserved across Live Update that
+	 * are still performing memory transactions.
+	 */
+	if (pci_liveupdate_is_incoming(dev)) {
+		pci_warn(dev, "Can't reassign resources of device preserved across Live Update\n");
+		return;
+	}
+
 	pci_read_config_word(dev, PCI_COMMAND, &command);
 	command &= ~PCI_COMMAND_MEMORY;
 	pci_write_config_word(dev, PCI_COMMAND, command);
