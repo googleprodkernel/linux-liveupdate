@@ -520,19 +520,14 @@ static void pci_read_bridge_mmio_pref(struct pci_dev *dev, struct resource *res,
 	}
 }
 
-static void pci_read_bridge_windows(struct pci_dev *bridge)
+/*
+ * Determine which windows @bridge implements. This requires temporarily
+ * writing to the window registers of windows that read as zero.
+ */
+static void pci_probe_bridge_windows(struct pci_dev *bridge)
 {
-	u32 buses;
 	u16 io;
 	u32 pmem, tmp;
-	struct resource res;
-
-	pci_read_config_dword(bridge, PCI_PRIMARY_BUS, &buses);
-	res.flags = IORESOURCE_BUS;
-	res.start = FIELD_GET(PCI_SECONDARY_BUS_MASK, buses);
-	res.end = FIELD_GET(PCI_SUBORDINATE_BUS_MASK, buses);
-	pci_info(bridge, "PCI bridge to %pR%s\n", &res,
-		 bridge->transparent ? " (subtractive decode)" : "");
 
 	pci_read_config_word(bridge, PCI_IO_BASE, &io);
 	if (!io) {
@@ -540,12 +535,8 @@ static void pci_read_bridge_windows(struct pci_dev *bridge)
 		pci_read_config_word(bridge, PCI_IO_BASE, &io);
 		pci_write_config_word(bridge, PCI_IO_BASE, 0x0);
 	}
-	if (io) {
+	if (io)
 		bridge->io_window = 1;
-		pci_read_bridge_io(bridge, &res, true);
-	}
-
-	pci_read_bridge_mmio(bridge, &res, true);
 
 	/*
 	 * DECchip 21050 pass 2 errata: the bridge may miss an address
@@ -582,8 +573,29 @@ static void pci_read_bridge_windows(struct pci_dev *bridge)
 		if (tmp)
 			bridge->pref_64_window = 1;
 	}
+}
 
-	pci_read_bridge_mmio_pref(bridge, &res, true);
+static void pci_read_bridge_windows(struct pci_dev *bridge)
+{
+	u32 buses;
+	struct resource res;
+
+	pci_read_config_dword(bridge, PCI_PRIMARY_BUS, &buses);
+	res.flags = IORESOURCE_BUS;
+	res.start = FIELD_GET(PCI_SECONDARY_BUS_MASK, buses);
+	res.end = FIELD_GET(PCI_SUBORDINATE_BUS_MASK, buses);
+	pci_info(bridge, "PCI bridge to %pR%s\n", &res,
+		 bridge->transparent ? " (subtractive decode)" : "");
+
+	pci_probe_bridge_windows(bridge);
+
+	if (bridge->io_window)
+		pci_read_bridge_io(bridge, &res, true);
+
+	pci_read_bridge_mmio(bridge, &res, true);
+
+	if (bridge->pref_window)
+		pci_read_bridge_mmio_pref(bridge, &res, true);
 }
 
 void pci_read_bridge_bases(struct pci_bus *child)
