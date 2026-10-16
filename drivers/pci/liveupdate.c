@@ -197,6 +197,13 @@
  *  * The PCI core does not disable bus mastering on outgoing preserved devices
  *    during kexec. This allows preserved devices to issue memory transactions
  *    throughout the Live Update.
+ *
+ *  * The PCI core does not size the BARs of incoming preserved devices, since
+ *    sizing requires disabling decoding, which would disrupt memory
+ *    transactions targeting the device (e.g. P2PDMA, or MMIO from VMs whose
+ *    vCPUs keep running during kexec). Instead, the previous kernel passes the
+ *    size of each BAR in struct pci_dev_ser. Everything else about the BARs
+ *    (e.g. their addresses and types) is read from the device as usual.
  */
 
 #define pr_fmt(fmt) "PCI: liveupdate: " fmt
@@ -221,10 +228,14 @@
  * @had_incoming: True if the previous kernel preserved at least one PCI device.
  *                Set when the incoming FLB is retrieved and never cleared, so
  *                it stays true after Live Update finishes.
+ * @incoming_optional_flags: The optional features in the incoming FLB
+ *                           (struct pci_ser::optional_flags) that this kernel
+ *                           supports. Set when the incoming FLB is retrieved.
  */
 struct pci_liveupdate_global {
 	struct rw_semaphore rwsem;
 	bool had_incoming;
+	u64 incoming_optional_flags;
 };
 
 static struct pci_liveupdate_global pci_liveupdate = {
@@ -267,6 +278,26 @@ struct pci_flb_incoming {
  */
 #define PCI_SER_REQUIRED_FLAGS_SUPPORTED	0ULL
 
+/*
+ * Bits in struct pci_ser::optional_flags that this kernel knows how to handle.
+ * This kernel also provides all of them to the next kernel.
+ */
+#define PCI_SER_OPTIONAL_FLAGS_SUPPORTED	PCI_SER_OPTIONAL_BAR_MASKS
+
+/*
+ * The minimum size of struct pci_dev_ser given the optional features that are
+ * present in it.
+ */
+static u32 pci_dev_ser_min_size(u64 optional_flags)
+{
+	u32 size = PCI_DEV_SER_MIN_SIZE;
+
+	if (optional_flags & PCI_SER_OPTIONAL_BAR_MASKS)
+		size = max(size, offsetofend(struct pci_dev_ser, rom_mask));
+
+	return size;
+}
+
 /* PCI_LIVEUPDATE depends on 64BIT, so domain and bdf always fit. */
 static unsigned long pci_ser_xa_key(u32 domain, u16 bdf)
 {
@@ -287,7 +318,7 @@ static int pci_flb_preserve(struct liveupdate_flb_op_args *args)
 		return PTR_ERR(ser);
 
 	ser->required_flags = 0;
-	ser->optional_flags = 0;
+	ser->optional_flags = PCI_SER_OPTIONAL_FLAGS_SUPPORTED;
 	ser->dev_ser_size = sizeof(struct pci_dev_ser);
 	ser->nr_devices = 0;
 	ser->devices = 0;
@@ -325,6 +356,7 @@ static int pci_flb_retrieve(struct liveupdate_flb_op_args *args)
 	struct pci_flb_incoming *incoming;
 	struct pci_dev_ser *dev_ser;
 	struct kho_block_set_it it;
+	u64 optional_flags;
 	int ret;
 
 	pr_debug("Retrieving struct pci_ser (0x%llx)\n", args->data);
@@ -333,12 +365,16 @@ static int pci_flb_retrieve(struct liveupdate_flb_op_args *args)
 		panic("Incoming PCI FLB requires unsupported features (0x%llx)\n",
 		      ser->required_flags & ~PCI_SER_REQUIRED_FLAGS_SUPPORTED);
 
+	/* Ignore any optional features that this kernel does not support. */
+	optional_flags = ser->optional_flags & PCI_SER_OPTIONAL_FLAGS_SUPPORTED;
+
 	/*
 	 * The previous kernel may have appended fields to struct pci_dev_ser,
 	 * which this kernel ignores, but every entry must be at least the
-	 * minimum size.
+	 * minimum size, including the fields of the optional features that
+	 * are present.
 	 */
-	if (ser->dev_ser_size < PCI_DEV_SER_MIN_SIZE)
+	if (ser->dev_ser_size < pci_dev_ser_min_size(optional_flags))
 		panic("Incoming PCI FLB has unsupported struct pci_dev_ser size (%u)\n",
 		      ser->dev_ser_size);
 
@@ -377,6 +413,8 @@ static int pci_flb_retrieve(struct liveupdate_flb_op_args *args)
 	 */
 	if (!xa_empty(&incoming->xa))
 		pci_liveupdate.had_incoming = true;
+
+	pci_liveupdate.incoming_optional_flags = optional_flags;
 
 	args->obj = incoming;
 	return 0;
@@ -539,6 +577,53 @@ static void pci_liveupdate_unpreserve_path(struct pci_flb_outgoing *outgoing,
 		if (pci_liveupdate_unpreserve_device(outgoing, dev))
 			return;
 	}
+}
+
+/*
+ * Compute the value that the BAR backing resource @resno of @dev returns when
+ * read after writing all 1s to it, from the size of the resource.
+ */
+static u64 pci_liveupdate_bar_mask(struct pci_dev *dev, int resno)
+{
+	struct resource *res = &dev->resource[resno];
+	resource_size_t size = resource_size(res);
+
+	if (!res->flags || !size)
+		return 0;
+
+	/* Skip resources that are not decoded by the BAR. */
+	if (res->flags & IORESOURCE_PCI_EA_BEI)
+		return 0;
+
+	if (resno == PCI_ROM_RESOURCE && (res->flags & IORESOURCE_ROM_SHADOW))
+		return 0;
+
+	/* The size of a BAR is always a power of 2. */
+	pci_WARN_ONCE(dev, size & (size - 1),
+		      "%s %pR: Size is not a power of 2\n",
+		      pci_resource_name(dev, resno), res);
+
+	return ~((u64)size - 1);
+}
+
+static void pci_liveupdate_save_bar_masks(struct pci_dev *dev,
+					  struct pci_dev_ser *dev_ser)
+{
+	u64 mask;
+	int i;
+
+	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+		mask = pci_liveupdate_bar_mask(dev, i);
+		dev_ser->bar_masks[i] = lower_32_bits(mask);
+
+		/* The upper half of a 64-bit BAR is in the next register. */
+		if ((dev->resource[i].flags & IORESOURCE_MEM_64) &&
+		    i + 1 < PCI_STD_NUM_BARS)
+			dev_ser->bar_masks[++i] = upper_32_bits(mask);
+	}
+
+	mask = pci_liveupdate_bar_mask(dev, PCI_ROM_RESOURCE);
+	dev_ser->rom_mask = lower_32_bits(mask);
 }
 
 static int pci_liveupdate_preserve_device(struct pci_flb_outgoing *outgoing,
@@ -833,6 +918,14 @@ void pci_liveupdate_freeze(struct pci_dev *dev)
 {
 	guard(rwsem_write)(&pci_liveupdate.rwsem);
 	dev->liveupdate.frozen = true;
+
+	/*
+	 * Save the BAR masks of outgoing devices now that preservation status
+	 * is frozen, rather than when the devices are preserved, in case the
+	 * size of a BAR changes in between (e.g. via Resizable BAR).
+	 */
+	if (dev->liveupdate.outgoing)
+		pci_liveupdate_save_bar_masks(dev, dev->liveupdate.outgoing);
 }
 
 static int pci_liveupdate_finish_device(struct pci_ser *ser, struct pci_dev *dev)
@@ -982,6 +1075,45 @@ bool pci_liveupdate_is_outgoing(struct pci_dev *dev)
 	guard(rwsem_read)(&pci_liveupdate.rwsem);
 	pci_WARN_ONCE(dev, !dev->liveupdate.frozen, "Preservation status is unstable!\n");
 	return dev->liveupdate.outgoing;
+}
+
+/**
+ * pci_liveupdate_read_bar_masks() - Get the BAR masks of an incoming device
+ * @dev: The PCI device
+ * @nr_bars: The number of standard BARs to get masks for
+ * @bar_masks: Array of @nr_bars entries to fill with the standard BAR masks
+ * @rom_mask: Filled with the Expansion ROM BAR mask, if not NULL
+ *
+ * Get the BAR masks passed by the previous kernel, i.e. the values that the
+ * BARs of @dev return when read after writing all 1s to them, so that the BARs
+ * do not need to be sized.
+ *
+ * Return: 0 on success, or <0 if @dev is not incoming-preserved or the
+ * previous kernel did not pass BAR masks.
+ */
+int pci_liveupdate_read_bar_masks(struct pci_dev *dev, unsigned int nr_bars,
+				  u32 *bar_masks, u32 *rom_mask)
+{
+	struct pci_dev_ser *dev_ser;
+	unsigned int i;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	dev_ser = dev->liveupdate.incoming;
+	if (!dev_ser)
+		return -EINVAL;
+
+	if (!(pci_liveupdate.incoming_optional_flags &
+	      PCI_SER_OPTIONAL_BAR_MASKS))
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < nr_bars; i++)
+		bar_masks[i] = dev_ser->bar_masks[i];
+
+	if (rom_mask)
+		*rom_mask = dev_ser->rom_mask;
+
+	return 0;
 }
 
 /**

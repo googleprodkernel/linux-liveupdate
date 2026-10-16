@@ -19,6 +19,8 @@ bool pci_liveupdate_refuse_bus_numbers(struct pci_bus *bus, struct pci_dev *dev)
 int pci_liveupdate_adopt_acs(struct pci_dev *dev);
 int pci_liveupdate_adopt_ari(struct pci_dev *dev);
 bool pci_liveupdate_is_outgoing(struct pci_dev *dev);
+int pci_liveupdate_read_bar_masks(struct pci_dev *dev, unsigned int nr_bars,
+				  u32 *bar_masks, u32 *rom_mask);
 #else
 static inline void pci_liveupdate_setup_device(struct pci_dev *dev)
 {
@@ -56,6 +58,13 @@ static inline int pci_liveupdate_adopt_ari(struct pci_dev *dev)
 static inline bool pci_liveupdate_is_outgoing(struct pci_dev *dev)
 {
 	return false;
+}
+
+static inline int pci_liveupdate_read_bar_masks(struct pci_dev *dev,
+						unsigned int nr_bars,
+						u32 *bar_masks, u32 *rom_mask)
+{
+	return -EINVAL;
 }
 #endif
 

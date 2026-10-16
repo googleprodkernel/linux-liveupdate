@@ -328,6 +328,16 @@ static void pci_size_bases(struct pci_dev *dev, unsigned int howmany, int rom,
 {
 	u16 orig_cmd;
 
+	/*
+	 * Sizing BARs requires disabling decoding, which would disrupt memory
+	 * transactions targeting devices preserved across Live Update (e.g.
+	 * P2PDMA, or MMIO from VMs whose vCPUs keep running during kexec), so
+	 * use the BAR masks passed by the previous kernel for those devices.
+	 */
+	if (!pci_liveupdate_read_bar_masks(dev, howmany, stdbars,
+					   rom ? rombar : NULL))
+		return;
+
 	/* No printks while decoding is disabled! */
 	if (!dev->mmio_always_on) {
 		pci_read_config_word(dev, PCI_COMMAND, &orig_cmd);
