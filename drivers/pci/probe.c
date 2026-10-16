@@ -323,21 +323,10 @@ out:
 	return (res->flags & IORESOURCE_MEM_64) ? 1 : 0;
 }
 
-static __always_inline void pci_read_bases(struct pci_dev *dev,
-					   unsigned int howmany, int rom)
+static void pci_size_bases(struct pci_dev *dev, unsigned int howmany, int rom,
+			   u32 *stdbars, u32 *rombar)
 {
-	u32 rombar, stdbars[PCI_STD_NUM_BARS];
-	unsigned int pos, reg;
 	u16 orig_cmd;
-
-	BUILD_BUG_ON(statically_true(howmany > PCI_STD_NUM_BARS));
-
-	if (dev->non_compliant_bars)
-		return;
-
-	/* Per PCIe r4.0, sec 9.3.4.1.11, the VF BARs are all RO Zero */
-	if (dev->is_virtfn)
-		return;
 
 	/* No printks while decoding is disabled! */
 	if (!dev->mmio_always_on) {
@@ -350,11 +339,29 @@ static __always_inline void pci_read_bases(struct pci_dev *dev,
 
 	__pci_size_stdbars(dev, howmany, PCI_BASE_ADDRESS_0, stdbars);
 	if (rom)
-		__pci_size_rom(dev, rom, &rombar);
+		__pci_size_rom(dev, rom, rombar);
 
 	if (!dev->mmio_always_on &&
 	    (orig_cmd & PCI_COMMAND_DECODE_ENABLE))
 		pci_write_config_word(dev, PCI_COMMAND, orig_cmd);
+}
+
+static __always_inline void pci_read_bases(struct pci_dev *dev,
+					   unsigned int howmany, int rom)
+{
+	u32 rombar, stdbars[PCI_STD_NUM_BARS];
+	unsigned int pos, reg;
+
+	BUILD_BUG_ON(statically_true(howmany > PCI_STD_NUM_BARS));
+
+	if (dev->non_compliant_bars)
+		return;
+
+	/* Per PCIe r4.0, sec 9.3.4.1.11, the VF BARs are all RO Zero */
+	if (dev->is_virtfn)
+		return;
+
+	pci_size_bases(dev, howmany, rom, stdbars, &rombar);
 
 	for (pos = 0; pos < howmany; pos++) {
 		struct resource *res = &dev->resource[pos];
