@@ -204,6 +204,12 @@
  *    vCPUs keep running during kexec). Instead, the previous kernel passes the
  *    size of each BAR in struct pci_dev_ser. Everything else about the BARs
  *    (e.g. their addresses and types) is read from the device as usual.
+ *
+ *  * The PCI core does not probe properties of incoming preserved devices
+ *    that require temporarily writing to the device (e.g. which windows a
+ *    bridge implements), since that would disrupt memory transactions
+ *    targeting the device or devices below it. Instead, the previous kernel
+ *    passes the results of probing in struct pci_dev_ser.
  */
 
 #define pr_fmt(fmt) "PCI: liveupdate: " fmt
@@ -282,7 +288,13 @@ struct pci_flb_incoming {
  * Bits in struct pci_ser::optional_flags that this kernel knows how to handle.
  * This kernel also provides all of them to the next kernel.
  */
-#define PCI_SER_OPTIONAL_FLAGS_SUPPORTED	PCI_SER_OPTIONAL_BAR_MASKS
+#define PCI_SER_OPTIONAL_FLAGS_SUPPORTED \
+	(PCI_SER_OPTIONAL_BAR_MASKS | PCI_SER_OPTIONAL_PROBED)
+
+#define PCI_DEV_SER_PROBED_WINDOWS		\
+	(PCI_DEV_SER_PROBED_IO_WINDOW |		\
+	 PCI_DEV_SER_PROBED_PREF_WINDOW |	\
+	 PCI_DEV_SER_PROBED_PREF_64_WINDOW)
 
 /*
  * The minimum size of struct pci_dev_ser given the optional features that are
@@ -294,6 +306,9 @@ static u32 pci_dev_ser_min_size(u64 optional_flags)
 
 	if (optional_flags & PCI_SER_OPTIONAL_BAR_MASKS)
 		size = max(size, offsetofend(struct pci_dev_ser, rom_mask));
+
+	if (optional_flags & PCI_SER_OPTIONAL_PROBED)
+		size = max(size, offsetofend(struct pci_dev_ser, probed));
 
 	return size;
 }
@@ -626,6 +641,28 @@ static void pci_liveupdate_save_bar_masks(struct pci_dev *dev,
 	dev_ser->rom_mask = lower_32_bits(mask);
 }
 
+static void pci_liveupdate_preserve_probed(struct pci_dev *dev,
+					   struct pci_dev_ser *dev_ser)
+{
+	u64 supported = 0, probed = 0;
+
+	if (dev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
+		supported |= PCI_DEV_SER_PROBED_WINDOWS;
+
+		if (dev->io_window)
+			probed |= PCI_DEV_SER_PROBED_IO_WINDOW;
+
+		if (dev->pref_window)
+			probed |= PCI_DEV_SER_PROBED_PREF_WINDOW;
+
+		if (dev->pref_64_window)
+			probed |= PCI_DEV_SER_PROBED_PREF_64_WINDOW;
+	}
+
+	dev_ser->probed_supported = supported;
+	dev_ser->probed = probed;
+}
+
 static int pci_liveupdate_preserve_device(struct pci_flb_outgoing *outgoing,
 					  struct pci_dev *dev)
 {
@@ -670,6 +707,8 @@ static int pci_liveupdate_preserve_device(struct pci_flb_outgoing *outgoing,
 		dev_ser = pci_flb_alloc_dev_ser(outgoing);
 		if (IS_ERR(dev_ser))
 			return PTR_ERR(dev_ser);
+
+		pci_liveupdate_preserve_probed(dev, dev_ser);
 
 		pci_info(dev, "Device will be preserved across next Live Update\n");
 		outgoing->ser->nr_devices++;
@@ -1113,6 +1152,58 @@ int pci_liveupdate_read_bar_masks(struct pci_dev *dev, unsigned int nr_bars,
 	if (rom_mask)
 		*rom_mask = dev_ser->rom_mask;
 
+	return 0;
+}
+
+/*
+ * Get the results of probing @bits on the incoming device @dev, as passed by
+ * the previous kernel. Returns false if the previous kernel did not pass all of
+ * @bits, in which case they must be probed.
+ */
+static bool pci_liveupdate_read_probed(struct pci_dev *dev, u64 bits,
+				       u64 *probed)
+{
+	struct pci_dev_ser *dev_ser = dev->liveupdate.incoming;
+
+	lockdep_assert_held(&pci_liveupdate.rwsem);
+
+	if (!dev_ser)
+		return false;
+
+	if (!(pci_liveupdate.incoming_optional_flags & PCI_SER_OPTIONAL_PROBED))
+		return false;
+
+	if ((dev_ser->probed_supported & bits) != bits)
+		return false;
+
+	*probed = dev_ser->probed & bits;
+	return true;
+}
+
+/**
+ * pci_liveupdate_read_bridge_windows() - Get the windows of an incoming bridge
+ * @bridge: The PCI bridge
+ *
+ * Set which windows @bridge implements (@bridge->io_window, pref_window, and
+ * pref_64_window) as determined by the previous kernel, so that the windows do
+ * not need to be probed.
+ *
+ * Return: 0 on success, or -ENODATA if @bridge is not incoming-preserved or
+ * the previous kernel did not pass which windows @bridge implements.
+ */
+int pci_liveupdate_read_bridge_windows(struct pci_dev *bridge)
+{
+	u64 probed;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	if (!pci_liveupdate_read_probed(bridge, PCI_DEV_SER_PROBED_WINDOWS,
+					&probed))
+		return -ENODATA;
+
+	bridge->io_window = !!(probed & PCI_DEV_SER_PROBED_IO_WINDOW);
+	bridge->pref_window = !!(probed & PCI_DEV_SER_PROBED_PREF_WINDOW);
+	bridge->pref_64_window = !!(probed & PCI_DEV_SER_PROBED_PREF_64_WINDOW);
 	return 0;
 }
 

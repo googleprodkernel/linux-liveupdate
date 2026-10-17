@@ -66,6 +66,13 @@
  *             which requires disabling decoding and would disrupt memory
  *             transactions targeting the device.
  * @rom_mask: Same as @bar_masks, but for the Expansion ROM BAR.
+ * @probed_supported: The ``PCI_DEV_SER_PROBED_*`` bits that are valid in
+ *                    @probed.
+ * @probed: The results of probing properties of the device that require
+ *          temporarily writing to it (``PCI_DEV_SER_PROBED_*``). Used by the
+ *          next kernel instead of probing the device again, which would
+ *          disrupt memory transactions targeting the device or devices below
+ *          it.
  *
  * Each field after @refcount is only present if the ``PCI_SER_OPTIONAL_*``
  * flag that covers it is set in ``pci_ser.optional_flags``.
@@ -76,7 +83,22 @@ struct pci_dev_ser {
 	u16 refcount;
 	u32 bar_masks[PCI_STD_NUM_BARS];
 	u32 rom_mask;
+	u64 probed_supported;
+	u64 probed;
 } __packed;
+
+/*
+ * Bits in struct pci_dev_ser::probed_supported and probed:
+ *
+ *  * PCI_DEV_SER_PROBED_IO_WINDOW: The bridge has an I/O window.
+ *  * PCI_DEV_SER_PROBED_PREF_WINDOW: The bridge has a prefetchable memory
+ *    window.
+ *  * PCI_DEV_SER_PROBED_PREF_64_WINDOW: The bridge's prefetchable memory
+ *    window is 64-bit.
+ */
+#define PCI_DEV_SER_PROBED_IO_WINDOW		BIT_ULL(0)
+#define PCI_DEV_SER_PROBED_PREF_WINDOW		BIT_ULL(1)
+#define PCI_DEV_SER_PROBED_PREF_64_WINDOW	BIT_ULL(2)
 
 /*
  * The size of struct pci_dev_ser when this ABI was introduced. Since fields
@@ -113,7 +135,9 @@ struct pci_ser {
  * large enough to contain the fields of struct pci_dev_ser that it covers:
  *
  *  * PCI_SER_OPTIONAL_BAR_MASKS: @bar_masks and @rom_mask
+ *  * PCI_SER_OPTIONAL_PROBED: @probed_supported and @probed
  */
 #define PCI_SER_OPTIONAL_BAR_MASKS	BIT_ULL(0)
+#define PCI_SER_OPTIONAL_PROBED		BIT_ULL(1)
 
 #endif /* _LINUX_KHO_ABI_PCI_H */

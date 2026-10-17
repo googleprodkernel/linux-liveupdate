@@ -529,6 +529,15 @@ static void pci_probe_bridge_windows(struct pci_dev *bridge)
 	u16 io;
 	u32 pmem, tmp;
 
+	/*
+	 * Writing to the window registers would disrupt memory transactions
+	 * that bridges preserved across Live Update forward to devices below
+	 * them, so use the windows determined by the previous kernel for those
+	 * bridges.
+	 */
+	if (!pci_liveupdate_read_bridge_windows(bridge))
+		return;
+
 	pci_read_config_word(bridge, PCI_IO_BASE, &io);
 	if (!io) {
 		pci_write_config_word(bridge, PCI_IO_BASE, 0xe0f0);
