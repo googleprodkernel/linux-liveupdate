@@ -2,9 +2,22 @@
 #ifndef LINUX_KEXEC_HANDOVER_INTERNAL_H
 #define LINUX_KEXEC_HANDOVER_INTERNAL_H
 
+#include <linux/init.h>
 #include <linux/kexec_handover.h>
+#include <linux/kho/abi/kexec_handover.h>
 #include <linux/list.h>
 #include <linux/types.h>
+
+const void *kho_get_fdt(void);
+unsigned long kho_encode_radix_key(phys_addr_t phys, unsigned int order);
+phys_addr_t kho_decode_radix_key(unsigned long key, unsigned int *order);
+unsigned long kho_radix_get_bitmap_index(unsigned long key);
+unsigned long kho_radix_get_table_index(unsigned long key, unsigned int level);
+struct kho_radix_leaf *kho_radix_find_leaf(phys_addr_t root_pa,
+					   unsigned long key,
+					   void *(*map)(phys_addr_t pa));
+int __init kho_check_fdt(const void *fdt, phys_addr_t fdt_phys);
+phys_addr_t __init kho_get_mem_map_phys(const void *fdt);
 
 #ifdef CONFIG_KEXEC_HANDOVER_DEBUGFS
 #include <linux/debugfs.h>

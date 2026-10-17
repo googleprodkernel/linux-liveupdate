@@ -107,71 +107,9 @@ struct kho_in {
 static struct kho_in kho_in = {
 };
 
-static const void *kho_get_fdt(void)
+const void *kho_get_fdt(void)
 {
 	return kho_in.fdt_phys ? phys_to_virt(kho_in.fdt_phys) : NULL;
-}
-
-/**
- * kho_encode_radix_key - Encodes a physical address and order into a radix key.
- * @phys: The physical address of the page.
- * @order: The order of the page.
- *
- * This function combines a page's physical address and its order into a
- * single unsigned long, which is used as a key for all radix tree
- * operations.
- *
- * Return: The encoded unsigned long radix key.
- */
-static unsigned long kho_encode_radix_key(phys_addr_t phys, unsigned int order)
-{
-	/* The physical address is encoded by shifting the PFN by its order. */
-	unsigned long shift = PAGE_SHIFT + order;
-	/* Order bit goes right before the shifted PFN. */
-	unsigned long h = 1UL << (64 - shift);
-	/* Shifted PFN. */
-	unsigned long l = phys >> shift;
-
-	return h | l;
-}
-
-/**
- * kho_decode_radix_key - Decodes a radix key back into a physical address and order.
- * @key: The unsigned long key to decode.
- * @order: An output parameter, a pointer to an unsigned int where the decoded
- *         page order will be stored.
- *
- * This function reverses the encoding performed by kho_encode_radix_key(),
- * extracting the original physical address and page order from a given key.
- *
- * Return: The decoded physical address.
- */
-static phys_addr_t kho_decode_radix_key(unsigned long key, unsigned int *order)
-{
-	/* fls64() indexes starting from 1. */
-	unsigned int order_bit = fls64(key) - 1;
-	phys_addr_t phys;
-
-	/* order bit goes right before the shifted PFN. */
-	*order = 64 - (PAGE_SHIFT + order_bit);
-	/* The order bit is discarded by the shift */
-	phys = key << (PAGE_SHIFT + *order);
-
-	return phys;
-}
-
-static unsigned long kho_radix_get_bitmap_index(unsigned long key)
-{
-	return key % (1 << KHO_BITMAP_SIZE_LOG2);
-}
-
-static unsigned long kho_radix_get_table_index(unsigned long key,
-					       unsigned int level)
-{
-	int s;
-
-	s = ((level - 1) * KHO_TABLE_SIZE_LOG2) + KHO_BITMAP_SIZE_LOG2;
-	return (key >> s) % (1 << KHO_TABLE_SIZE_LOG2);
 }
 
 static void __ref *kho_radix_alloc_node(void)
@@ -282,6 +220,11 @@ err_free_nodes:
 }
 EXPORT_SYMBOL_GPL(kho_radix_add_key);
 
+static void *kho_radix_map_direct(phys_addr_t pa)
+{
+	return phys_to_virt(pa);
+}
+
 /**
  * kho_radix_del_key - Removes the key from the radix tree.
  * @tree: The KHO radix tree.
@@ -293,9 +236,7 @@ EXPORT_SYMBOL_GPL(kho_radix_add_key);
  */
 void kho_radix_del_key(struct kho_radix_tree *tree, unsigned long key)
 {
-	struct kho_radix_node *node = tree->root;
 	struct kho_radix_leaf *leaf;
-	unsigned int i, idx;
 
 	if (WARN_ON_ONCE(!tree->root))
 		return;
@@ -308,24 +249,16 @@ void kho_radix_del_key(struct kho_radix_tree *tree, unsigned long key)
 
 	guard(mutex)(&tree->lock);
 
-	/* Go from high levels to low levels */
-	for (i = KHO_TREE_MAX_DEPTH - 1; i > 0; i--) {
-		idx = kho_radix_get_table_index(key, i);
+	/*
+	 * Attempting to delete a page that has not been preserved,
+	 * return with a warning.
+	 */
+	leaf = kho_radix_find_leaf(virt_to_phys(tree->root), key,
+				   kho_radix_map_direct);
+	if (WARN_ON(!leaf))
+		return;
 
-		/*
-		 * Attempting to delete a page that has not been preserved,
-		 * return with a warning.
-		 */
-		if (WARN_ON(!node->table[idx]))
-			return;
-
-		node = phys_to_virt(node->table[idx]);
-	}
-
-	/* Handle the leaf level bitmap (level 0) */
-	leaf = (struct kho_radix_leaf *)node;
-	idx = kho_radix_get_bitmap_index(key);
-	__clear_bit(idx, leaf->bitmap);
+	__clear_bit(kho_radix_get_bitmap_index(key), leaf->bitmap);
 }
 EXPORT_SYMBOL_GPL(kho_radix_del_key);
 
@@ -631,21 +564,6 @@ static int __init kho_preserved_memory_reserve(unsigned long key, void *data)
 	page->private = info.page_private;
 
 	return 0;
-}
-
-/* Returns physical address of the preserved memory map from FDT */
-static phys_addr_t __init kho_get_mem_map_phys(const void *fdt)
-{
-	const void *mem_ptr;
-	int len;
-
-	mem_ptr = fdt_getprop(fdt, 0, KHO_FDT_MEMORY_MAP_PROP_NAME, &len);
-	if (!mem_ptr || len != sizeof(u64)) {
-		pr_err("failed to get preserved memory map\n");
-		return 0;
-	}
-
-	return get_unaligned((const u64 *)mem_ptr);
 }
 
 static void __init *kho_get_mem_map(const void *fdt)
@@ -1302,6 +1220,9 @@ static unsigned int kho_flags_to_vmalloc(unsigned short kho_flags)
 	if (kho_flags & KHO_VMALLOC_HUGE_VMAP)
 		vm_flags |= VM_ALLOW_HUGE_VMAP;
 
+	if (kho_flags & ~(KHO_VMALLOC_ALLOC | KHO_VMALLOC_HUGE_VMAP))
+		return ~KHO_VMALLOC_SUPPORTED_FLAGS;
+
 	return vm_flags;
 }
 
@@ -1634,53 +1555,6 @@ bool is_kho_boot(void)
 }
 EXPORT_SYMBOL_GPL(is_kho_boot);
 
-/**
- * kho_retrieve_subtree - retrieve a preserved sub blob by its name.
- * @name: the name of the sub blob passed to kho_add_subtree().
- * @phys: if found, the physical address of the sub blob is stored in @phys.
- * @size: if not NULL and found, the size of the sub blob is stored in @size.
- *
- * Retrieve a preserved sub blob named @name and store its physical
- * address in @phys and optionally its size in @size.
- *
- * Return: 0 on success, error code on failure
- */
-int kho_retrieve_subtree(const char *name, phys_addr_t *phys, size_t *size)
-{
-	const void *fdt = kho_get_fdt();
-	const u64 *val;
-	int offset, len;
-
-	if (!fdt)
-		return -ENOENT;
-
-	if (!phys)
-		return -EINVAL;
-
-	offset = fdt_subnode_offset(fdt, 0, name);
-	if (offset < 0)
-		return -ENOENT;
-
-	val = fdt_getprop(fdt, offset, KHO_SUB_TREE_PROP_NAME, &len);
-	if (!val || len != sizeof(*val))
-		return -EINVAL;
-
-	*phys = (phys_addr_t)*val;
-
-	val = fdt_getprop(fdt, offset, KHO_SUB_TREE_SIZE_PROP_NAME, &len);
-	if (!val || len != sizeof(*val)) {
-		pr_warn("broken KHO subnode '%s': missing or invalid blob-size property\n",
-			name);
-		return -EINVAL;
-	}
-
-	if (size)
-		*size = (size_t)*val;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(kho_retrieve_subtree);
-
 static void __init kho_mem_retrieve(void)
 {
 	const struct kho_radix_walk_cb cb = {
@@ -1963,18 +1837,8 @@ void __init kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
 		pr_warn("setup: failed to memremap FDT (0x%llx)\n", fdt_phys);
 		goto report;
 	}
-	err = fdt_check_header(fdt);
-	if (err) {
-		pr_warn("setup: handover FDT (0x%llx) is invalid: %d\n",
-			fdt_phys, err);
+	if (kho_check_fdt(fdt, fdt_phys))
 		goto unmap_fdt;
-	}
-	err = fdt_node_check_compatible(fdt, 0, KHO_FDT_COMPATIBLE);
-	if (err) {
-		pr_warn("setup: handover FDT (0x%llx) is incompatible with '%s': %d\n",
-			fdt_phys, KHO_FDT_COMPATIBLE, err);
-		goto unmap_fdt;
-	}
 
 	mem_map_phys = kho_get_mem_map_phys(fdt);
 	if (!mem_map_phys)
