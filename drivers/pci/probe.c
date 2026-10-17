@@ -3156,6 +3156,14 @@ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
 	}
 
 	/*
+	 * Claim the resources of devices preserved across Live Update before
+	 * scanning the buses below and before any resources are sized or
+	 * assigned, so that nothing else is assigned the address space they
+	 * decode.
+	 */
+	pci_liveupdate_claim_bus_resources(bus);
+
+	/*
 	 * Calculate how many hotplug bridges and normal bridges there
 	 * are on this bus. We will distribute the additional available
 	 * buses between hotplug bridges.

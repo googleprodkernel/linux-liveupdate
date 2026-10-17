@@ -22,6 +22,7 @@ bool pci_liveupdate_is_outgoing(struct pci_dev *dev);
 int pci_liveupdate_read_bar_masks(struct pci_dev *dev, unsigned int nr_bars,
 				  u32 *bar_masks, u32 *rom_mask);
 int pci_liveupdate_read_bridge_windows(struct pci_dev *bridge);
+void pci_liveupdate_claim_bus_resources(struct pci_bus *bus);
 #else
 static inline void pci_liveupdate_setup_device(struct pci_dev *dev)
 {
@@ -71,6 +72,10 @@ static inline int pci_liveupdate_read_bar_masks(struct pci_dev *dev,
 static inline int pci_liveupdate_read_bridge_windows(struct pci_dev *bridge)
 {
 	return -EINVAL;
+}
+
+static inline void pci_liveupdate_claim_bus_resources(struct pci_bus *bus)
+{
 }
 #endif
 

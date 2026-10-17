@@ -184,6 +184,12 @@
  * The PCI core treats preserved devices differently than non-preserved devices.
  * This section enumerates those differences.
  *
+ *  * The PCI core claims the BARs and bridge windows of incoming preserved
+ *    devices, as programmed by the previous kernel, while scanning and before
+ *    any resources are sized or assigned. This ensures no other device is
+ *    assigned address space that an incoming device is still decoding, and
+ *    that the resources of incoming devices are never reassigned.
+ *
  *  * The PCI core adopts all ACS controls enabled on incoming preserved devices
  *    rather than assigning new ones. This ensures that TLPs are routed the same
  *    way after Live Update and ensures that IOMMU groups do not change. Note
@@ -1205,6 +1211,99 @@ int pci_liveupdate_read_bridge_windows(struct pci_dev *bridge)
 	bridge->pref_window = !!(probed & PCI_DEV_SER_PROBED_PREF_WINDOW);
 	bridge->pref_64_window = !!(probed & PCI_DEV_SER_PROBED_PREF_64_WINDOW);
 	return 0;
+}
+
+/*
+ * Check if the windows of @bridge have been read from hardware. Outside of x86
+ * that does not happen during scanning.
+ */
+static bool pci_liveupdate_windows_read(struct pci_dev *bridge)
+{
+	int i;
+
+	for (i = PCI_BRIDGE_RESOURCES; i <= PCI_BRIDGE_RESOURCE_END; i++) {
+		if (pci_resource_n(bridge, i)->flags)
+			return true;
+	}
+
+	return false;
+}
+
+static void pci_liveupdate_claim_resource(struct pci_dev *dev, int resno)
+{
+	struct resource *r = pci_resource_n(dev, resno);
+	int ret;
+
+	/*
+	 * Skip resources that are unused, already claimed, or disabled (e.g.
+	 * bridge windows that are turned off).
+	 */
+	if (!r->flags || resource_assigned(r) ||
+	    (r->flags & IORESOURCE_DISABLED))
+		return;
+
+	/*
+	 * Panic if something else has already claimed part of the range, since
+	 * memory transactions still targeting the device may be corrupting it.
+	 * Also panic if a bridge window cannot be claimed at all, since the
+	 * bridge forwards the range even though the resource tree considers it
+	 * free. BARs that fail for other reasons were never assigned an address
+	 * (e.g. a ROM BAR that was left unassigned), so there is nothing to
+	 * claim.
+	 */
+	ret = pci_claim_resource(dev, resno);
+	if (ret == -EBUSY || (ret && pci_resource_is_bridge_win(resno)))
+		panic("%s %s %pR: Failed to claim resource of device preserved across Live Update\n",
+		      pci_name(dev), pci_resource_name(dev, resno), r);
+}
+
+/**
+ * pci_liveupdate_claim_bus_resources() - Claim the resources of incoming
+ *                                        devices on a bus
+ * @bus: The PCI bus
+ *
+ * Claim the windows of the bridge upstream of @bus, if it is
+ * incoming-preserved, and the BARs of the incoming preserved devices on @bus,
+ * as programmed by the previous kernel. The PCI core calls this while
+ * scanning, after enumerating the devices on @bus and before scanning the
+ * buses below it, so that the resources of incoming devices are claimed before
+ * any resources are sized or assigned.
+ *
+ * Buses are scanned top-down and all bridges upstream of a preserved device
+ * are also preserved, so the windows that contain the resources of an incoming
+ * device are always claimed before the device's resources. Failing to claim a
+ * resource because something else has already claimed part of its range is
+ * fatal, since memory transactions still targeting the device may be
+ * corrupting it.
+ *
+ * This does nothing if the previous kernel did not preserve any devices.
+ */
+void pci_liveupdate_claim_bus_resources(struct pci_bus *bus)
+{
+	struct pci_dev *dev;
+	int i;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	if (!pci_liveupdate.had_incoming)
+		return;
+
+	if (bus->self && bus->self->liveupdate.incoming) {
+		if (!pci_liveupdate_windows_read(bus->self))
+			pci_read_bridge_bases(bus);
+
+		for (i = PCI_BRIDGE_RESOURCES;
+		     i <= PCI_BRIDGE_RESOURCE_END; i++)
+			pci_liveupdate_claim_resource(bus->self, i);
+	}
+
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		if (!dev->liveupdate.incoming)
+			continue;
+
+		for (i = 0; i < PCI_BRIDGE_RESOURCES; i++)
+			pci_liveupdate_claim_resource(dev, i);
+	}
 }
 
 /**
