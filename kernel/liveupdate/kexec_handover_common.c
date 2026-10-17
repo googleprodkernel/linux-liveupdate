@@ -19,8 +19,95 @@
 #include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
+#include <linux/vmalloc.h>
 
 #include "kexec_handover_internal.h"
+
+static unsigned int kho_flags_to_vmalloc(unsigned short kho_flags)
+{
+	unsigned int vm_flags = 0;
+
+	if (kho_flags & KHO_VMALLOC_ALLOC)
+		vm_flags |= VM_ALLOC;
+	if (kho_flags & KHO_VMALLOC_HUGE_VMAP)
+		vm_flags |= VM_ALLOW_HUGE_VMAP;
+
+	return vm_flags;
+}
+
+bool kho_vmalloc_validate(const struct kho_vmalloc *preservation,
+			  unsigned int *vm_flags)
+{
+	if (!preservation || !preservation->first.phys ||
+	    !PAGE_ALIGNED(preservation->first.phys) ||
+	    !preservation->total_pages)
+		return false;
+
+	if (preservation->order >= BITS_PER_LONG - PAGE_SHIFT ||
+	    (1UL << preservation->order) > preservation->total_pages ||
+	    !IS_ALIGNED(preservation->total_pages, 1UL << preservation->order))
+		return false;
+
+	if (preservation->flags & ~(KHO_VMALLOC_ALLOC | KHO_VMALLOC_HUGE_VMAP))
+		return false;
+
+	*vm_flags = kho_flags_to_vmalloc(preservation->flags);
+	return true;
+}
+
+/**
+ * kho_vmalloc_walk - Walk the chunk list of a preserved vmalloc region.
+ * @preservation: Validated KHO vmalloc preservation metadata.
+ * @ops:          Callbacks to acquire/release chunks and process each entry.
+ * @priv:         Caller context passed to @ops->entry.
+ *
+ * Traverses the linked list of struct kho_vmalloc_chunk pages starting from
+ * @preservation->first.phys, invoking @ops->entry for each contiguous physical
+ * range and verifying that non-terminal chunks are full and that the total
+ * number of pages matches @preservation->total_pages.
+ *
+ * Return: 0 on success, or a negative errno on failure.
+ */
+int kho_vmalloc_walk(const struct kho_vmalloc *preservation,
+		     const struct kho_vmalloc_walk_ops *ops, void *priv)
+{
+	unsigned long contig_pages = 1UL << preservation->order;
+	unsigned long total_pages = preservation->total_pages;
+	unsigned long nr_pages = 0;
+	phys_addr_t chunk_pa;
+
+	for (chunk_pa = preservation->first.phys; chunk_pa; ) {
+		const struct kho_vmalloc_chunk *chunk;
+		phys_addr_t next_pa;
+		unsigned int i;
+
+		chunk = ops->get_chunk(chunk_pa);
+		if (!chunk)
+			return -EINVAL;
+
+		for (i = 0; i < ARRAY_SIZE(chunk->phys) && chunk->phys[i]; i++) {
+			if (nr_pages + contig_pages > total_pages ||
+			    ops->entry(chunk->phys[i], priv))
+				goto err_put_chunk;
+
+			nr_pages += contig_pages;
+		}
+
+		next_pa = chunk->hdr.next.phys;
+		if (next_pa && i < ARRAY_SIZE(chunk->phys))
+			goto err_put_chunk;
+
+		ops->put_chunk(chunk);
+		chunk_pa = next_pa;
+		continue;
+
+err_put_chunk:
+		ops->put_chunk(chunk);
+		return -EINVAL;
+	}
+
+	return nr_pages == total_pages ? 0 : -EINVAL;
+}
 
 /**
  * kho_encode_radix_key - Encodes a physical address and order into a radix key.
@@ -176,7 +263,7 @@ phys_addr_t __init kho_get_mem_map_phys(const void *fdt)
  */
 int kho_retrieve_subtree(const char *name, phys_addr_t *phys, size_t *size)
 {
-	const void *fdt = kho_get_fdt();
+	const void *fdt = kho_is_ro() ? kho_ro_get_fdt() : kho_get_fdt();
 	const u64 *val;
 	int offset, len;
 

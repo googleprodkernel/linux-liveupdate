@@ -1195,10 +1195,6 @@ EXPORT_SYMBOL_GPL(kho_unpreserve_pages);
 /* vmalloc flags KHO supports */
 #define KHO_VMALLOC_SUPPORTED_FLAGS	(VM_ALLOC | VM_ALLOW_HUGE_VMAP)
 
-/* KHO internal flags for vmalloc preservations */
-#define KHO_VMALLOC_ALLOC	0x0001
-#define KHO_VMALLOC_HUGE_VMAP	0x0002
-
 static unsigned short vmalloc_flags_to_kho(unsigned int vm_flags)
 {
 	unsigned short kho_flags = 0;
@@ -1209,21 +1205,6 @@ static unsigned short vmalloc_flags_to_kho(unsigned int vm_flags)
 		kho_flags |= KHO_VMALLOC_HUGE_VMAP;
 
 	return kho_flags;
-}
-
-static unsigned int kho_flags_to_vmalloc(unsigned short kho_flags)
-{
-	unsigned int vm_flags = 0;
-
-	if (kho_flags & KHO_VMALLOC_ALLOC)
-		vm_flags |= VM_ALLOC;
-	if (kho_flags & KHO_VMALLOC_HUGE_VMAP)
-		vm_flags |= VM_ALLOW_HUGE_VMAP;
-
-	if (kho_flags & ~(KHO_VMALLOC_ALLOC | KHO_VMALLOC_HUGE_VMAP))
-		return ~KHO_VMALLOC_SUPPORTED_FLAGS;
-
-	return vm_flags;
 }
 
 static struct kho_vmalloc_chunk *new_vmalloc_chunk(struct kho_vmalloc_chunk *cur)
@@ -1351,6 +1332,48 @@ void kho_unpreserve_vmalloc(struct kho_vmalloc *preservation)
 }
 EXPORT_SYMBOL_GPL(kho_unpreserve_vmalloc);
 
+struct kho_vmalloc_restore_ctx {
+	struct page **pages;
+	unsigned long contig_pages;
+	unsigned long idx;
+};
+
+static const struct kho_vmalloc_chunk *kho_vmalloc_get_chunk(phys_addr_t pa)
+{
+	struct page *page = kho_restore_pages(pa, 1);
+
+	if (!page)
+		return NULL;
+
+	return page_to_virt(page);
+}
+
+static void kho_vmalloc_put_chunk(const struct kho_vmalloc_chunk *chunk)
+{
+	free_page((unsigned long)chunk);
+}
+
+static int kho_vmalloc_restore_entry(phys_addr_t pa, void *priv)
+{
+	struct kho_vmalloc_restore_ctx *ctx = priv;
+	struct page *page;
+
+	page = kho_restore_pages(pa, ctx->contig_pages);
+	if (!page)
+		return -EINVAL;
+
+	for (unsigned long j = 0; j < ctx->contig_pages; j++)
+		ctx->pages[ctx->idx++] = page + j;
+
+	return 0;
+}
+
+static const struct kho_vmalloc_walk_ops kho_vmalloc_restore_ops = {
+	.get_chunk = kho_vmalloc_get_chunk,
+	.put_chunk = kho_vmalloc_put_chunk,
+	.entry = kho_vmalloc_restore_entry,
+};
+
 /**
  * kho_restore_vmalloc - recreates and populates an area in vmalloc address
  * space from the preserved memory.
@@ -1363,18 +1386,16 @@ EXPORT_SYMBOL_GPL(kho_unpreserve_vmalloc);
  */
 void *kho_restore_vmalloc(const struct kho_vmalloc *preservation)
 {
-	struct kho_vmalloc_chunk *chunk = KHOSER_LOAD_PTR(preservation->first);
 	kasan_vmalloc_flags_t kasan_flags = KASAN_VMALLOC_PROT_NORMAL;
-	unsigned int align, order, shift, vm_flags;
-	unsigned long total_pages, contig_pages;
+	struct kho_vmalloc_restore_ctx ctx;
+	unsigned int order, shift, vm_flags;
+	unsigned long total_pages, align;
 	unsigned long addr, size;
 	struct vm_struct *area;
 	struct page **pages;
-	unsigned int idx = 0;
 	int err;
 
-	vm_flags = kho_flags_to_vmalloc(preservation->flags);
-	if (vm_flags & ~KHO_VMALLOC_SUPPORTED_FLAGS)
+	if (!kho_vmalloc_validate(preservation, &vm_flags))
 		return NULL;
 
 	total_pages = preservation->total_pages;
@@ -1382,37 +1403,15 @@ void *kho_restore_vmalloc(const struct kho_vmalloc *preservation)
 	if (!pages)
 		return NULL;
 	order = preservation->order;
-	contig_pages = (1 << order);
 	shift = PAGE_SHIFT + order;
-	align = 1 << shift;
+	align = 1UL << shift;
 
-	while (chunk) {
-		struct page *page;
+	ctx = (struct kho_vmalloc_restore_ctx){
+		.pages = pages,
+		.contig_pages = 1UL << order,
+	};
 
-		for (int i = 0; i < ARRAY_SIZE(chunk->phys) && chunk->phys[i]; i++) {
-			phys_addr_t phys = chunk->phys[i];
-
-			if (idx + contig_pages > total_pages)
-				goto err_free_pages_array;
-
-			page = kho_restore_pages(phys, contig_pages);
-			if (!page)
-				goto err_free_pages_array;
-
-			for (int j = 0; j < contig_pages; j++)
-				pages[idx++] = page + j;
-
-			phys += contig_pages * PAGE_SIZE;
-		}
-
-		page = kho_restore_pages(virt_to_phys(chunk), 1);
-		if (!page)
-			goto err_free_pages_array;
-		chunk = KHOSER_LOAD_PTR(chunk->hdr.next);
-		__free_page(page);
-	}
-
-	if (idx != total_pages)
+	if (kho_vmalloc_walk(preservation, &kho_vmalloc_restore_ops, &ctx))
 		goto err_free_pages_array;
 
 	area = __get_vm_area_node(total_pages * PAGE_SIZE, align, shift,

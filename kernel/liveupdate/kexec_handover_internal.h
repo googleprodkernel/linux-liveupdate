@@ -8,7 +8,21 @@
 #include <linux/list.h>
 #include <linux/types.h>
 
+/* KHO internal flags for vmalloc preservations */
+#define KHO_VMALLOC_ALLOC	0x0001
+#define KHO_VMALLOC_HUGE_VMAP	0x0002
+
+struct kho_vmalloc_walk_ops {
+	const struct kho_vmalloc_chunk *(*get_chunk)(phys_addr_t pa);
+	void (*put_chunk)(const struct kho_vmalloc_chunk *chunk);
+	int (*entry)(phys_addr_t pa, void *priv);
+};
+
 const void *kho_get_fdt(void);
+bool kho_vmalloc_validate(const struct kho_vmalloc *preservation,
+			  unsigned int *vm_flags);
+int kho_vmalloc_walk(const struct kho_vmalloc *preservation,
+		     const struct kho_vmalloc_walk_ops *ops, void *priv);
 unsigned long kho_encode_radix_key(phys_addr_t phys, unsigned int order);
 phys_addr_t kho_decode_radix_key(unsigned long key, unsigned int *order);
 unsigned long kho_radix_get_bitmap_index(unsigned long key);
