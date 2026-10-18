@@ -95,10 +95,13 @@ struct pci_dev_ser {
  *    window.
  *  * PCI_DEV_SER_PROBED_PREF_64_WINDOW: The bridge's prefetchable memory
  *    window is 64-bit.
+ *  * PCI_DEV_SER_PROBED_BROKEN_INTX_MASKING: INTx masking cannot be used on
+ *    the device, i.e. struct pci_dev::broken_intx_masking is set.
  */
 #define PCI_DEV_SER_PROBED_IO_WINDOW		BIT_ULL(0)
 #define PCI_DEV_SER_PROBED_PREF_WINDOW		BIT_ULL(1)
 #define PCI_DEV_SER_PROBED_PREF_64_WINDOW	BIT_ULL(2)
+#define PCI_DEV_SER_PROBED_BROKEN_INTX_MASKING	BIT_ULL(3)
 
 /*
  * The size of struct pci_dev_ser when this ABI was introduced. Since fields

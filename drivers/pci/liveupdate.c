@@ -216,6 +216,11 @@
  *    bridge implements), since that would disrupt memory transactions
  *    targeting the device or devices below it. Instead, the previous kernel
  *    passes the results of probing in struct pci_dev_ser.
+ *
+ *  * The PCI core does not enable INTx (i.e. clear PCI_COMMAND_INTX_DISABLE)
+ *    on incoming preserved devices, neither while probing whether INTx masking
+ *    works nor when the device is enabled, since the device could then raise
+ *    interrupts before its driver is ready to handle them.
  */
 
 #define pr_fmt(fmt) "PCI: liveupdate: " fmt
@@ -650,7 +655,11 @@ static void pci_liveupdate_save_bar_masks(struct pci_dev *dev,
 static void pci_liveupdate_preserve_probed(struct pci_dev *dev,
 					   struct pci_dev_ser *dev_ser)
 {
-	u64 supported = 0, probed = 0;
+	u64 supported = PCI_DEV_SER_PROBED_BROKEN_INTX_MASKING;
+	u64 probed = 0;
+
+	if (dev->broken_intx_masking)
+		probed |= PCI_DEV_SER_PROBED_BROKEN_INTX_MASKING;
 
 	if (dev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
 		supported |= PCI_DEV_SER_PROBED_WINDOWS;
@@ -1211,6 +1220,32 @@ int pci_liveupdate_read_bridge_windows(struct pci_dev *bridge)
 	bridge->pref_window = !!(probed & PCI_DEV_SER_PROBED_PREF_WINDOW);
 	bridge->pref_64_window = !!(probed & PCI_DEV_SER_PROBED_PREF_64_WINDOW);
 	return 0;
+}
+
+/**
+ * pci_liveupdate_intx_mask_broken() - Get whether INTx masking is broken on an
+ *                                     incoming device
+ * @dev: The PCI device
+ *
+ * Get whether INTx masking is broken on @dev as determined by the previous
+ * kernel, so that INTx masking does not need to be probed.
+ *
+ * Return: 1 if INTx masking is broken, 0 if it is not, or -ENODATA if @dev is
+ * not incoming-preserved or the previous kernel did not pass whether INTx
+ * masking is broken on @dev.
+ */
+int pci_liveupdate_intx_mask_broken(struct pci_dev *dev)
+{
+	u64 probed;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	if (!pci_liveupdate_read_probed(dev,
+					PCI_DEV_SER_PROBED_BROKEN_INTX_MASKING,
+					&probed))
+		return -ENODATA;
+
+	return !!probed;
 }
 
 /*

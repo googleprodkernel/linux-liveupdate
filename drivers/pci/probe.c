@@ -1976,6 +1976,16 @@ static u8 pci_hdr_type(struct pci_dev *dev)
 static int pci_intx_mask_broken(struct pci_dev *dev)
 {
 	u16 orig, toggle, new;
+	int ret;
+
+	/*
+	 * Toggling PCI_COMMAND_INTX_DISABLE could let a device preserved across
+	 * Live Update raise interrupts before its driver is ready, so use the
+	 * result determined by the previous kernel for those devices.
+	 */
+	ret = pci_liveupdate_intx_mask_broken(dev);
+	if (ret >= 0)
+		return ret;
 
 	pci_read_config_word(dev, PCI_COMMAND, &orig);
 	toggle = orig ^ PCI_COMMAND_INTX_DISABLE;

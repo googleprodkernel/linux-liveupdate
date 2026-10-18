@@ -2191,6 +2191,14 @@ static int do_pci_enable_device(struct pci_dev *dev, int bars)
 	if (dev->msi_enabled || dev->msix_enabled)
 		return 0;
 
+	/*
+	 * Leave INTx disabled on devices preserved across Live Update, since
+	 * the device could raise interrupts before its driver is ready. It is
+	 * up to the driver to enable INTx once it is ready.
+	 */
+	if (pci_liveupdate_is_incoming(dev))
+		return 0;
+
 	pci_read_config_byte(dev, PCI_INTERRUPT_PIN, &pin);
 	if (pin) {
 		pci_read_config_word(dev, PCI_COMMAND, &cmd);
