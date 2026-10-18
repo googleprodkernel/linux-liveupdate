@@ -311,6 +311,10 @@ static bool pdev_resource_assignable(struct pci_dev *dev, struct resource *res)
 	if (pci_resource_is_bridge_win(idx) && res->flags & IORESOURCE_DISABLED)
 		return false;
 
+	/* Devices preserved across Live Update keep their resources */
+	if (pci_liveupdate_is_incoming(dev))
+		return false;
+
 	return true;
 }
 
