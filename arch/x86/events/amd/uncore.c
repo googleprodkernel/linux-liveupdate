@@ -598,6 +598,8 @@ fail:
 	return -ENOMEM;
 }
 
+static DEFINE_MUTEX(amd_uncore_mutex);
+
 static void amd_uncore_ctx_move(struct amd_uncore *uncore, unsigned int cpu)
 {
 	struct amd_uncore_ctx *curr, *next;
@@ -610,11 +612,13 @@ static void amd_uncore_ctx_move(struct amd_uncore *uncore, unsigned int cpu)
 	for (i = 0; i < uncore->num_pmus; i++) {
 		pmu = &uncore->pmus[i];
 		curr = *per_cpu_ptr(pmu->ctx, cpu);
-		if (!curr)
+		if (!curr || curr->cpu != cpu)
 			continue;
 
 		/* Migrate to a shared sibling if possible */
 		for_each_online_cpu(j) {
+			if (cpu_dying(j))
+				continue;
 			next = *per_cpu_ptr(pmu->ctx, j);
 			if (!next || cpu == j)
 				continue;
@@ -648,6 +652,7 @@ static int amd_uncore_cpu_online(unsigned int cpu)
 	struct amd_uncore *uncore;
 	int i;
 
+	guard(mutex)(&amd_uncore_mutex);
 	for (i = 0; i < UNCORE_TYPE_MAX; i++) {
 		uncore = &uncores[i];
 		if (uncore->init(uncore, cpu))
@@ -662,6 +667,7 @@ static int amd_uncore_cpu_down_prepare(unsigned int cpu)
 	struct amd_uncore *uncore;
 	int i;
 
+	guard(mutex)(&amd_uncore_mutex);
 	for (i = 0; i < UNCORE_TYPE_MAX; i++) {
 		uncore = &uncores[i];
 		uncore->move(uncore, cpu);
@@ -675,6 +681,7 @@ static int amd_uncore_cpu_dead(unsigned int cpu)
 	struct amd_uncore *uncore;
 	int i;
 
+	guard(mutex)(&amd_uncore_mutex);
 	for (i = 0; i < UNCORE_TYPE_MAX; i++) {
 		uncore = &uncores[i];
 		uncore->free(uncore, cpu);

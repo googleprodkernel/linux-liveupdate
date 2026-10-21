@@ -1558,6 +1558,8 @@ static void uncore_change_context(struct intel_uncore_type **uncores,
 		uncore_change_type_ctx(*uncores, old_cpu, new_cpu);
 }
 
+static DEFINE_MUTEX(uncore_hotplug_mutex);
+
 static void uncore_box_unref(struct intel_uncore_type **types, int die)
 {
 	struct intel_uncore_type *type;
@@ -1570,7 +1572,7 @@ static void uncore_box_unref(struct intel_uncore_type **types, int die)
 		pmu = type->pmus;
 		for (i = 0; i < type->num_boxes; i++, pmu++) {
 			box = pmu->boxes[die];
-			if (box && box->cpu >= 0 &&
+			if (box && atomic_read(&box->refcnt) > 0 &&
 			    atomic_dec_return(&box->refcnt) == 0) {
 				if (uncore_box_active(box) &&
 				    atomic_dec_return(&pmu->activeboxes) == 0)
@@ -1585,6 +1587,8 @@ static int uncore_event_cpu_offline(unsigned int cpu)
 {
 	int die, target;
 
+	guard(mutex)(&uncore_hotplug_mutex);
+
 	/* Clear the references */
 	die = topology_logical_die_id(cpu);
 	uncore_box_unref(uncore_msr_uncores, die);
@@ -1595,7 +1599,7 @@ static int uncore_event_cpu_offline(unsigned int cpu)
 		return 0;
 
 	/* Find a new cpu to collect uncore events */
-	target = cpumask_any_but(topology_die_cpumask(cpu), cpu);
+	target = cpumask_any_andnot_but(topology_die_cpumask(cpu), cpu_dying_mask, cpu);
 
 	/* Migrate uncore events to the new target */
 	if (target < nr_cpu_ids)
@@ -1672,6 +1676,8 @@ static int uncore_box_ref(struct intel_uncore_type **types,
 static int uncore_event_cpu_online(unsigned int cpu)
 {
 	int die, target;
+
+	guard(mutex)(&uncore_hotplug_mutex);
 
 	die = topology_logical_die_id(cpu);
 	allocate_boxes(uncore_msr_uncores, die, cpu);

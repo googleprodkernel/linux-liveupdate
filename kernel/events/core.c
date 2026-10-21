@@ -15240,7 +15240,7 @@ static void perf_event_clear_cpumask(unsigned int cpu)
 
 		if (!cpumask_test_and_clear_cpu(cpu, pmu_cpumask))
 			continue;
-		target[scope] = cpumask_any_but(cpumask, cpu);
+		target[scope] = cpumask_any_andnot_but(cpumask, cpu_dying_mask, cpu);
 		if (target[scope] < nr_cpu_ids)
 			cpumask_set_cpu(target[scope], pmu_cpumask);
 	}
