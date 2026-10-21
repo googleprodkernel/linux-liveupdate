@@ -13,14 +13,17 @@
 #include <linux/cacheinfo.h>
 #include <linux/compiler.h>
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
 #include <linux/device.h>
 #include <linux/init.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/sched.h>
 #include <linux/sched/topology.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/sysfs.h>
+#include <linux/workqueue.h>
 
 /* pointer to per cpu cacheinfo */
 static DEFINE_PER_CPU(struct cpu_cacheinfo, ci_cpu_cacheinfo);
@@ -919,6 +922,8 @@ err_out:
 	return -ENOMEM;
 }
 
+static DEFINE_MUTEX(cache_map_mutex);
+
 static int cache_add_dev(unsigned int cpu)
 {
 	unsigned int i;
@@ -926,6 +931,9 @@ static int cache_add_dev(unsigned int cpu)
 	struct device *ci_dev, *parent;
 	struct cacheinfo *this_leaf;
 	const struct attribute_group **cache_groups;
+
+	if (cpumask_test_cpu(cpu, &cache_dev_map))
+		return 0;
 
 	rc = cpu_cache_sysfs_init(cpu);
 	if (unlikely(rc < 0))
@@ -1030,22 +1038,73 @@ static void update_per_cpu_data_slice_size(bool cpu_online, unsigned int cpu,
 	}
 }
 
+static cpumask_t cache_dev_pending_map;
+static DEFINE_SPINLOCK(cache_dev_pending_lock);
+
+static void cache_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		bool do_add = false;
+
+		scoped_guard(spinlock_irqsave, &cache_dev_pending_lock) {
+			if (cpumask_test_and_clear_cpu(cpu, &cache_dev_pending_map))
+				do_add = true;
+		}
+		if (!do_add)
+			continue;
+		cpus_read_lock();
+		if (cpu_online(cpu))
+			cache_add_dev(cpu);
+		cpus_read_unlock();
+	}
+}
+static DECLARE_DELAYED_WORK(cache_add_dev_work, cache_add_dev_work_fn);
+
 static int cacheinfo_cpu_online(unsigned int cpu)
 {
-	int rc = detect_cache_attributes(cpu);
+	struct cpu_cacheinfo *this_cpu_ci = get_cpu_cacheinfo(cpu);
+	int rc;
 	cpumask_t *cpu_map;
 
-	if (rc)
-		return rc;
-	rc = cache_add_dev(cpu);
-	if (rc)
-		goto err;
-	if (cpu_map_shared_cache(true, cpu, &cpu_map))
-		update_per_cpu_data_slice_size(true, cpu, cpu_map);
-	sched_update_llc_bytes(cpu);
+	if (!this_cpu_ci->cpu_map_populated) {
+		rc = init_level_allocate_ci(cpu);
+		if (rc)
+			return rc;
+		if (!last_level_cache_is_valid(cpu)) {
+			rc = populate_cache_leaves(cpu);
+			if (rc)
+				goto err;
+		}
+		scoped_guard(mutex, &cache_map_mutex) {
+			rc = cache_shared_cpu_map_setup(cpu);
+			if (rc) {
+				pr_warn("Unable to detect cache hierarchy for CPU %d\n", cpu);
+				free_cache_attributes(cpu);
+				return rc;
+			}
+			if (cpu_map_shared_cache(true, cpu, &cpu_map))
+				update_per_cpu_data_slice_size(true, cpu, cpu_map);
+			sched_update_llc_bytes(cpu);
+		}
+	}
+
+	if (!cpumask_test_cpu(cpu, &cache_dev_map)) {
+		if (cpuhp_in_batch()) {
+			scoped_guard(spinlock_irqsave, &cache_dev_pending_lock)
+				cpumask_set_cpu(cpu, &cache_dev_pending_map);
+			schedule_delayed_work(&cache_add_dev_work, HZ);
+		} else {
+			rc = cache_add_dev(cpu);
+			if (rc)
+				goto err;
+		}
+	}
 	return 0;
 err:
-	free_cache_attributes(cpu);
+	scoped_guard(mutex, &cache_map_mutex)
+		free_cache_attributes(cpu);
 	return rc;
 }
 
@@ -1054,15 +1113,22 @@ static int cacheinfo_cpu_pre_down(unsigned int cpu)
 	cpumask_t *cpu_map;
 	unsigned int nr_shared;
 
-	nr_shared = cpu_map_shared_cache(false, cpu, &cpu_map);
+	scoped_guard(spinlock_irqsave, &cache_dev_pending_lock)
+		cpumask_clear_cpu(cpu, &cache_dev_pending_map);
+
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
+
 	if (cpumask_test_and_clear_cpu(cpu, &cache_dev_map))
 		cpu_cache_sysfs_exit(cpu);
 
-	free_cache_attributes(cpu);
-	if (nr_shared > 1)
-		update_per_cpu_data_slice_size(false, cpu, cpu_map);
-
-	sched_update_llc_bytes(cpu);
+	scoped_guard(mutex, &cache_map_mutex) {
+		nr_shared = cpu_map_shared_cache(false, cpu, &cpu_map);
+		free_cache_attributes(cpu);
+		if (nr_shared > 1)
+			update_per_cpu_data_slice_size(false, cpu, cpu_map);
+		sched_update_llc_bytes(cpu);
+	}
 
 	return 0;
 }
