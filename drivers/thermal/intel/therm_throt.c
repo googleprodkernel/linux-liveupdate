@@ -27,6 +27,9 @@
 #include <linux/smp.h>
 #include <linux/sysfs.h>
 #include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
+#include <linux/cpu_preserve.h>
+#include <linux/workqueue.h>
 
 #include <asm/processor.h>
 #include <asm/thermal.h>
@@ -781,17 +784,44 @@ static void cleanup_directed_pkg_thermal_intr(void)
 	directed_intr_handler_cpus = NULL;
 }
 
+static cpumask_t therm_throt_dev_created_mask;
+
+static void therm_throt_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
+		if (!cpumask_test_and_set_cpu(cpu, &therm_throt_dev_created_mask)) {
+			struct device *dev = get_cpu_device(cpu);
+
+			if (dev)
+				thermal_throttle_add_dev(dev, cpu);
+		}
+	}
+	cpus_read_unlock();
+}
+
+static DECLARE_DELAYED_WORK(therm_throt_add_dev_work, therm_throt_add_dev_work_fn);
+
 /* Get notified when a cpu comes on/off. Be hotplug friendly. */
 static int thermal_throttle_online(unsigned int cpu)
 {
 	struct thermal_state *state = &per_cpu(thermal_state, cpu);
 	struct device *dev = get_cpu_device(cpu);
-	int err;
+	int err = 0;
 	u32 l;
 
-	err = thermal_throttle_add_dev(dev, cpu);
-	if (err)
-		return err;
+	if (!cpumask_test_cpu(cpu, &therm_throt_dev_created_mask)) {
+		if (cpuhp_in_batch()) {
+			schedule_delayed_work(&therm_throt_add_dev_work, HZ);
+		} else {
+			err = thermal_throttle_add_dev(dev, cpu);
+			if (err)
+				return err;
+			cpumask_set_cpu(cpu, &therm_throt_dev_created_mask);
+		}
+	}
 
 	state->package_throttle.level = PACKAGE_LEVEL;
 	state->core_throttle.level = CORE_LEVEL;
@@ -838,7 +868,10 @@ static int thermal_throttle_offline(unsigned int cpu)
 	state->package_throttle.rate_control_active = false;
 	state->core_throttle.rate_control_active = false;
 
-	thermal_throttle_remove_dev(dev);
+	if (!cpuhp_in_batch() && !cpu_is_preserved(cpu)) {
+		if (cpumask_test_and_clear_cpu(cpu, &therm_throt_dev_created_mask))
+			thermal_throttle_remove_dev(dev);
+	}
 	return 0;
 }
 

@@ -10,6 +10,9 @@
  */
 #include <linux/mm.h>
 #include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
+#include <linux/cpu_preserve.h>
+#include <linux/workqueue.h>
 #include <linux/module.h>
 #include <linux/hardirq.h>
 #include <linux/topology.h>
@@ -185,18 +188,31 @@ static const struct attribute_group topology_attr_group = {
 };
 
 /* Add/Remove cpu_topology interface for CPU device */
+static cpumask_t topology_dev_created_mask;
+
 static int topology_add_dev(unsigned int cpu)
 {
 	struct device *dev = get_cpu_device(cpu);
+	int ret;
 
-	return sysfs_create_group(&dev->kobj, &topology_attr_group);
+	if (cpumask_test_cpu(cpu, &topology_dev_created_mask))
+		return 0;
+
+	ret = sysfs_create_group(&dev->kobj, &topology_attr_group);
+	if (!ret)
+		cpumask_set_cpu(cpu, &topology_dev_created_mask);
+	return ret;
 }
 
 static int topology_remove_dev(unsigned int cpu)
 {
 	struct device *dev = get_cpu_device(cpu);
 
-	sysfs_remove_group(&dev->kobj, &topology_attr_group);
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
+
+	if (cpumask_test_and_clear_cpu(cpu, &topology_dev_created_mask))
+		sysfs_remove_group(&dev->kobj, &topology_attr_group);
 	return 0;
 }
 
@@ -228,6 +244,26 @@ static ssize_t cpu_capacity_show(struct device *dev,
 
 static DEVICE_ATTR_RO(cpu_capacity);
 
+static cpumask_t cpu_capacity_created_mask;
+
+static void cpu_capacity_add_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
+		if (!cpumask_test_and_set_cpu(cpu, &cpu_capacity_created_mask)) {
+			struct device *cpu_dev = get_cpu_device(cpu);
+
+			if (cpu_dev)
+				device_create_file(cpu_dev, &dev_attr_cpu_capacity);
+		}
+	}
+	cpus_read_unlock();
+}
+
+static DECLARE_DELAYED_WORK(cpu_capacity_add_work, cpu_capacity_add_work_fn);
+
 static int cpu_capacity_sysctl_add(unsigned int cpu)
 {
 	struct device *cpu_dev = get_cpu_device(cpu);
@@ -235,7 +271,16 @@ static int cpu_capacity_sysctl_add(unsigned int cpu)
 	if (!cpu_dev)
 		return -ENOENT;
 
+	if (cpumask_test_cpu(cpu, &cpu_capacity_created_mask))
+		return 0;
+
+	if (cpuhp_in_batch()) {
+		schedule_delayed_work(&cpu_capacity_add_work, HZ);
+		return 0;
+	}
+
 	device_create_file(cpu_dev, &dev_attr_cpu_capacity);
+	cpumask_set_cpu(cpu, &cpu_capacity_created_mask);
 
 	return 0;
 }
@@ -247,7 +292,11 @@ static int cpu_capacity_sysctl_remove(unsigned int cpu)
 	if (!cpu_dev)
 		return -ENOENT;
 
-	device_remove_file(cpu_dev, &dev_attr_cpu_capacity);
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
+
+	if (cpumask_test_and_clear_cpu(cpu, &cpu_capacity_created_mask))
+		device_remove_file(cpu_dev, &dev_attr_cpu_capacity);
 
 	return 0;
 }

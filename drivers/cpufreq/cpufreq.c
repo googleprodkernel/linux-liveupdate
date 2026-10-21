@@ -15,6 +15,9 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
+#include <linux/cpu_preserve.h>
+#include <linux/workqueue.h>
 #include <linux/cpufreq.h>
 #include <linux/cpu_cooling.h>
 #include <linux/delay.h>
@@ -2884,8 +2887,36 @@ EXPORT_SYMBOL_GPL(cpufreq_boost_enabled);
  *********************************************************************/
 static enum cpuhp_state hp_online;
 
+static void cpufreq_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	cpus_read_lock();
+	if (cpufreq_driver) {
+		for_each_online_cpu(cpu) {
+			struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu);
+
+			if (!policy || !cpumask_test_cpu(cpu, policy->cpus))
+				cpufreq_online(cpu);
+		}
+	}
+	cpus_read_unlock();
+}
+
+static DECLARE_DELAYED_WORK(cpufreq_add_dev_work, cpufreq_add_dev_work_fn);
+
 static int cpuhp_cpufreq_online(unsigned int cpu)
 {
+	struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu);
+
+	if (policy && cpumask_test_cpu(cpu, policy->cpus))
+		return 0;
+
+	if (cpuhp_in_batch()) {
+		schedule_delayed_work(&cpufreq_add_dev_work, HZ);
+		return 0;
+	}
+
 	cpufreq_online(cpu);
 
 	return 0;
@@ -2893,6 +2924,9 @@ static int cpuhp_cpufreq_online(unsigned int cpu)
 
 static int cpuhp_cpufreq_offline(unsigned int cpu)
 {
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
+
 	cpufreq_offline(cpu);
 
 	return 0;

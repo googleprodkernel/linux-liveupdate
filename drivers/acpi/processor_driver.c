@@ -17,6 +17,7 @@
 #include <linux/cpufreq.h>
 #include <linux/cpu.h>
 #include <linux/cpuidle.h>
+#include <linux/cpu_preserve.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
 
@@ -91,7 +92,7 @@ static void acpi_processor_notify(acpi_handle handle, u32 event, void *data)
 
 static int __acpi_processor_start(struct acpi_device *device);
 
-static int acpi_soft_cpu_online(unsigned int cpu)
+static int acpi_soft_cpu_online_one(unsigned int cpu)
 {
 	struct acpi_processor *pr = per_cpu(processors, cpu);
 	struct acpi_device *device;
@@ -122,9 +123,58 @@ static int acpi_soft_cpu_online(unsigned int cpu)
 	return 0;
 }
 
+static cpumask_t acpi_cpu_pending_map;
+static DEFINE_SPINLOCK(acpi_cpu_pending_lock);
+
+static void acpi_cpu_online_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		bool do_add = false;
+
+		scoped_guard(spinlock_irqsave, &acpi_cpu_pending_lock) {
+			if (cpumask_test_and_clear_cpu(cpu, &acpi_cpu_pending_map))
+				do_add = true;
+		}
+		if (!do_add)
+			continue;
+		cpus_read_lock();
+		if (cpu_online(cpu))
+			acpi_soft_cpu_online_one(cpu);
+		cpus_read_unlock();
+	}
+}
+static DECLARE_DELAYED_WORK(acpi_cpu_online_work, acpi_cpu_online_work_fn);
+
+static int acpi_soft_cpu_online(unsigned int cpu)
+{
+	struct acpi_processor *pr = per_cpu(processors, cpu);
+
+	if (!pr || !acpi_fetch_acpi_dev(pr->handle))
+		return 0;
+
+	if (cpuhp_in_batch()) {
+		if (!pr->flags.previously_online) {
+			scoped_guard(spinlock_irqsave, &acpi_cpu_pending_lock)
+				cpumask_set_cpu(cpu, &acpi_cpu_pending_map);
+			schedule_delayed_work(&acpi_cpu_online_work, HZ);
+		}
+		return 0;
+	}
+
+	return acpi_soft_cpu_online_one(cpu);
+}
+
 static int acpi_soft_cpu_dead(unsigned int cpu)
 {
 	struct acpi_processor *pr = per_cpu(processors, cpu);
+
+	scoped_guard(spinlock_irqsave, &acpi_cpu_pending_lock)
+		cpumask_clear_cpu(cpu, &acpi_cpu_pending_map);
+
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
 
 	if (!pr || !acpi_fetch_acpi_dev(pr->handle))
 		return 0;
