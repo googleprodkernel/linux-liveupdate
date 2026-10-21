@@ -3315,6 +3315,7 @@ int kvm_apic_get_state(struct kvm_vcpu *vcpu, struct kvm_lapic_state *s)
 int kvm_apic_set_state(struct kvm_vcpu *vcpu, struct kvm_lapic_state *s)
 {
 	struct kvm_lapic *apic = vcpu->arch.apic;
+	bool map_changed;
 	int r;
 
 	kvm_x86_call(apicv_pre_state_restore)(vcpu);
@@ -3327,9 +3328,13 @@ int kvm_apic_set_state(struct kvm_vcpu *vcpu, struct kvm_lapic_state *s)
 		kvm_recalculate_apic_map(vcpu->kvm);
 		return r;
 	}
+	map_changed = memcmp(apic->regs + APIC_ID, s->regs + APIC_ID, sizeof(u32)) ||
+		      memcmp(apic->regs + APIC_LDR, s->regs + APIC_LDR, sizeof(u32)) ||
+		      memcmp(apic->regs + APIC_DFR, s->regs + APIC_DFR, sizeof(u32));
 	memcpy(vcpu->arch.apic->regs, s->regs, sizeof(*s));
 
-	atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
+	if (map_changed)
+		atomic_set_release(&apic->vcpu->kvm->arch.apic_map_dirty, DIRTY);
 	kvm_recalculate_apic_map(vcpu->kvm);
 	kvm_apic_set_version(vcpu);
 
