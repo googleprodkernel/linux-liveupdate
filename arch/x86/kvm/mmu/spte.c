@@ -124,7 +124,8 @@ static bool __kvm_is_mmio_pfn(kvm_pfn_t pfn)
 
 	return !e820__mapped_raw_any(pfn_to_hpa(pfn),
 				     pfn_to_hpa(pfn + 1) - 1,
-				     E820_TYPE_RAM);
+				     E820_TYPE_RAM) &&
+		(!pat_enabled() || pat_pfn_immune_to_uc_mtrr(pfn));
 }
 
 static bool kvm_is_mmio_pfn(kvm_pfn_t pfn, int *is_host_mmio)
