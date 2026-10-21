@@ -39,13 +39,10 @@ int kvm_arch_vm_luo_preserve(struct kvm *kvm, struct kvm_luo_ser *ser)
 	return 0;
 }
 
-int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
+static int kvm_arch_vcpu_luo_check_preconditions(struct kvm_vcpu *vcpu,
+						 unsigned int *max_msrs_out)
 {
-	struct kvm_vcpu_arch_ser *state;
-	struct kvm_cpuid2 *cpuid;
-	struct kvm_msrs *msrs;
 	unsigned int max_msrs;
-	size_t size;
 	int ret;
 
 	/*
@@ -98,11 +95,18 @@ int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
 	max_msrs = kvm_num_msrs_to_save();
 	if (max_msrs > KVM_X86_SER_MAX_MSRS)
 		return -E2BIG;
-	size = sizeof(*state) + struct_size(msrs, entries, max_msrs) +
-	       struct_size(cpuid, entries, KVM_MAX_CPUID_ENTRIES);
-	state = kho_alloc_preserve(size);
-	if (IS_ERR(state))
-		return PTR_ERR(state);
+
+	*max_msrs_out = max_msrs;
+	return 0;
+}
+
+static int kvm_arch_vcpu_luo_save_state(struct kvm_vcpu *vcpu,
+					struct kvm_vcpu_arch_ser *state,
+					phys_addr_t state_phys)
+{
+	struct kvm_cpuid2 *cpuid;
+	struct kvm_msrs *msrs;
+	int ret;
 
 	/*
 	 * kvm_arch_vcpu_ioctl_{get,set}_mpstate() take the vCPU themselves, so
@@ -114,7 +118,7 @@ int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
 	 */
 	ret = kvm_arch_vcpu_ioctl_get_mpstate(vcpu, &state->mp_state);
 	if (ret)
-		goto err_free;
+		return ret;
 	state->pad = 0;
 	memset(state->pad_xsave, 0, sizeof(state->pad_xsave));
 
@@ -136,10 +140,15 @@ int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
 	if (ret)
 		goto err_put;
 
-	if (vcpu->vcpu_id == 0)
+	if (vcpu->vcpu_id == 0) {
 		kvm_get_clock(vcpu->kvm, &state->clock);
-	else
+		if (kho_is_ro()) {
+			state->clock.flags &= ~KVM_CLOCK_REALTIME;
+			state->clock.realtime = 0;
+		}
+	} else {
 		memset(&state->clock, 0, sizeof(state->clock));
+	}
 
 	kvm_vcpu_ioctl_x86_get_vcpu_events(vcpu, &state->events);
 
@@ -165,49 +174,78 @@ int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
 
 	msrs = (void *)(state + 1);
 	kvm_msrs_save(vcpu, msrs);
-	KHOSER_STORE_PTR(state->msrs, msrs);
+	state->msrs.phys = state_phys + ((void *)msrs - (void *)state);
 
 	cpuid = (void *)&msrs->entries[msrs->nmsrs];
 	kvm_get_cpuid(vcpu, cpuid);
-	KHOSER_STORE_PTR(state->cpuid, cpuid);
+	state->cpuid.phys = state_phys + ((void *)cpuid - (void *)state);
 
 	vcpu_put(vcpu);
-
-	KHOSER_STORE_PTR(ser->arch_state, state);
-
 	return 0;
 
 err_put:
 	vcpu_put(vcpu);
-err_free:
-	kho_unpreserve_free(state);
 	return ret;
 }
 
-int kvm_arch_vcpu_luo_retrieve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
+int kvm_arch_vcpu_luo_preserve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
 {
 	struct kvm_vcpu_arch_ser *state;
 	struct kvm_cpuid2 *cpuid;
 	struct kvm_msrs *msrs;
+	unsigned int max_msrs;
+	size_t size;
 	int ret;
 
-	if (!ser->arch_state.phys)
-		return -EINVAL;
+	ret = kvm_arch_vcpu_luo_check_preconditions(vcpu, &max_msrs);
+	if (ret)
+		return ret;
 
-	state = KHOSER_LOAD_PTR(ser->arch_state);
+	size = sizeof(*state) + struct_size(msrs, entries, max_msrs) +
+	       struct_size(cpuid, entries, KVM_MAX_CPUID_ENTRIES);
+	state = kho_alloc_preserve(size);
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+
+	ret = kvm_arch_vcpu_luo_save_state(vcpu, state, virt_to_phys(state));
+	if (ret) {
+		kho_unpreserve_free(state);
+		return ret;
+	}
+
+	KHOSER_STORE_PTR(ser->arch_state, state);
+	return 0;
+}
+
+static int kvm_arch_vcpu_luo_restore_state(struct kvm_vcpu *vcpu,
+					   struct kvm_vcpu_arch_ser *state,
+					   phys_addr_t state_phys)
+{
+	struct kvm_cpuid2 *cpuid = NULL;
+	struct kvm_msrs *msrs;
+	int ret;
+
 	if (state->pad ||
 	    memchr_inv(state->pad_xsave, 0, sizeof(state->pad_xsave)))
 		return -EINVAL;
 
-	msrs = KHOSER_LOAD_PTR(state->msrs);
-	cpuid = KHOSER_LOAD_PTR(state->cpuid);
-	if (!msrs || msrs != (struct kvm_msrs *)(state + 1) ||
-	    msrs->pad || msrs->nmsrs > KVM_X86_SER_MAX_MSRS)
+	if (!state->msrs.phys ||
+	    state->msrs.phys != state_phys + sizeof(*state))
 		return -EINVAL;
-	if (cpuid &&
-	    (cpuid != (struct kvm_cpuid2 *)&msrs->entries[msrs->nmsrs] ||
-	     cpuid->padding || cpuid->nent > KVM_MAX_CPUID_ENTRIES))
+	msrs = (struct kvm_msrs *)(state + 1);
+	if (msrs->pad || msrs->nmsrs > KVM_X86_SER_MAX_MSRS)
 		return -EINVAL;
+
+	if (state->cpuid.phys) {
+		size_t cpuid_off = (void *)&msrs->entries[msrs->nmsrs] -
+				   (void *)state;
+
+		if (state->cpuid.phys != state_phys + cpuid_off)
+			return -EINVAL;
+		cpuid = (struct kvm_cpuid2 *)&msrs->entries[msrs->nmsrs];
+		if (cpuid->padding || cpuid->nent > KVM_MAX_CPUID_ENTRIES)
+			return -EINVAL;
+	}
 
 	vcpu_load(vcpu);
 
@@ -288,6 +326,65 @@ out:
 
 	return ret;
 }
+
+int kvm_arch_vcpu_luo_retrieve(struct kvm_vcpu *vcpu, struct kvm_vcpu_ser *ser)
+{
+	struct kvm_vcpu_arch_ser *state;
+
+	if (!ser->arch_state.phys)
+		return -EINVAL;
+
+	state = KHOSER_LOAD_PTR(ser->arch_state);
+	return kvm_arch_vcpu_luo_restore_state(vcpu, state,
+					       ser->arch_state.phys);
+}
+
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+int kvm_arch_vcpu_luo_preserve_ro(struct kvm_vcpu *vcpu,
+				  const struct kvm_vcpu_ser *ser)
+{
+	struct kvm_vcpu_arch_ser *state;
+	unsigned int max_msrs;
+	int ret;
+
+	if (!ser->arch_state.phys)
+		return -EINVAL;
+
+	ret = kvm_arch_vcpu_luo_check_preconditions(vcpu, &max_msrs);
+	if (ret)
+		return ret;
+
+	state = vcpu->luo_ro_arch_state ?: kho_ro_map_folio(ser->arch_state.phys,
+							    PAGE_KERNEL);
+	if (!state)
+		return -EINVAL;
+	vcpu->luo_ro_arch_state = state;
+
+	return kvm_arch_vcpu_luo_save_state(vcpu, state, ser->arch_state.phys);
+}
+
+int kvm_arch_vcpu_luo_retrieve_ro(struct kvm_vcpu *vcpu,
+				  const struct kvm_vcpu_ser *ser)
+{
+	struct kvm_vcpu_arch_ser *state;
+
+	if (!ser->arch_state.phys)
+		return -EINVAL;
+
+	/*
+	 * Map read-write because kvm_vcpu_ioctl_x86_set_sregs2() ->
+	 * set_sregs_common() updates sregs->cs.unusable in place.
+	 */
+	state = vcpu->luo_ro_arch_state ?: kho_ro_map_folio(ser->arch_state.phys,
+							    PAGE_KERNEL);
+	if (!state)
+		return -EINVAL;
+	vcpu->luo_ro_arch_state = state;
+
+	return kvm_arch_vcpu_luo_restore_state(vcpu, state,
+					       ser->arch_state.phys);
+}
+#endif /* CONFIG_KEXEC_HANDOVER_READONLY */
 
 void kvm_arch_vcpu_luo_unpreserve(struct kvm_vcpu_ser *ser)
 {
