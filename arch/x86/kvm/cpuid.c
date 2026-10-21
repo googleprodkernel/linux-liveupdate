@@ -538,6 +538,17 @@ int kvm_set_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid_entry2 *e2,
 	BUILD_BUG_ON(sizeof(vcpu_caps) != sizeof(vcpu->arch.cpu_caps));
 
 	/*
+	 * Fast path: if CPUID entries were already pre-configured and are
+	 * unchanged (either byte-for-byte via memcmp or after normalizing
+	 * runtime/PV dynamic bits), skip the expensive kvm_vcpu_after_set_cpuid()
+	 * rebuild and preserve pre-faulted MMU state.
+	 */
+	if (nent && vcpu->arch.cpuid_nent == nent &&
+	    (!memcmp(vcpu->arch.cpuid_entries, e2, nent * sizeof(*e2)) ||
+	     !kvm_cpuid_check_equal(vcpu, e2, nent)))
+		goto success;
+
+	/*
 	 * KVM does not correctly handle changing guest CPUID after KVM_RUN or
 	 * while L2 is active, as MAXPHYADDR, GBPAGES support, AMD reserved bit
 	 * behavior, etc. aren't tracked in kvm_mmu_page_role, and L2 state
