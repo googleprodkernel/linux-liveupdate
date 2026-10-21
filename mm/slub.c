@@ -28,6 +28,8 @@
 #include <linux/node.h>
 #include <linux/kmsan.h>
 #include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
+#include <linux/cpu_preserve.h>
 #include <linux/cpuset.h>
 #include <linux/mempolicy.h>
 #include <linux/ctype.h>
@@ -4249,6 +4251,9 @@ out:
 static int slub_cpu_dead(unsigned int cpu)
 {
 	struct kmem_cache *s;
+
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
 
 	mutex_lock(&slab_mutex);
 	list_for_each_entry(s, &slab_caches, list) {

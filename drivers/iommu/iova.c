@@ -12,6 +12,7 @@
 #include <linux/smp.h>
 #include <linux/bitops.h>
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
 #include <linux/workqueue.h>
 
 /* The anchor node sits above the top of the usable address space */
@@ -944,6 +945,9 @@ static void free_global_cached_iovas(struct iova_domain *iovad)
 static int iova_cpuhp_dead(unsigned int cpu, struct hlist_node *node)
 {
 	struct iova_domain *iovad;
+
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
 
 	iovad = hlist_entry_safe(node, struct iova_domain, cpuhp_dead);
 
