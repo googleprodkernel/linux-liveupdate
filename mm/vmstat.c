@@ -2207,14 +2207,40 @@ static void __init init_cpu_node_state(void)
 	}
 }
 
+static DEFINE_MUTEX(vmstat_hotplug_mutex);
+static int vmstat_cpuhp_batch_depth;
+static bool vmstat_cpuhp_batch_dirty;
+
+void vmstat_cpuhp_batch_begin(void)
+{
+	guard(mutex)(&vmstat_hotplug_mutex);
+	vmstat_cpuhp_batch_depth++;
+}
+
+void vmstat_cpuhp_batch_end(void)
+{
+	guard(mutex)(&vmstat_hotplug_mutex);
+	if (WARN_ON_ONCE(vmstat_cpuhp_batch_depth <= 0))
+		return;
+	if (--vmstat_cpuhp_batch_depth > 0 || !vmstat_cpuhp_batch_dirty)
+		return;
+	vmstat_cpuhp_batch_dirty = false;
+	if (vmstat_late_init_done)
+		refresh_zone_stat_thresholds();
+}
+
 static int vmstat_cpu_online(unsigned int cpu)
 {
-	if (vmstat_late_init_done)
+	mutex_lock(&vmstat_hotplug_mutex);
+	if (vmstat_cpuhp_batch_depth > 0)
+		vmstat_cpuhp_batch_dirty = true;
+	else if (vmstat_late_init_done)
 		refresh_zone_stat_thresholds();
 
 	if (!node_state(cpu_to_node(cpu), N_CPU)) {
 		node_set_state(cpu_to_node(cpu), N_CPU);
 	}
+	mutex_unlock(&vmstat_hotplug_mutex);
 	enable_delayed_work(&per_cpu(vmstat_work, cpu));
 
 	return 0;
@@ -2233,7 +2259,11 @@ static int vmstat_cpu_dead(unsigned int cpu)
 
 	node = cpu_to_node(cpu);
 
-	refresh_zone_stat_thresholds();
+	guard(mutex)(&vmstat_hotplug_mutex);
+	if (vmstat_cpuhp_batch_depth > 0)
+		vmstat_cpuhp_batch_dirty = true;
+	else
+		refresh_zone_stat_thresholds();
 	node_cpus = cpumask_of_node(node);
 	if (!cpumask_empty(node_cpus))
 		return 0;

@@ -9,6 +9,7 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  */
+#include <linux/cpu.h>
 #include <linux/interrupt.h>
 #include <linux/ratelimit.h>
 #include <linux/irq.h>
@@ -226,6 +227,54 @@ static void irq_restore_affinity_of_irq(struct irq_desc *desc, unsigned int cpu)
 		irq_set_affinity_locked(data, affinity, false);
 }
 
+static DEFINE_MUTEX(irq_cpuhp_batch_mutex);
+static int irq_cpuhp_batch_depth;
+static cpumask_t irq_cpuhp_batch_online_cpus;
+
+void irq_affinity_cpuhp_batch_begin(void)
+{
+	guard(mutex)(&irq_cpuhp_batch_mutex);
+	if (irq_cpuhp_batch_depth++ == 0)
+		cpumask_clear(&irq_cpuhp_batch_online_cpus);
+}
+
+void irq_affinity_cpuhp_batch_end(void)
+{
+	struct irq_desc *desc;
+	unsigned int irq;
+	cpumask_t cpus;
+
+	scoped_guard(mutex, &irq_cpuhp_batch_mutex) {
+		if (WARN_ON_ONCE(irq_cpuhp_batch_depth <= 0))
+			return;
+		if (--irq_cpuhp_batch_depth > 0 ||
+		    cpumask_empty(&irq_cpuhp_batch_online_cpus))
+			return;
+		cpumask_copy(&cpus, &irq_cpuhp_batch_online_cpus);
+		cpumask_clear(&irq_cpuhp_batch_online_cpus);
+	}
+
+	irq_lock_sparse();
+	for_each_active_irq(irq) {
+		struct irq_data *data;
+		const struct cpumask *affinity;
+		unsigned int cpu;
+
+		desc = irq_to_desc(irq);
+		scoped_guard(raw_spinlock_irq, &desc->lock) {
+			data = irq_desc_get_irq_data(desc);
+			if (!irqd_affinity_is_managed(data) || !desc->action ||
+			    !irq_data_get_irq_chip(data))
+				continue;
+			affinity = irq_data_get_affinity_mask(data);
+			cpu = cpumask_first_and(&cpus, affinity);
+			if (cpu < nr_cpu_ids)
+				irq_restore_affinity_of_irq(desc, cpu);
+		}
+	}
+	irq_unlock_sparse();
+}
+
 /**
  * irq_affinity_online_cpu - Restore affinity for managed interrupts
  * @cpu:	Upcoming CPU for which interrupts should be restored
@@ -234,6 +283,13 @@ int irq_affinity_online_cpu(unsigned int cpu)
 {
 	struct irq_desc *desc;
 	unsigned int irq;
+
+	scoped_guard(mutex, &irq_cpuhp_batch_mutex) {
+		if (irq_cpuhp_batch_depth > 0) {
+			cpumask_set_cpu(cpu, &irq_cpuhp_batch_online_cpus);
+			return 0;
+		}
+	}
 
 	irq_lock_sparse();
 	for_each_active_irq(irq) {

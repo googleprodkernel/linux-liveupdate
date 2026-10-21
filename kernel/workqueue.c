@@ -6946,11 +6946,102 @@ int workqueue_prepare_cpu(unsigned int cpu)
 	return 0;
 }
 
+static int wq_cpuhp_batch_depth;
+static cpumask_t wq_cpuhp_batch_cpus;
+static bool wq_cpuhp_batch_has_online;
+
+void workqueue_cpuhp_batch_begin(void)
+{
+	mutex_lock(&wq_pool_mutex);
+	if (wq_cpuhp_batch_depth++ == 0) {
+		cpumask_clear(&wq_cpuhp_batch_cpus);
+		wq_cpuhp_batch_has_online = false;
+	}
+	mutex_unlock(&wq_pool_mutex);
+}
+
+void workqueue_cpuhp_batch_end(void)
+{
+	struct worker_pool *pool;
+	struct workqueue_struct *wq;
+	int pi;
+
+	mutex_lock(&wq_pool_mutex);
+	if (WARN_ON_ONCE(wq_cpuhp_batch_depth <= 0)) {
+		mutex_unlock(&wq_pool_mutex);
+		return;
+	}
+	if (--wq_cpuhp_batch_depth > 0 ||
+	    cpumask_empty(&wq_cpuhp_batch_cpus)) {
+		mutex_unlock(&wq_pool_mutex);
+		return;
+	}
+
+	if (wq_cpuhp_batch_has_online) {
+		for_each_pool(pool, pi) {
+			if ((pool->flags & POOL_BH) || pool->cpu >= 0)
+				continue;
+			if (!cpumask_intersects(&wq_cpuhp_batch_cpus,
+						pool->attrs->cpumask))
+				continue;
+			mutex_lock(&wq_pool_attach_mutex);
+			restore_unbound_workers_cpumask(pool,
+				cpumask_first_and(&wq_cpuhp_batch_cpus,
+						  pool->attrs->cpumask));
+			mutex_unlock(&wq_pool_attach_mutex);
+		}
+	}
+
+	list_for_each_entry(wq, &workqueues, list) {
+		struct workqueue_attrs *attrs = wq->attrs;
+
+		if (wq->flags & WQ_UNBOUND) {
+			const struct wq_pod_type *pt = wqattrs_pod_type(attrs);
+			int pod;
+
+			for (pod = 0; pod < pt->nr_pods; pod++) {
+				int tcpu;
+
+				if (!cpumask_intersects(&wq_cpuhp_batch_cpus,
+							pt->pod_cpus[pod]))
+					continue;
+				for_each_cpu(tcpu, pt->pod_cpus[pod])
+					unbound_wq_update_pwq(wq, tcpu);
+			}
+
+			mutex_lock(&wq->mutex);
+			wq_update_node_max_active(wq, -1);
+			mutex_unlock(&wq->mutex);
+		}
+	}
+
+	cpumask_clear(&wq_cpuhp_batch_cpus);
+	wq_cpuhp_batch_has_online = false;
+	mutex_unlock(&wq_pool_mutex);
+}
+
 int workqueue_online_cpu(unsigned int cpu)
 {
 	struct worker_pool *pool;
 	struct workqueue_struct *wq;
 	int pi;
+
+	if (READ_ONCE(wq_cpuhp_batch_depth) > 0) {
+		for_each_cpu_worker_pool(pool, cpu) {
+			if (pool->flags & POOL_BH)
+				continue;
+			mutex_lock(&wq_pool_attach_mutex);
+			rebind_workers(pool);
+			mutex_unlock(&wq_pool_attach_mutex);
+		}
+
+		mutex_lock(&wq_pool_mutex);
+		cpumask_set_cpu(cpu, wq_online_cpumask);
+		cpumask_set_cpu(cpu, &wq_cpuhp_batch_cpus);
+		wq_cpuhp_batch_has_online = true;
+		mutex_unlock(&wq_pool_mutex);
+		return 0;
+	}
 
 	mutex_lock(&wq_pool_mutex);
 
@@ -6999,6 +7090,14 @@ int workqueue_offline_cpu(unsigned int cpu)
 		return -1;
 
 	unbind_workers(cpu);
+
+	if (READ_ONCE(wq_cpuhp_batch_depth) > 0) {
+		mutex_lock(&wq_pool_mutex);
+		cpumask_clear_cpu(cpu, wq_online_cpumask);
+		cpumask_set_cpu(cpu, &wq_cpuhp_batch_cpus);
+		mutex_unlock(&wq_pool_mutex);
+		return 0;
+	}
 
 	/* update pod affinity of unbound workqueues */
 	mutex_lock(&wq_pool_mutex);

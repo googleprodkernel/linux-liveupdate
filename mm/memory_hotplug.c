@@ -1320,6 +1320,9 @@ int try_online_node(int nid)
 {
 	int ret;
 
+	if (node_online(nid))
+		return 0;
+
 	mem_hotplug_begin();
 	ret =  __try_online_node(nid, true);
 	mem_hotplug_done();

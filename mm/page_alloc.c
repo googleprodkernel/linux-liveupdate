@@ -6460,6 +6460,28 @@ void free_reserved_pages(struct page *page, unsigned int order)
 }
 EXPORT_SYMBOL(free_reserved_pages);
 
+static int page_alloc_cpuhp_batch_depth;
+static bool page_alloc_cpuhp_batch_dirty;
+
+void page_alloc_cpuhp_batch_begin(void)
+{
+	page_alloc_cpuhp_batch_depth++;
+}
+
+void page_alloc_cpuhp_batch_end(void)
+{
+	struct zone *zone;
+
+	if (WARN_ON_ONCE(page_alloc_cpuhp_batch_depth <= 0))
+		return;
+	if (--page_alloc_cpuhp_batch_depth > 0 || !page_alloc_cpuhp_batch_dirty)
+		return;
+
+	page_alloc_cpuhp_batch_dirty = false;
+	for_each_populated_zone(zone)
+		zone_pcp_update(zone, 0);
+}
+
 static int page_alloc_cpu_dead(unsigned int cpu)
 {
 	struct zone *zone;
@@ -6485,6 +6507,11 @@ static int page_alloc_cpu_dead(unsigned int cpu)
 	 */
 	cpu_vm_stats_fold(cpu);
 
+	if (READ_ONCE(page_alloc_cpuhp_batch_depth) > 0) {
+		WRITE_ONCE(page_alloc_cpuhp_batch_dirty, true);
+		return 0;
+	}
+
 	for_each_populated_zone(zone)
 		zone_pcp_update(zone, 0);
 
@@ -6494,6 +6521,11 @@ static int page_alloc_cpu_dead(unsigned int cpu)
 static int page_alloc_cpu_online(unsigned int cpu)
 {
 	struct zone *zone;
+
+	if (READ_ONCE(page_alloc_cpuhp_batch_depth) > 0) {
+		WRITE_ONCE(page_alloc_cpuhp_batch_dirty, true);
+		return 0;
+	}
 
 	for_each_populated_zone(zone)
 		zone_pcp_update(zone, 1);
