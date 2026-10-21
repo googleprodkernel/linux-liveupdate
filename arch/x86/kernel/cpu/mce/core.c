@@ -46,6 +46,7 @@
 #include <linux/hardirq.h>
 #include <linux/kexec.h>
 #include <linux/vmcore_info.h>
+#include <linux/cpu_preserve.h>
 
 #include <asm/fred.h>
 #include <asm/cpu_device_id.h>
@@ -1875,6 +1876,9 @@ static void __mcheck_cpu_init_prepare_banks(void)
 	u64 msrval;
 	int i;
 
+	if (cpuhp_in_batch())
+		return;
+
 	/*
 	 * Log the machine checks left over from the previous reset. Log them
 	 * only, do not start processing them. That will happen in mcheck_late_init()
@@ -2730,6 +2734,9 @@ static void mce_disable_cpu(void)
 	if (!mce_available(raw_cpu_ptr(&cpu_info)))
 		return;
 
+	if (cpuhp_in_batch() || cpu_is_preserved(raw_smp_processor_id()))
+		return;
+
 	if (!cpuhp_tasks_frozen)
 		cmci_clear();
 
@@ -2742,6 +2749,9 @@ static void mce_reenable_cpu(void)
 	int i;
 
 	if (!mce_available(raw_cpu_ptr(&cpu_info)))
+		return;
+
+	if (cpuhp_in_batch())
 		return;
 
 	if (!cpuhp_tasks_frozen)
@@ -2762,12 +2772,44 @@ static int mce_cpu_dead(unsigned int cpu)
 	return 0;
 }
 
+static cpumask_t mce_dev_pending_map;
+static DEFINE_SPINLOCK(mce_dev_pending_lock);
+
+static void mce_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		bool do_add = false;
+
+		scoped_guard(spinlock_irqsave, &mce_dev_pending_lock) {
+			if (cpumask_test_and_clear_cpu(cpu, &mce_dev_pending_map))
+				do_add = true;
+		}
+		if (!do_add)
+			continue;
+		cpus_read_lock();
+		if (cpu_online(cpu)) {
+			mce_device_create(cpu);
+			mce_threshold_create_device(cpu);
+		}
+		cpus_read_unlock();
+	}
+}
+static DECLARE_DELAYED_WORK(mce_add_dev_work, mce_add_dev_work_fn);
+
 static int mce_cpu_online(unsigned int cpu)
 {
 	struct timer_list *t = this_cpu_ptr(&mce_timer);
 
-	mce_device_create(cpu);
-	mce_threshold_create_device(cpu);
+	if (cpuhp_in_batch() && !per_cpu(mce_device, cpu)) {
+		scoped_guard(spinlock_irqsave, &mce_dev_pending_lock)
+			cpumask_set_cpu(cpu, &mce_dev_pending_map);
+		schedule_delayed_work(&mce_add_dev_work, HZ);
+	} else {
+		mce_device_create(cpu);
+		mce_threshold_create_device(cpu);
+	}
 	mce_reenable_cpu();
 	mce_start_timer(t);
 	return 0;
@@ -2777,10 +2819,15 @@ static int mce_cpu_pre_down(unsigned int cpu)
 {
 	struct timer_list *t = this_cpu_ptr(&mce_timer);
 
+	scoped_guard(spinlock_irqsave, &mce_dev_pending_lock)
+		cpumask_clear_cpu(cpu, &mce_dev_pending_map);
+
 	mce_disable_cpu();
 	timer_delete_sync(t);
-	mce_threshold_remove_device(cpu);
-	mce_device_remove(cpu);
+	if (!cpu_is_preserved(cpu)) {
+		mce_threshold_remove_device(cpu);
+		mce_device_remove(cpu);
+	}
 	return 0;
 }
 

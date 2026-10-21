@@ -41,8 +41,10 @@
  * owned by the offlined cpu.
  */
 static DEFINE_PER_CPU(mce_banks_t, mce_banks_owned);
+static DEFINE_PER_CPU(bool, cmci_initialized);
 static mce_banks_t cmci_orphaned_banks;
 static unsigned int cmci_orphaned_target;
+static int cmci_discover_defer_depth;
 
 /*
  * cmci_discover_lock protects against parallel discovery attempts
@@ -352,8 +354,10 @@ void cmci_clear(void)
 
 	if (!cmci_supported(&banks))
 		return;
+	__this_cpu_write(cmci_initialized, false);
 	raw_spin_lock_irqsave(&cmci_discover_lock, flags);
-	bitmap_zero(cmci_orphaned_banks, MAX_NR_BANKS);
+	if (!cmci_discover_defer_depth)
+		bitmap_zero(cmci_orphaned_banks, MAX_NR_BANKS);
 	/*
 	 * A bank is shared by the CPUs of one SMT core, L2 cluster, die or
 	 * package, and these scopes nest. The first online peer found from
@@ -373,11 +377,13 @@ void cmci_clear(void)
 	cmci_orphaned_target = target;
 	for (i = 0; i < banks; i++)
 		__cmci_disable_bank(i);
-	if (target < nr_cpu_ids)
-		bitmap_andnot(cmci_orphaned_banks, cmci_orphaned_banks,
-			      per_cpu(mce_banks_owned, target), MAX_NR_BANKS);
-	else
-		bitmap_zero(cmci_orphaned_banks, MAX_NR_BANKS);
+	if (!cmci_discover_defer_depth) {
+		if (target < nr_cpu_ids)
+			bitmap_andnot(cmci_orphaned_banks, cmci_orphaned_banks,
+				      per_cpu(mce_banks_owned, target), MAX_NR_BANKS);
+		else
+			bitmap_zero(cmci_orphaned_banks, MAX_NR_BANKS);
+	}
 	raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
 }
 
@@ -388,6 +394,41 @@ static void cmci_rediscover_work_func(void *arg)
 	/* Recheck banks in case CPUs don't all have the same */
 	if (cmci_supported(&banks))
 		cmci_discover(banks);
+}
+
+void cmci_discover_defer_begin(void)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&cmci_discover_lock, flags);
+	if (!cmci_discover_defer_depth++)
+		bitmap_zero(cmci_orphaned_banks, MAX_NR_BANKS);
+	raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+}
+
+void cmci_discover_defer_end(void)
+{
+	unsigned int target = nr_cpu_ids;
+	unsigned long flags;
+	bool orphaned = false;
+	int banks;
+
+	raw_spin_lock_irqsave(&cmci_discover_lock, flags);
+	if (WARN_ON_ONCE(cmci_discover_defer_depth <= 0)) {
+		raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+		return;
+	}
+	if (--cmci_discover_defer_depth == 0) {
+		orphaned = !bitmap_empty(cmci_orphaned_banks, MAX_NR_BANKS);
+		if (orphaned)
+			target = cpumask_first(cpu_online_mask);
+		bitmap_zero(cmci_orphaned_banks, MAX_NR_BANKS);
+	}
+	raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+
+	if (orphaned && target < nr_cpu_ids && cmci_supported(&banks))
+		smp_call_function_single(target, cmci_rediscover_work_func,
+					 NULL, 1);
 }
 
 /*
@@ -403,6 +444,9 @@ void cmci_rediscover(void)
 	unsigned long flags;
 	bool orphaned;
 	int banks;
+
+	if (READ_ONCE(cmci_discover_defer_depth) > 0)
+		return;
 
 	if (!cmci_supported(&banks))
 		return;
@@ -430,8 +474,13 @@ void cmci_rediscover(void)
 void cmci_reenable(void)
 {
 	int banks;
-	if (cmci_supported(&banks))
+
+	if (__this_cpu_read(cmci_initialized))
+		return;
+	if (cmci_supported(&banks)) {
 		cmci_discover(banks);
+		__this_cpu_write(cmci_initialized, true);
+	}
 }
 
 void cmci_disable_bank(int bank)
@@ -465,7 +514,13 @@ void intel_init_cmci(void)
 	}
 
 	mce_threshold_vector = intel_threshold_interrupt;
+	if (cpuhp_in_batch()) {
+		__this_cpu_write(cmci_initialized, true);
+		apic_write(APIC_LVTCMCI, THRESHOLD_APIC_VECTOR|APIC_DM_FIXED);
+		return;
+	}
 	cmci_discover(banks);
+	__this_cpu_write(cmci_initialized, true);
 	/*
 	 * For CPU #0 this runs with still disabled APIC, but that's
 	 * ok because only the vector is set up. We still do another

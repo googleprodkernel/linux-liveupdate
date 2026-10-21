@@ -277,6 +277,8 @@ void cmci_clear(void);
 void cmci_reenable(void);
 void cmci_rediscover(void);
 void cmci_recheck(void);
+void cmci_discover_defer_begin(void);
+void cmci_discover_defer_end(void);
 #else
 static inline void mce_intel_feature_init(struct cpuinfo_x86 *c) { }
 static inline void mce_intel_feature_clear(struct cpuinfo_x86 *c) { }
@@ -284,6 +286,8 @@ static inline void cmci_clear(void) {}
 static inline void cmci_reenable(void) {}
 static inline void cmci_rediscover(void) {}
 static inline void cmci_recheck(void) {}
+static inline void cmci_discover_defer_begin(void) {}
+static inline void cmci_discover_defer_end(void) {}
 #endif
 
 bool mce_available(struct cpuinfo_x86 *c);

@@ -44,6 +44,13 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpuhp.h>
 
+#ifdef CONFIG_X86_MCE_INTEL
+#include <asm/mce.h>
+#else
+static inline void cmci_discover_defer_begin(void) {}
+static inline void cmci_discover_defer_end(void) {}
+#endif
+
 #include "smpboot.h"
 
 /**
@@ -1868,6 +1875,7 @@ void cpuhp_batch_begin(void)
 	if (READ_ONCE(cpuhp_batch_owner) == current) {
 		cpuhp_batch_depth++;
 		sched_domains_defer_begin();
+		cmci_discover_defer_begin();
 		return;
 	}
 
@@ -1877,6 +1885,7 @@ void cpuhp_batch_begin(void)
 	WRITE_ONCE(cpuhp_batch_owner, current);
 	cpuhp_batch_depth = 1;
 	sched_domains_defer_begin();
+	cmci_discover_defer_begin();
 	workqueue_cpuhp_batch_begin();
 	page_alloc_cpuhp_batch_begin();
 	vmstat_cpuhp_batch_begin();
@@ -1892,6 +1901,7 @@ void cpuhp_batch_end(void)
 
 	if (--cpuhp_batch_depth > 0) {
 		sched_domains_defer_end();
+		cmci_discover_defer_end();
 		return;
 	}
 
@@ -1906,6 +1916,7 @@ void cpuhp_batch_end(void)
 	cpus_write_unlock();
 	cpu_maps_update_done();
 
+	cmci_discover_defer_end();
 	arch_smt_update();
 }
 EXPORT_SYMBOL_GPL(cpuhp_batch_end);
