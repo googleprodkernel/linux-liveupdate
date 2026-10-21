@@ -134,6 +134,12 @@ void vmstat_cpuhp_batch_begin(void);
 void vmstat_cpuhp_batch_end(void);
 void irq_affinity_cpuhp_batch_begin(void);
 void irq_affinity_cpuhp_batch_end(void);
+void arch_cpuhp_batch_disable_set(int nr);
+void cpuhp_batch_begin(void);
+void cpuhp_batch_end(void);
+bool cpuhp_in_batch(void);
+int cpuhp_offline_mask(const struct cpumask *cpus);
+int cpuhp_online_mask(const struct cpumask *cpus);
 
 #else	/* CONFIG_SMP */
 #define cpuhp_tasks_frozen	0
@@ -161,6 +167,12 @@ static inline void vmstat_cpuhp_batch_begin(void) { }
 static inline void vmstat_cpuhp_batch_end(void) { }
 static inline void irq_affinity_cpuhp_batch_begin(void) { }
 static inline void irq_affinity_cpuhp_batch_end(void) { }
+static inline void arch_cpuhp_batch_disable_set(int nr) { }
+static inline void cpuhp_batch_begin(void) { }
+static inline void cpuhp_batch_end(void) { }
+static inline bool cpuhp_in_batch(void) { return false; }
+static inline int cpuhp_offline_mask(const struct cpumask *cpus) { return 0; }
+static inline int cpuhp_online_mask(const struct cpumask *cpus) { return 0; }
 
 #endif /* CONFIG_SMP */
 extern const struct bus_type cpu_subsys;

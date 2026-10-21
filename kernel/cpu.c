@@ -39,6 +39,7 @@
 #include <linux/cc_platform.h>
 #include <linux/parser.h>
 
+#include "rcu/rcu.h"
 #include <trace/events/power.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpuhp.h>
@@ -458,8 +459,16 @@ static inline bool cpuhp_can_boot_ap(unsigned int cpu) { return true; }
 
 /* Serializes the updates to cpu_online_mask, cpu_present_mask */
 static DEFINE_MUTEX(cpu_add_remove_lock);
+static int cpuhp_batch_depth;
+static struct task_struct *cpuhp_batch_owner;
 bool cpuhp_tasks_frozen;
 EXPORT_SYMBOL_GPL(cpuhp_tasks_frozen);
+
+bool cpuhp_in_batch(void)
+{
+	return READ_ONCE(cpuhp_batch_depth) > 0;
+}
+EXPORT_SYMBOL_GPL(cpuhp_in_batch);
 
 /*
  * The following two APIs (cpu_maps_update_begin/done) must be used when
@@ -467,11 +476,15 @@ EXPORT_SYMBOL_GPL(cpuhp_tasks_frozen);
  */
 void cpu_maps_update_begin(void)
 {
+	if (READ_ONCE(cpuhp_batch_owner) == current)
+		return;
 	mutex_lock(&cpu_add_remove_lock);
 }
 
 void cpu_maps_update_done(void)
 {
+	if (READ_ONCE(cpuhp_batch_owner) == current)
+		return;
 	mutex_unlock(&cpu_add_remove_lock);
 }
 
@@ -507,11 +520,15 @@ EXPORT_SYMBOL_GPL(cpus_read_unlock);
 
 void cpus_write_lock(void)
 {
+	if (READ_ONCE(cpuhp_batch_owner) == current)
+		return;
 	percpu_down_write(&cpu_hotplug_lock);
 }
 
 void cpus_write_unlock(void)
 {
+	if (READ_ONCE(cpuhp_batch_owner) == current)
+		return;
 	percpu_up_write(&cpu_hotplug_lock);
 }
 
@@ -764,8 +781,7 @@ cpuhp_reset_state(int cpu, struct cpuhp_cpu_state *st,
 		set_cpu_dying(cpu, !bringup);
 }
 
-/* Regular hotplug invocation of the AP hotplug thread */
-static void __cpuhp_kick_ap(struct cpuhp_cpu_state *st)
+static void __cpuhp_kick_ap_nowait(struct cpuhp_cpu_state *st)
 {
 	if (!st->single && st->state == st->target)
 		return;
@@ -778,6 +794,15 @@ static void __cpuhp_kick_ap(struct cpuhp_cpu_state *st)
 	smp_mb();
 	st->should_run = true;
 	wake_up_process(st->thread);
+}
+
+/* Regular hotplug invocation of the AP hotplug thread */
+static void __cpuhp_kick_ap(struct cpuhp_cpu_state *st)
+{
+	if (!st->single && st->state == st->target)
+		return;
+
+	__cpuhp_kick_ap_nowait(st);
 	wait_for_ap_thread(st, st->bringup);
 }
 
@@ -907,11 +932,17 @@ out_unlock:
 }
 #endif
 
+static cpumask_t cpuhp_deferred_die_mask;
+
 static int finish_cpu(unsigned int cpu)
 {
 	struct task_struct *idle = idle_thread_get(cpu);
 	struct mm_struct *mm = idle->active_mm;
 
+#ifdef CONFIG_HOTPLUG_CPU
+	if (cpumask_test_cpu(cpu, &cpuhp_deferred_die_mask))
+		return 0;
+#endif
 	/*
 	 * sched_force_init_mm() ensured the use of &init_mm,
 	 * drop that refcount now that the CPU has stopped.
@@ -1273,6 +1304,9 @@ void clear_tasks_mm_cpumask(int cpu)
 	rcu_read_unlock();
 }
 
+static DEFINE_RAW_SPINLOCK(take_cpu_down_lock);
+static bool take_cpu_down_batch;
+
 /* Take this CPU down. */
 static int take_cpu_down(void *_param)
 {
@@ -1294,7 +1328,13 @@ static int take_cpu_down(void *_param)
 	/*
 	 * Invoke the former CPU_DYING callbacks. DYING must not fail!
 	 */
-	cpuhp_invoke_callback_range_nofail(false, cpu, st, target);
+	if (READ_ONCE(take_cpu_down_batch)) {
+		raw_spin_lock(&take_cpu_down_lock);
+		cpuhp_invoke_callback_range_nofail(false, cpu, st, target);
+		raw_spin_unlock(&take_cpu_down_lock);
+	} else {
+		cpuhp_invoke_callback_range_nofail(false, cpu, st, target);
+	}
 
 	/* Park the stopper thread */
 	stop_machine_park(cpu);
@@ -1339,6 +1379,11 @@ static int takedown_cpu(unsigned int cpu)
 	irq_unlock_sparse();
 
 	hotplug_cpu__broadcast_tick_pull(cpu);
+	if (READ_ONCE(cpuhp_batch_owner) == current) {
+		cpumask_set_cpu(cpu, &cpuhp_deferred_die_mask);
+		rcutree_migrate_callbacks(cpu);
+		return 0;
+	}
 	/* This actually kills the CPU. */
 	__cpu_die(cpu);
 
@@ -1354,6 +1399,77 @@ static int takedown_cpu(unsigned int cpu)
 	rcutree_migrate_callbacks(cpu);
 
 	return 0;
+}
+
+__weak void arch_cpuhp_batch_disable_set(int nr)
+{
+}
+
+static int takedown_cpu_mask(const struct cpumask *cpus)
+{
+	unsigned int cpu;
+	int err;
+
+	if (cpumask_empty(cpus))
+		return 0;
+
+	for_each_cpu(cpu, cpus) {
+		struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+		st->target = CPUHP_OFFLINE;
+		st->state = CPUHP_TEARDOWN_CPU - 1;
+		kthread_park(st->thread);
+	}
+
+	irq_lock_sparse();
+	arch_cpuhp_batch_disable_set(cpumask_weight(cpus));
+	WRITE_ONCE(take_cpu_down_batch, true);
+	err = stop_machine_cpuslocked(take_cpu_down, NULL, cpus);
+	WRITE_ONCE(take_cpu_down_batch, false);
+	arch_cpuhp_batch_disable_set(0);
+	if (err) {
+		irq_unlock_sparse();
+		for_each_cpu(cpu, cpus) {
+			struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+			if (cpu_online(cpu)) {
+				st->state = CPUHP_TEARDOWN_CPU;
+				kthread_unpark(st->thread);
+			}
+		}
+		return err;
+	}
+
+	for_each_cpu(cpu, cpus) {
+		struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+		BUG_ON(cpu_online(cpu));
+		wait_for_ap_thread(st, false);
+		BUG_ON(st->state != CPUHP_AP_IDLE_DEAD);
+	}
+
+	irq_unlock_sparse();
+
+	for_each_cpu(cpu, cpus) {
+		hotplug_cpu__broadcast_tick_pull(cpu);
+		cpumask_set_cpu(cpu, &cpuhp_deferred_die_mask);
+		rcutree_migrate_callbacks(cpu);
+	}
+
+	return 0;
+}
+
+static void cpuhp_flush_deferred_die(void)
+{
+	unsigned int cpu;
+
+	for_each_cpu(cpu, &cpuhp_deferred_die_mask) {
+		cpumask_clear_cpu(cpu, &cpuhp_deferred_die_mask);
+		__cpu_die(cpu);
+		cpuhp_bp_sync_dead(cpu);
+		lockdep_cleanup_dead_cpu(cpu, idle_thread_get(cpu));
+		finish_cpu(cpu);
+	}
 }
 
 static void cpuhp_complete_idle_dead(void *arg)
@@ -1408,7 +1524,7 @@ static int __ref _cpu_down(unsigned int cpu, int tasks_frozen,
 	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
 	int prev_state, ret = 0;
 
-	if (num_online_cpus() == 1)
+	if (num_online_cpus() == 1 && cpu_online(cpu))
 		return -EBUSY;
 
 	if (!cpu_present(cpu))
@@ -1468,7 +1584,8 @@ static int __ref _cpu_down(unsigned int cpu, int tasks_frozen,
 
 out:
 	cpus_write_unlock();
-	arch_smt_update();
+	if (!cpuhp_batch_depth)
+		arch_smt_update();
 	return ret;
 }
 
@@ -1566,6 +1683,8 @@ void smp_shutdown_nonboot_cpus(unsigned int primary_cpu)
 
 #else
 #define takedown_cpu		NULL
+static inline int takedown_cpu_mask(const struct cpumask *cpus) { return 0; }
+static inline void cpuhp_flush_deferred_die(void) { }
 #endif /*CONFIG_HOTPLUG_CPU*/
 
 /**
@@ -1681,7 +1800,8 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
 	ret = cpuhp_up_callbacks(cpu, st, target);
 out:
 	cpus_write_unlock();
-	arch_smt_update();
+	if (!cpuhp_batch_depth)
+		arch_smt_update();
 	return ret;
 }
 
@@ -1742,6 +1862,258 @@ int add_cpu(unsigned int cpu)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(add_cpu);
+
+void cpuhp_batch_begin(void)
+{
+	if (READ_ONCE(cpuhp_batch_owner) == current) {
+		cpuhp_batch_depth++;
+		sched_domains_defer_begin();
+		return;
+	}
+
+	cpu_maps_update_begin();
+	cpus_write_lock();
+	rcu_expedite_gp();
+	WRITE_ONCE(cpuhp_batch_owner, current);
+	cpuhp_batch_depth = 1;
+	sched_domains_defer_begin();
+	workqueue_cpuhp_batch_begin();
+	page_alloc_cpuhp_batch_begin();
+	vmstat_cpuhp_batch_begin();
+	irq_affinity_cpuhp_batch_begin();
+}
+EXPORT_SYMBOL_GPL(cpuhp_batch_begin);
+
+void cpuhp_batch_end(void)
+{
+	if (WARN_ON_ONCE(READ_ONCE(cpuhp_batch_owner) != current ||
+			 cpuhp_batch_depth <= 0))
+		return;
+
+	if (--cpuhp_batch_depth > 0) {
+		sched_domains_defer_end();
+		return;
+	}
+
+	cpuhp_flush_deferred_die();
+	irq_affinity_cpuhp_batch_end();
+	vmstat_cpuhp_batch_end();
+	page_alloc_cpuhp_batch_end();
+	workqueue_cpuhp_batch_end();
+	sched_domains_defer_end();
+	WRITE_ONCE(cpuhp_batch_owner, NULL);
+	rcu_unexpedite_gp();
+	cpus_write_unlock();
+	cpu_maps_update_done();
+
+	arch_smt_update();
+}
+EXPORT_SYMBOL_GPL(cpuhp_batch_end);
+
+static cpumask_t cpuhp_batch_kicked_mask;
+
+int cpuhp_offline_mask(const struct cpumask *cpus)
+{
+	int cpu, ret = 0;
+
+	if (!cpus || cpumask_empty(cpus))
+		return 0;
+
+	lock_device_hotplug();
+	cpuhp_batch_begin();
+	sched_cpu_deactivate_prepare_mask(cpus);
+
+	cpumask_clear(&cpuhp_batch_kicked_mask);
+	if (!cpu_hotplug_offline_disabled && !cpu_hotplug_disabled &&
+	    cpumask_any_andnot_but(cpu_online_mask, cpus, -1) < nr_cpu_ids) {
+		for (cpu = nr_cpu_ids - 1; cpu >= 1; cpu--) {
+			struct cpuhp_cpu_state *st;
+			struct device *dev;
+
+			if (!cpumask_test_cpu(cpu, cpus))
+				continue;
+			dev = get_cpu_device(cpu);
+			if (!dev || !cpu_online(cpu) || dev_offline_disabled(dev))
+				continue;
+			st = per_cpu_ptr(&cpuhp_state, cpu);
+			if (st->state > CPUHP_TEARDOWN_CPU) {
+				cpuhp_tasks_frozen = 0;
+				cpuhp_set_state(cpu, st, CPUHP_TEARDOWN_CPU);
+				cpumask_set_cpu(cpu, &cpuhp_batch_kicked_mask);
+			}
+		}
+
+		for_each_cpu(cpu, &cpuhp_batch_kicked_mask)
+			__cpuhp_kick_ap_nowait(per_cpu_ptr(&cpuhp_state, cpu));
+
+		for_each_cpu(cpu, &cpuhp_batch_kicked_mask) {
+			struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+			wait_for_ap_thread(st, false);
+			if (st->result) {
+				if (!ret)
+					ret = st->result;
+				cpuhp_reset_state(cpu, st, CPUHP_ONLINE);
+				__cpuhp_kick_ap(st);
+			}
+		}
+	}
+
+	if (!ret)
+		ret = takedown_cpu_mask(&cpuhp_batch_kicked_mask);
+
+	if (!ret) {
+		for (cpu = nr_cpu_ids - 1; cpu >= 1; cpu--) {
+			struct cpuhp_cpu_state *st;
+			struct device *dev;
+
+			if (!cpumask_test_cpu(cpu, cpus))
+				continue;
+			dev = get_cpu_device(cpu);
+			if (!dev)
+				continue;
+			if (!cpu_online(cpu) &&
+			    cpumask_test_cpu(cpu, &cpuhp_batch_kicked_mask)) {
+				st = per_cpu_ptr(&cpuhp_state, cpu);
+				cpuhp_tasks_frozen = 0;
+				st->target = CPUHP_OFFLINE;
+				ret = cpuhp_down_callbacks(cpu, st, CPUHP_OFFLINE);
+				if (ret)
+					break;
+				dev_set_offline(dev);
+				continue;
+			}
+			if (!cpu_online(cpu))
+				continue;
+			ret = device_offline(dev);
+			if (ret < 0)
+				break;
+			ret = 0;
+		}
+	}
+
+	if (ret < 0) {
+		for_each_cpu(cpu, &cpuhp_batch_kicked_mask) {
+			struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+			if (cpu_online(cpu) && st->state == CPUHP_TEARDOWN_CPU) {
+				cpuhp_set_state(cpu, st, CPUHP_ONLINE);
+				__cpuhp_kick_ap(st);
+			}
+		}
+	}
+
+	cpuhp_flush_deferred_die();
+	cpuhp_batch_end();
+	unlock_device_hotplug();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cpuhp_offline_mask);
+
+int cpuhp_online_mask(const struct cpumask *cpus)
+{
+	unsigned int cpu;
+	int pass, max_pass = 1, ret = 0;
+
+	if (!cpus || cpumask_empty(cpus))
+		return 0;
+
+#ifdef CONFIG_HOTPLUG_SMT
+	if (cpu_smt_max_threads > 1 && cpu_smt_control != CPU_SMT_ENABLED)
+		max_pass = 2;
+#endif
+
+	lock_device_hotplug();
+	cpuhp_batch_begin();
+
+	for (pass = 0; pass < max_pass; pass++) {
+		cpumask_clear(&cpuhp_batch_kicked_mask);
+
+		for_each_cpu(cpu, cpus) {
+			struct device *dev = get_cpu_device(cpu);
+
+			if (!dev || cpu_online(cpu))
+				continue;
+#ifdef CONFIG_HOTPLUG_SMT
+			if (max_pass > 1 &&
+			    !cpumask_test_cpu(cpu, cpu_primary_thread_mask) != pass)
+				continue;
+#endif
+			if (!cpu_possible(cpu) || cpu_hotplug_disabled ||
+			    !cpu_bootable(cpu)) {
+				ret = device_online(dev);
+				if (ret < 0)
+					goto out;
+				ret = 0;
+				continue;
+			}
+			ret = try_online_node(cpu_to_node(cpu));
+			if (ret)
+				goto out;
+			cpumask_set_cpu(cpu, &cpuhp_batch_kicked_mask);
+#ifdef CONFIG_HOTPLUG_SPLIT_STARTUP
+			_cpu_up(cpu, 0, CPUHP_BP_KICK_AP);
+#endif
+		}
+
+		for_each_cpu(cpu, &cpuhp_batch_kicked_mask) {
+			int err = _cpu_up(cpu, 0, CPUHP_AP_ONLINE_IDLE);
+
+			if (err) {
+				cpumask_clear_cpu(cpu, &cpuhp_batch_kicked_mask);
+				if (!ret)
+					ret = err;
+				break;
+			}
+		}
+
+		for_each_cpu(cpu, &cpuhp_batch_kicked_mask) {
+			struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+			if (st->state < CPUHP_AP_ONLINE_IDLE) {
+				cpumask_clear_cpu(cpu, &cpuhp_batch_kicked_mask);
+				continue;
+			}
+			cpuhp_set_state(cpu, st, CPUHP_ONLINE);
+			__cpuhp_kick_ap_nowait(st);
+		}
+
+		for_each_cpu(cpu, &cpuhp_batch_kicked_mask) {
+			struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+			wait_for_ap_thread(st, true);
+			if (st->result) {
+				if (!ret)
+					ret = st->result;
+				cpuhp_reset_state(cpu, st, CPUHP_AP_ONLINE_IDLE);
+				__cpuhp_kick_ap(st);
+				cpuhp_down_callbacks(cpu, st, CPUHP_OFFLINE);
+				continue;
+			}
+
+			dev_clear_offline(get_cpu_device(cpu));
+		}
+
+		if (ret < 0)
+			goto out;
+	}
+
+out:
+#ifdef CONFIG_HOTPLUG_SPLIT_STARTUP
+	for_each_cpu(cpu, cpus) {
+		struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+		if (!cpu_online(cpu) && st->state > CPUHP_OFFLINE &&
+		    can_rollback_cpu(st))
+			WARN_ON(cpuhp_invoke_callback_range(false, cpu, st,
+							    CPUHP_OFFLINE));
+	}
+#endif
+	cpuhp_batch_end();
+	unlock_device_hotplug();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cpuhp_online_mask);
 
 /**
  * bringup_hibernate_cpu - Bring up the CPU that we hibernated on
