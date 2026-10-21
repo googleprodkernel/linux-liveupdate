@@ -3007,6 +3007,12 @@ kvm_pfn_t hva_to_pfn(struct kvm_follow_pfn *kfp)
 	if (hva_to_pfn_fast(kfp, &pfn))
 		return pfn;
 
+	mmap_read_lock(current->mm);
+	vma = vma_lookup(current->mm, kfp->hva);
+	if (vma && (vma->vm_flags & (VM_IO | VM_PFNMAP)))
+		goto remapped;
+	mmap_read_unlock(current->mm);
+
 	npages = hva_to_pfn_slow(kfp, &pfn);
 	if (npages == 1)
 		return pfn;
@@ -3022,6 +3028,7 @@ retry:
 	if (vma == NULL)
 		pfn = KVM_PFN_ERR_FAULT;
 	else if (vma->vm_flags & (VM_IO | VM_PFNMAP)) {
+remapped:
 		r = hva_to_pfn_remapped(vma, kfp, &pfn);
 		if (r == -EAGAIN)
 			goto retry;
