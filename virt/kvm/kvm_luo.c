@@ -260,16 +260,18 @@ static int kvm_vcpu_luo_preserve(struct liveupdate_file_op_args *args)
 	}
 
 	kvm_file = get_file_active(&vcpu->kvm->vm_file);
-	if (!kvm_file) {
-		mutex_unlock(&vcpu->mutex);
-		return -ENOENT;
-	}
-
-	err = liveupdate_get_token_outgoing(args->session, kvm_file, &vm_token);
-	fput(kvm_file);
-	if (err) {
-		mutex_unlock(&vcpu->mutex);
-		return err;
+	if (kvm_file) {
+		err = liveupdate_get_token_outgoing(args->session, kvm_file,
+						    &vm_token);
+		fput(kvm_file);
+		if (err == -ENOENT)
+			vm_token = 0;
+		else if (err) {
+			mutex_unlock(&vcpu->mutex);
+			return err;
+		}
+	} else {
+		vm_token = 0;
 	}
 
 	ser = kho_alloc_preserve(sizeof(*ser));
@@ -301,10 +303,46 @@ static int kvm_vcpu_luo_restore(struct kvm_vcpu *vcpu, void *data)
 	return kvm_arch_vcpu_luo_retrieve(vcpu, data);
 }
 
+static struct file *kvm_vcpu_luo_get_target_file(struct liveupdate_file_op_args *args,
+						 u32 expected_vcpu_id)
+{
+	const struct liveupdate_vcpu_retrieve_arg *rarg = args->arg;
+	struct kvm_vcpu *vcpu;
+	struct file *file;
+	int err;
+
+	file = fget(rarg->fd);
+	if (!file)
+		return ERR_PTR(-EBADF);
+
+	if (!file_is_kvm_vcpu(file)) {
+		err = -EINVAL;
+		goto put_file;
+	}
+
+	vcpu = file->private_data;
+	if (vcpu->vcpu_id != expected_vcpu_id) {
+		err = -EINVAL;
+		goto put_file;
+	}
+
+	if (vcpu->kvm->mm != current->mm || vcpu->kvm->vm_dead) {
+		err = -EIO;
+		goto put_file;
+	}
+
+	return file;
+
+put_file:
+	fput(file);
+	return ERR_PTR(err);
+}
+
 static int kvm_vcpu_luo_retrieve(struct liveupdate_file_op_args *args)
 {
 	struct kvm_vcpu_ser *ser;
 	struct file *vm_file, *file;
+	struct kvm_vcpu *vcpu;
 	struct kvm *kvm;
 	int err;
 
@@ -314,6 +352,33 @@ static int kvm_vcpu_luo_retrieve(struct liveupdate_file_op_args *args)
 	ser = phys_to_virt(args->serialized_data);
 	if (ser->reserved)
 		return -EINVAL;
+
+	if (args->arg) {
+		file = kvm_vcpu_luo_get_target_file(args, ser->vcpu_id);
+		if (IS_ERR(file)) {
+			args->retryable = true;
+			return PTR_ERR(file);
+		}
+
+		vcpu = file->private_data;
+		if (mutex_lock_killable(&vcpu->mutex)) {
+			fput(file);
+			args->retryable = true;
+			return -EINTR;
+		}
+
+		err = kvm_arch_vcpu_luo_retrieve(vcpu, ser);
+		if (!err)
+			vcpu->luo_preserved = false;
+		mutex_unlock(&vcpu->mutex);
+		if (err) {
+			fput(file);
+			return err;
+		}
+
+		args->file = file;
+		return 0;
+	}
 
 	err = liveupdate_get_file_incoming(args->session, ser->vm_token, &vm_file);
 	if (err)
@@ -379,6 +444,7 @@ static const struct liveupdate_file_ops kvm_vcpu_luo_file_ops = {
 	.retrieve = kvm_vcpu_luo_retrieve,
 	.unpreserve = kvm_vcpu_luo_unpreserve,
 	.finish = kvm_vcpu_luo_finish,
+	.rarg = LIVEUPDATE_ARG(struct liveupdate_vcpu_retrieve_arg, fd),
 	.owner = THIS_MODULE,
 };
 

@@ -308,6 +308,21 @@ struct liveupdate_shmem_retrieve_arg {
 };
 
 /**
+ * struct liveupdate_vcpu_retrieve_arg - Optional argument for vCPU retrieval
+ * @size: Input; sizeof(struct liveupdate_vcpu_retrieve_arg)
+ * @fd:   Input; Existing KVM vCPU file descriptor to restore state into.
+ *
+ * Passed via &struct liveupdate_session_retrieve_fd.arg on
+ * %LIVEUPDATE_SESSION_RETRIEVE_FD when restoring preserved vCPU state into an
+ * already-created KVM vCPU file descriptor. When &liveupdate_session_retrieve_fd.arg
+ * is 0, a new vCPU file descriptor is created on the preserved KVM VM instead.
+ */
+struct liveupdate_vcpu_retrieve_arg {
+	__u32		size;
+	__s32		fd;
+};
+
+/**
  * struct liveupdate_cpu_preserve_arg - Optional argument for CPU preservation
  * @size:         Input; sizeof(struct liveupdate_cpu_preserve_arg)
  * @flags:        Input; Reserved for future extensions, must be 0.
