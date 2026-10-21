@@ -131,9 +131,6 @@ static bool kvm_gmem_luo_can_preserve(struct liveupdate_file_handler *handler, s
 	if (kvm_arch_has_private_mem(kvm))
 		return false;
 
-	if (mapping_large_folio_support(inode->i_mapping))
-		return false;
-
 	return true;
 }
 

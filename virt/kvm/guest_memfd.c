@@ -3,6 +3,7 @@
 #include <linux/backing-dev.h>
 #include <linux/falloc.h>
 #include <linux/fs.h>
+#include <linux/huge_mm.h>
 #include <linux/kvm_host.h>
 #include <linux/mempolicy.h>
 #include <linux/pseudo_fs.h>
@@ -58,7 +59,7 @@ static bool kvm_gmem_is_shared_mem(struct inode *inode, pgoff_t index)
  */
 static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 {
-	/* TODO: Support huge pages. */
+	fgf_t fgf = FGP_LOCK | FGP_CREAT;
 	struct mempolicy *policy;
 	struct folio *folio;
 	int idx;
@@ -77,22 +78,21 @@ static struct folio *kvm_gmem_get_folio(struct inode *inode, pgoff_t index)
 		return ERR_PTR(-EPERM);
 	}
 
+	if (IS_ALIGNED(index, HPAGE_PMD_NR) &&
+	    (index + HPAGE_PMD_NR) <= (i_size_read(inode) >> PAGE_SHIFT) &&
+	    !filemap_range_has_page(inode->i_mapping, index << PAGE_SHIFT,
+				    ((index + HPAGE_PMD_NR) << PAGE_SHIFT) - 1))
+		fgf |= fgf_set_order(PMD_SIZE);
+
 	policy = mpol_shared_policy_lookup(&GMEM_I(inode)->policy, index);
-	folio = __filemap_get_folio_mpol(inode->i_mapping, index,
-					 FGP_LOCK | FGP_CREAT,
+	folio = __filemap_get_folio_mpol(inode->i_mapping, index, fgf,
 					 mapping_gfp_mask(inode->i_mapping), policy);
 	mpol_cond_put(policy);
 
 	srcu_read_unlock(&kvm_gmem_freeze_srcu, idx);
 
-	/*
-	 * External interfaces like kvm_gmem_get_pfn() support dealing
-	 * with hugepages to a degree, but internally, guest_memfd currently
-	 * assumes that all folios are order-0 and handling would need
-	 * to be updated for anything otherwise (e.g. page-clearing
-	 * operations).
-	 */
-	WARN_ON_ONCE(!IS_ERR(folio) && folio_order(folio));
+	if (!IS_ERR(folio) && !folio_test_uptodate(folio))
+		folio_mark_uptodate(folio);
 
 	return folio;
 }
@@ -377,19 +377,13 @@ static vm_fault_t kvm_gmem_fault_user_mapping(struct vm_fault *vmf)
 		return vmf_error(PTR_ERR(folio));
 	}
 
-	if (WARN_ON_ONCE(folio_test_large(folio))) {
-		ret = VM_FAULT_SIGBUS;
-		goto out_folio;
-	}
-
 	if (!folio_test_uptodate(folio)) {
-		clear_highpage(folio_page(folio, 0));
+		folio_zero_range(folio, 0, folio_size(folio));
 		folio_mark_uptodate(folio);
 	}
 
 	vmf->page = folio_file_page(folio, vmf->pgoff);
 
-out_folio:
 	if (ret != VM_FAULT_LOCKED) {
 		folio_unlock(folio);
 		folio_put(folio);
@@ -451,10 +445,11 @@ static int kvm_gmem_mmap(struct file *file, struct vm_area_struct *vma)
 }
 
 static struct file_operations kvm_gmem_fops = {
-	.mmap		= kvm_gmem_mmap,
-	.open		= generic_file_open,
-	.release	= kvm_gmem_release,
-	.fallocate	= kvm_gmem_fallocate,
+	.mmap		   = kvm_gmem_mmap,
+	.get_unmapped_area = thp_get_unmapped_area,
+	.open		   = generic_file_open,
+	.release	   = kvm_gmem_release,
+	.fallocate	   = kvm_gmem_fallocate,
 };
 
 static int kvm_gmem_migrate_folio(struct address_space *mapping,
@@ -547,10 +542,12 @@ struct file *__kvm_gmem_create_file(struct kvm *kvm, loff_t size, u64 flags)
 	}
 
 	inode->i_op = &kvm_gmem_iops;
+	inode->i_fop = &kvm_gmem_fops;
 	inode->i_mapping->a_ops = &kvm_gmem_aops;
 	inode->i_mode |= S_IFREG;
 	inode->i_size = size;
-	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
+	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER | __GFP_ZERO);
+	mapping_set_large_folios(inode->i_mapping);
 	mapping_set_inaccessible(inode->i_mapping);
 	/* Unmovable mappings are supposed to be marked unevictable as well. */
 	WARN_ON_ONCE(!mapping_unevictable(inode->i_mapping));
@@ -761,7 +758,7 @@ static struct folio *__kvm_gmem_get_pfn(struct file *file,
 
 	*pfn = folio_file_pfn(folio, index);
 	if (max_order)
-		*max_order = 0;
+		*max_order = folio_order(folio);
 
 	return folio;
 }
@@ -785,7 +782,7 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 		return PTR_ERR(folio);
 
 	if (!folio_test_uptodate(folio)) {
-		clear_highpage(folio_page(folio, 0));
+		folio_zero_range(folio, 0, folio_size(folio));
 		folio_mark_uptodate(folio);
 	}
 
