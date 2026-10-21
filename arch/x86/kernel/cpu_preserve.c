@@ -6,6 +6,7 @@
  * Architecture specific CPU preservation support for x86.
  */
 #include <linux/cc_platform.h>
+#include <linux/cpu.h>
 #include <linux/cpu_preserve.h>
 #include <linux/cpufeature.h>
 #include <linux/delay.h>
@@ -386,6 +387,9 @@ int arch_cpupr_wakeup_ap(unsigned int cpu)
 	smp_store_release(&ser->state, wake_start_ip);
 	cpupr_clean(ser);
 	x86_cpupr_send_nmi((int)cpu);
+
+	if (cpuhp_in_batch())
+		return 0;
 
 	for (i = 0; i < 1000000; i++) {
 		cpupr_clean(ser);

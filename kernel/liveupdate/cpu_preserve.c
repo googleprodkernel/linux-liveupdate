@@ -261,9 +261,11 @@ struct cpupr_session {
 	struct list_head node;
 	struct liveupdate_session *lsession;
 	struct cpumask cpus;
+	struct cpumask pending_offline_cpus;
 	struct cpupr_as_ser *as;
 #ifdef CONFIG_KEXEC_HANDOVER_READONLY
 	struct cpupr_as_ser *ro_as;
+	bool ro_batch_active;
 #endif
 	bool incoming;
 	struct mutex as_lock;
@@ -291,6 +293,7 @@ static DEFINE_PER_CPU(struct cpupr_ser *, cpupr_cpu_ser);
 static DEFINE_PER_CPU(struct cpupr_session *, cpupr_cpu_session);
 #ifdef CONFIG_KEXEC_HANDOVER_READONLY
 static DEFINE_PER_CPU(struct cpupr_stack_context *, cpupr_ro_sctx);
+static DEFINE_PER_CPU(phys_addr_t, cpupr_ro_ser_pa);
 #endif
 /* The link that points to the descriptor of a CPU on the handover list */
 static DEFINE_PER_CPU(u64 *, cpupr_cpu_link);
@@ -824,6 +827,9 @@ static void cpupr_signal_exit_ser(struct cpupr_ser *ser)
 	cpupr_clean(ser);
 }
 
+static struct cpupr_session *cpupr_session_of(unsigned int cpu);
+static int cpupr_flush_pending_offline(struct cpupr_session *ps);
+
 /**
  * cpupr_attach_workload - Attach & start workload execution on core
  * @cpu: Logical CPU identifier.
@@ -838,10 +844,15 @@ int cpupr_attach_workload(int cpu,
 	struct cpupr_stack_context *sctx;
 	struct cpupr_ser *ser;
 	u32 old;
+	int ret;
 
 	if ((unsigned int)cpu >= nr_cpu_ids || !entry_fn ||
 	    !cpupr_is_runtime_text(entry_fn))
 		return -EINVAL;
+
+	ret = cpupr_flush_pending_offline(cpupr_session_of(cpu));
+	if (ret)
+		return ret;
 
 	mutex_lock(&cpupr_lock);
 	if (!cpumask_test_cpu(cpu, &cpupr_outgoing_mask)) {
@@ -1156,6 +1167,10 @@ static void cpupr_unpreserve_locked(unsigned int cpu)
 		cpupr_handover_del(cpu);
 
 	WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), NULL);
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+	WRITE_ONCE(per_cpu(cpupr_ro_sctx, cpu), NULL);
+	WRITE_ONCE(per_cpu(cpupr_ro_ser_pa, cpu), 0);
+#endif
 	per_cpu(cpupr_cpu_session, cpu) = NULL;
 	cpumask_clear_cpu(cpu, &cpupr_outgoing_mask);
 	cpumask_clear_cpu(cpu, &cpupr_incoming_mask);
@@ -1438,38 +1453,148 @@ static struct cpupr_ser *cpupr_alloc_cpu(struct cpupr_session *ps,
 }
 
 /*
- * Hold the device hotplug lock from the online check until the CPU is offline,
- * so that no other path can take the CPU down (it would park on this stack) or
- * bring it up in between.
+ * Queue @cpu for batch offlining in @ps, marking it preserved immediately so
+ * that no other session can claim it.
  */
 static int cpupr_offline_cpu(unsigned int cpu, struct device *dev,
 			     struct cpupr_session *ps, struct cpupr_ser *ser)
 {
 	int ret = 0;
 
+	if (!cpu)
+		return -EBUSY;
+
 	lock_device_hotplug();
-	scoped_guard(mutex, &cpupr_lock) {
-		if (cpu_is_preserved(cpu) || !cpu_online(cpu)) {
-			ret = -EBUSY;
-		} else {
-			cpumask_set_cpu(cpu, &cpupr_outgoing_mask);
-			cpumask_set_cpu(cpu, &cpupr_mask);
-			WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), ser);
-			per_cpu(cpupr_cpu_session, cpu) = ps;
-		}
-	}
-	if (!ret) {
-		ret = device_offline(dev);
-		if (ret < 0) {
-			pr_err("Failed to offline preserved cpu %u: %d\n",
-			       cpu, ret);
-			scoped_guard(mutex, &cpupr_lock)
-				cpupr_unpreserve_locked(cpu);
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		scoped_guard(mutex, &cpupr_lock) {
+			if (cpu_is_preserved(cpu) || !cpu_online(cpu) ||
+			    cpumask_weight(&ps->pending_offline_cpus) + 1 >= num_online_cpus()) {
+				ret = -EBUSY;
+			} else {
+				cpumask_set_cpu(cpu, &cpupr_outgoing_mask);
+				cpumask_set_cpu(cpu, &cpupr_mask);
+				WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), ser);
+				per_cpu(cpupr_cpu_session, cpu) = ps;
+				cpumask_set_cpu(cpu, &ps->cpus);
+				cpumask_set_cpu(cpu, &ps->pending_offline_cpus);
+			}
 		}
 	}
 	unlock_device_hotplug();
 
-	return ret < 0 ? ret : 0;
+	return ret;
+}
+
+static int cpupr_flush_pending_offline(struct cpupr_session *ps)
+{
+	struct cpumask batch;
+	unsigned int cpu;
+	int ret;
+
+	if (!ps)
+		return 0;
+
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		if (cpumask_empty(&ps->pending_offline_cpus))
+			return 0;
+		cpumask_copy(&batch, &ps->pending_offline_cpus);
+		cpumask_clear(&ps->pending_offline_cpus);
+	}
+
+	ret = cpuhp_offline_mask(&batch);
+	if (ret) {
+		for_each_cpu(cpu, &batch) {
+			if (cpu_online(cpu)) {
+				scoped_guard(mutex, &cpupr_lock)
+					cpupr_unpreserve_locked(cpu);
+				cpupr_session_remove_cpu(ps, cpu);
+			}
+		}
+		return ret;
+	}
+
+	for_each_cpu(cpu, &batch) {
+		ret = cpupr_wait_parked(cpu);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void cpupr_unpark_session_batch(struct cpupr_session *ps)
+{
+	u64 timeout_us = 5 * CPUPR_WAIT_DEAD_TIMEOUT_US;
+	struct cpumask batch, online_batch;
+	unsigned int c;
+	bool empty = false;
+
+	if (!ps)
+		return;
+
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		if (cpumask_empty(&ps->cpus))
+			return;
+		cpumask_copy(&batch, &ps->cpus);
+		cpumask_clear(&ps->pending_offline_cpus);
+	}
+
+	cpumask_clear(&online_batch);
+
+	scoped_guard(mutex, &cpupr_lock) {
+		for_each_cpu(c, &batch) {
+			if (!cpu_is_preserved(c))
+				continue;
+			if (cpu_online(c)) {
+				cpupr_unpreserve_locked(c);
+				continue;
+			}
+			if (cpupr_state(c) == CPUPR_WORKLOAD)
+				timeout_us = USEC_PER_MSEC;
+			cpupr_signal_exit(c);
+			arch_cpupr_kick(c);
+			cpumask_set_cpu(c, &online_batch);
+		}
+	}
+
+	for_each_cpu(c, &online_batch) {
+		if (WARN_ON_ONCE(cpupr_wait_dead(c, timeout_us))) {
+			cpumask_clear_cpu(c, &online_batch);
+			cpumask_clear_cpu(c, &batch);
+		}
+	}
+
+	scoped_guard(mutex, &cpupr_lock) {
+		for_each_cpu(c, &online_batch)
+			cpupr_unpreserve_locked(c);
+	}
+
+	if (!cpumask_empty(&online_batch)) {
+		int ret = cpuhp_online_mask(&online_batch);
+
+		if (ret < 0) {
+			for_each_cpu(c, &online_batch) {
+				if (!cpu_online(c)) {
+					arch_cpupr_wait_dead(c, NULL, false);
+					pr_warn("Failed to bring unpreserved cpu %u back online: %d\n",
+						c, ret);
+				}
+			}
+		}
+	}
+
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		for_each_cpu(c, &batch)
+			cpumask_clear_cpu(c, &ps->cpus);
+		empty = cpumask_empty(&ps->cpus);
+		if (empty)
+			list_del_init(&ps->node);
+	}
+
+	if (empty)
+		cpupr_session_release(ps);
+	else
+		cpupr_session_detach(ps);
 }
 
 static int cpupr_preserve(unsigned int cpu, struct liveupdate_session *session)
@@ -1483,7 +1608,7 @@ static int cpupr_preserve(unsigned int cpu, struct liveupdate_session *session)
 		return -ENODEV;
 
 	/* Do not grow the address space for a CPU that cannot be preserved */
-	if (cpu_is_preserved(cpu) || !cpu_online(cpu))
+	if (!cpu || cpu_is_preserved(cpu) || !cpu_online(cpu))
 		return -EBUSY;
 
 	ps = cpupr_session_get(session);
@@ -1500,22 +1625,8 @@ static int cpupr_preserve(unsigned int cpu, struct liveupdate_session *session)
 	if (ret)
 		goto err_put;
 
-	ret = cpupr_wait_parked(cpu);
-	if (ret)
-		goto err_unpreserve;
-
-	scoped_guard(mutex, &cpupr_sessions_lock)
-		cpumask_set_cpu(cpu, &ps->cpus);
 	return 0;
 
-err_unpreserve:
-	/* A CPU that fails to stop keeps its session alive */
-	if (cpupr_unpreserve(cpu)) {
-		scoped_guard(mutex, &cpupr_sessions_lock)
-			cpumask_set_cpu(cpu, &ps->cpus);
-		cpupr_session_detach(ps);
-		return ret;
-	}
 err_put:
 	cpupr_session_put_if_empty(ps);
 	return ret;
@@ -1964,6 +2075,16 @@ static void cpupr_release_cpu(unsigned int cpu)
 {
 	struct cpupr_session *ps = cpupr_session_of(cpu);
 
+	if (ps) {
+		scoped_guard(mutex, &cpupr_sessions_lock) {
+			if (cpumask_test_and_clear_cpu(cpu, &ps->pending_offline_cpus) &&
+			    cpu_online(cpu)) {
+				scoped_guard(mutex, &cpupr_lock)
+					cpupr_unpreserve_locked(cpu);
+			}
+		}
+	}
+
 	if (cpupr_unpreserve(cpu)) {
 		cpupr_session_detach(ps);
 		return;
@@ -2012,26 +2133,28 @@ static int cpupr_preserve_cb(struct liveupdate_file_op_args *args)
 
 static void cpupr_unpreserve_cb(struct liveupdate_file_op_args *args)
 {
-	struct cpupr_session *ps;
+	struct cpupr_session *ps = NULL;
 	struct cpupr_ser *ser;
-	int cpu;
+	unsigned int c;
 
-	if (!args->serialized_data)
-		return;
-
-	ser = phys_to_virt(args->serialized_data);
-	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
-	if (WARN_ON_ONCE(cpu < 0))
-		return;
-
-	if (args->private_data) {
-		ps = cpupr_session_of(cpu);
+	if (args->serialized_data) {
+		ser = phys_to_virt(args->serialized_data);
+		scoped_guard(mutex, &cpupr_lock) {
+			for_each_cpu(c, &cpupr_outgoing_mask) {
+				if (per_cpu(cpupr_cpu_ser, c) == ser) {
+					ps = per_cpu(cpupr_cpu_session, c);
+					break;
+				}
+			}
+		}
 		if (ps) {
-			ps->mapped_mem_file = NULL;
-			ps->cleaned_mem_file = NULL;
+			if (args->private_data) {
+				ps->mapped_mem_file = NULL;
+				ps->cleaned_mem_file = NULL;
+			}
+			cpupr_unpark_session_batch(ps);
 		}
 	}
-	cpupr_release_cpu(cpu);
 	cpupr_free_job(args->private_data);
 }
 
@@ -2051,6 +2174,11 @@ static int cpupr_freeze_cb(struct liveupdate_file_op_args *args)
 
 	ser = phys_to_virt(args->serialized_data);
 	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+	if (cpu >= 0) {
+		ret = cpupr_flush_pending_offline(cpupr_session_of(cpu));
+		if (ret)
+			return ret;
+	}
 
 	scoped_guard(mutex, &cpupr_lock) {
 		gser = cpupr_global_ser;
@@ -2182,21 +2310,30 @@ static int cpupr_retrieve_cb(struct liveupdate_file_op_args *args)
 
 static void cpupr_finish_cb(struct liveupdate_file_op_args *args)
 {
-	struct cpupr_session *ps;
-	int cpu;
+	struct cpupr_session *ps = NULL;
+	struct cpupr_ser *ser;
+	unsigned int c;
 
-	cpu = cpupr_incoming_cpu(args->serialized_data);
-	if (cpu < 0)
+	if (!args->serialized_data)
 		return;
 
-	ps = cpupr_session_of(cpu);
-	if (cpupr_unpreserve(cpu))
-		return;
+	ser = phys_to_virt(args->serialized_data);
+	scoped_guard(mutex, &cpupr_lock) {
+		for_each_cpu(c, &cpupr_incoming_mask) {
+			if (per_cpu(cpupr_cpu_ser, c) == ser) {
+				ps = per_cpu(cpupr_cpu_session, c);
+				break;
+			}
+		}
+	}
 
-	cpupr_session_remove_cpu(ps, cpu);
+	if (ps)
+		cpupr_unpark_session_batch(ps);
 }
 
 #ifdef CONFIG_KEXEC_HANDOVER_READONLY
+static struct liveupdate_file_handler cpu_preserve_handler;
+
 static int cpupr_ro_setup_cpu(unsigned int cpu, struct liveupdate_session *s,
 			      struct cpupr_ser *ser, phys_addr_t ser_pa)
 {
@@ -2238,6 +2375,7 @@ static int cpupr_ro_setup_cpu(unsigned int cpu, struct liveupdate_session *s,
 			ps->ro_as = kho_ro_map_folio(ser->as.phys, PAGE_KERNEL);
 		WRITE_ONCE(per_cpu(cpupr_ro_sctx, cpu), sctx);
 		WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), ser);
+		WRITE_ONCE(per_cpu(cpupr_ro_ser_pa, cpu), ser_pa);
 		per_cpu(cpupr_cpu_session, cpu) = ps;
 		cpumask_set_cpu(cpu, &cpupr_outgoing_mask);
 		cpumask_set_cpu(cpu, &cpupr_mask);
@@ -2252,35 +2390,72 @@ static int cpupr_ro_setup_cpu(unsigned int cpu, struct liveupdate_session *s,
 static int cpupr_ro_release(struct inode *inode, struct file *file)
 {
 	unsigned int cpu = (uintptr_t)file->private_data;
-	struct device *dev = get_cpu_device(cpu);
+	struct cpupr_session *ps;
+	struct cpupr_ser *ser;
+	struct cpumask batch;
+	unsigned int c;
+	bool start_batch = false;
 
-	if (dev) {
-		lock_device_hotplug();
-		if (cpu_online(cpu)) {
-			struct cpupr_session *ps = per_cpu(cpupr_cpu_session, cpu);
-			struct cpupr_ser *ser = per_cpu(cpupr_cpu_ser, cpu);
+	if (cpu >= nr_cpu_ids)
+		return 0;
 
-			if (ps && ps->as && ser) {
+	cpumask_clear(&batch);
+
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		scoped_guard(mutex, &cpupr_lock) {
+			ser = per_cpu(cpupr_cpu_ser, cpu);
+			ps = per_cpu(cpupr_cpu_session, cpu);
+			if (!ser || !ps || !ps->as)
+				return 0;
+			if (ps->ro_as) {
+				WRITE_ONCE(ps->ro_as->pgd_pa, ps->as->pgd_pa);
+				cpupr_clean(ps->ro_as);
+			}
+			if (!ps->ro_batch_active && cpumask_weight(&ps->cpus) > 1) {
+				ps->ro_batch_active = true;
+				start_batch = true;
+				for_each_cpu(c, &ps->cpus) {
+					struct cpupr_ser *c_ser = per_cpu(cpupr_cpu_ser, c);
+
+					if (c_ser) {
+						WRITE_ONCE(c_ser->state, CPUPR_PARKING);
+						cpupr_clean(c_ser);
+					}
+					if (c && cpu_online(c))
+						cpumask_set_cpu(c, &batch);
+				}
+			} else {
 				WRITE_ONCE(ser->state, CPUPR_PARKING);
 				cpupr_clean(ser);
-				if (ps->ro_as) {
-					WRITE_ONCE(ps->ro_as->pgd_pa, ps->as->pgd_pa);
-					cpupr_clean(ps->ro_as);
-				}
-			}
-			if (!device_offline(dev)) {
-				cpupr_wait_parked(cpu);
-				scoped_guard(mutex, &cpupr_lock) {
-					cpumask_clear_cpu(cpu, &cpupr_outgoing_mask);
-					cpumask_clear_cpu(cpu, &cpupr_mask);
-					WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), NULL);
-					WRITE_ONCE(per_cpu(cpupr_ro_sctx, cpu), NULL);
-					per_cpu(cpupr_cpu_session, cpu) = NULL;
-				}
 			}
 		}
-		unlock_device_hotplug();
 	}
+
+	if (start_batch && !cpumask_empty(&batch)) {
+		cpuhp_offline_mask(&batch);
+		for_each_cpu(c, &batch) {
+			if (!cpu_online(c))
+				cpupr_wait_parked(c);
+		}
+	} else if (cpu && cpu_online(cpu)) {
+		if (!device_offline(get_cpu_device(cpu)))
+			cpupr_wait_parked(cpu);
+	}
+
+	scoped_guard(mutex, &cpupr_sessions_lock) {
+		scoped_guard(mutex, &cpupr_lock) {
+			cpumask_clear_cpu(cpu, &ps->cpus);
+			if (ps->ro_batch_active && cpumask_empty(&ps->cpus))
+				ps->ro_batch_active = false;
+			cpumask_clear_cpu(cpu, &cpupr_outgoing_mask);
+			cpumask_clear_cpu(cpu, &cpupr_mask);
+			WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), NULL);
+			WRITE_ONCE(per_cpu(cpupr_ro_sctx, cpu), NULL);
+			WRITE_ONCE(per_cpu(cpupr_ro_ser_pa, cpu), 0);
+			per_cpu(cpupr_cpu_session, cpu) = NULL;
+		}
+	}
+
 	return 0;
 }
 
@@ -2289,14 +2464,111 @@ static const struct file_operations cpupr_ro_fops = {
 	.release	= cpupr_ro_release,
 };
 
+struct cpupr_ro_batch_item {
+	int cpu;
+	phys_addr_t ser_pa;
+	struct cpupr_ser *ser;
+};
+
+struct cpupr_ro_batch_ctx {
+	struct cpupr_ro_batch_item *items;
+	unsigned int nr;
+	unsigned int cap;
+};
+
+static int cpupr_ro_collect_cb(u64 token, u64 data, void *arg)
+{
+	struct cpupr_ro_batch_ctx *ctx = arg;
+	struct cpupr_ser *ser;
+	int cpu;
+
+	if (!data || ctx->nr >= ctx->cap)
+		return 0;
+
+	ser = kho_ro_map_folio(data, PAGE_KERNEL);
+	if (!ser)
+		return -ENOMEM;
+
+	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+	if (cpu < 0 || cpu_online(cpu) || !get_cpu_device(cpu))
+		return cpu < 0 ? cpu : 0;
+
+	ctx->items[ctx->nr].cpu = cpu;
+	ctx->items[ctx->nr].ser_pa = data;
+	ctx->items[ctx->nr].ser = ser;
+	ctx->nr++;
+	return 0;
+}
+
 static int cpupr_retrieve_ro_cb(struct liveupdate_file_op_args *args)
 {
+	struct cpupr_ro_batch_ctx ctx = { 0 };
+	struct cpumask online_mask;
 	struct cpupr_ser *ser;
 	struct file *file;
-	int cpu, ret = 0;
+	unsigned int i, c;
+	int cpu = -ENOENT, ret = 0;
 
 	if (!args->serialized_data)
 		return -ENOENT;
+
+	for_each_cpu(c, &cpupr_outgoing_mask) {
+		if (READ_ONCE(per_cpu(cpupr_ro_ser_pa, c)) == args->serialized_data) {
+			cpu = c;
+			goto make_file;
+		}
+	}
+
+	ctx.cap = nr_cpu_ids;
+	ctx.items = kcalloc(ctx.cap, sizeof(*ctx.items), GFP_KERNEL);
+	if (ctx.items) {
+		ret = luo_session_for_each_file(args->session,
+						&cpu_preserve_handler,
+						cpupr_ro_collect_cb, &ctx);
+	}
+
+	if (!ret && ctx.nr > 0) {
+		cpumask_clear(&online_mask);
+		scoped_guard(mutex, &cpupr_lock) {
+			for (i = 0; i < ctx.nr; i++) {
+				cpumask_set_cpu(ctx.items[i].cpu, &cpupr_mask);
+				cpupr_signal_exit_ser(ctx.items[i].ser);
+				arch_cpupr_kick(ctx.items[i].cpu);
+				cpumask_clear_cpu(ctx.items[i].cpu, &cpupr_mask);
+			}
+		}
+
+		for (i = 0; i < ctx.nr; i++) {
+			ret = cpupr_wait_dead_ser(ctx.items[i].cpu,
+						  ctx.items[i].ser,
+						  5 * CPUPR_WAIT_DEAD_TIMEOUT_US,
+						  true);
+			if (ret)
+				break;
+			cpumask_set_cpu(ctx.items[i].cpu, &online_mask);
+		}
+
+		/* Batch device_online for all preserved session CPUs */
+		if (!ret)
+			ret = cpuhp_online_mask(&online_mask);
+
+		for (i = 0; i < ctx.nr; i++) {
+			if (!ret) {
+				ret = cpupr_ro_setup_cpu(ctx.items[i].cpu,
+							 args->session,
+							 ctx.items[i].ser,
+							 ctx.items[i].ser_pa);
+			}
+			if (!ret && ctx.items[i].ser_pa == args->serialized_data)
+				cpu = ctx.items[i].cpu;
+		}
+		kfree(ctx.items);
+		if (ret < 0)
+			return ret;
+		if (cpu >= 0)
+			goto make_file;
+	}
+	kfree(ctx.items);
 
 	ser = kho_ro_map_folio(args->serialized_data, PAGE_KERNEL);
 	if (!ser)
@@ -2306,13 +2578,14 @@ static int cpupr_retrieve_ro_cb(struct liveupdate_file_op_args *args)
 	if (cpu < 0)
 		return cpu;
 
-	lock_device_hotplug();
 	if (!cpu_online(cpu)) {
 		struct device *dev = get_cpu_device(cpu);
 
 		if (!dev) {
 			ret = -ENODEV;
 		} else {
+			struct cpumask single_mask;
+
 			scoped_guard(mutex, &cpupr_lock) {
 				cpumask_set_cpu(cpu, &cpupr_mask);
 				cpupr_signal_exit_ser(ser);
@@ -2322,18 +2595,21 @@ static int cpupr_retrieve_ro_cb(struct liveupdate_file_op_args *args)
 			ret = cpupr_wait_dead_ser(cpu, ser,
 						  5 * CPUPR_WAIT_DEAD_TIMEOUT_US,
 						  true);
-			if (!ret)
-				ret = device_online(dev);
+			if (!ret) {
+				cpumask_clear(&single_mask);
+				cpumask_set_cpu(cpu, &single_mask);
+				ret = cpuhp_online_mask(&single_mask);
+			}
 			if (!ret)
 				ret = cpupr_ro_setup_cpu(cpu, args->session,
 							 ser,
 							 args->serialized_data);
 		}
 	}
-	unlock_device_hotplug();
 	if (ret < 0)
 		return ret;
 
+make_file:
 	file = anon_inode_getfile("cpu_preserve_ro", &cpupr_ro_fops,
 				  (void *)(uintptr_t)cpu, O_RDONLY);
 	if (IS_ERR(file))
