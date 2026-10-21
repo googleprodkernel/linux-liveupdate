@@ -28,6 +28,8 @@ extern int irq_init_percpu_irqstack(unsigned int cpu);
 struct irq_desc;
 
 extern void fixup_irqs(void);
+extern void fixup_irqs_migrate(void);
+extern void fixup_irqs_drain(void);
 
 #if IS_ENABLED(CONFIG_KVM)
 extern void kvm_set_posted_intr_wakeup_handler(void (*handler)(void));

@@ -172,24 +172,6 @@ static void ap_starting(void)
 {
 	int cpuid = smp_processor_id();
 
-	/* Mop up eventual mwait_play_dead() wreckage */
-	this_cpu_write(mwait_cpu_dead.status, 0);
-	this_cpu_write(mwait_cpu_dead.control, 0);
-
-	/*
-	 * If woken up by an INIT in an 82489DX configuration the alive
-	 * synchronization guarantees that the CPU does not reach this
-	 * point before an INIT_deassert IPI reaches the local APIC, so it
-	 * is now safe to touch the local APIC.
-	 *
-	 * Set up this CPU, first the APIC, which is probably redundant on
-	 * most boards.
-	 */
-	apic_ap_setup();
-
-	/* Save the processor parameters. */
-	identify_secondary_cpu(cpuid);
-
 	/*
 	 * The topology information must be up to date before
 	 * notify_cpu_starting().
@@ -266,6 +248,14 @@ static void notrace __noendbr start_secondary(void *unused)
 	 */
 	load_ucode_ap();
 
+	this_cpu_write(mwait_cpu_dead.status, 0);
+	this_cpu_write(mwait_cpu_dead.control, 0);
+	cpu_init();
+	fpu__init_cpu();
+	x86_cpuinit.early_percpu_clock_init();
+	apic_ap_setup();
+	identify_secondary_cpu(raw_smp_processor_id());
+
 	/*
 	 * Synchronization point with the hotplug core. Sets this CPUs
 	 * synchronization state to ALIVE and spin-waits for the control CPU to
@@ -273,11 +263,7 @@ static void notrace __noendbr start_secondary(void *unused)
 	 */
 	cpuhp_ap_sync_alive();
 
-	cpu_init();
-	fpu__init_cpu();
 	rcutree_report_cpu_starting(raw_smp_processor_id());
-	x86_cpuinit.early_percpu_clock_init();
-
 	ap_starting();
 
 	/* Check TSC synchronization with the control CPU. */
@@ -442,9 +428,9 @@ early_param("split_llc", split_llc_setup);
 
 static bool match_llc(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 {
-	const struct x86_cpu_id *id = x86_match_cpu(intel_cod_cpu);
+	static int intel_snc_cached = -1;
 	int cpu1 = c->cpu_index, cpu2 = o->cpu_index;
-	bool intel_snc = id && id->driver_data;
+	int snc;
 
 	/* Do not match if we do not have a valid APICID for cpu: */
 	if (per_cpu_llc_id(cpu1) == BAD_APICID)
@@ -459,12 +445,20 @@ static bool match_llc(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 	    (per_cpu_core_id(cpu2) % split_llc))
 		return false;
 
+	snc = READ_ONCE(intel_snc_cached);
+	if (unlikely(snc < 0)) {
+		const struct x86_cpu_id *id = x86_match_cpu(intel_cod_cpu);
+
+		snc = (id && id->driver_data) ? 1 : 0;
+		WRITE_ONCE(intel_snc_cached, snc);
+	}
+
 	/*
 	 * Allow the SNC topology without warning. Return of false
 	 * means 'c' does not share the LLC of 'o'. This will be
 	 * reflected to userspace.
 	 */
-	if (match_pkg(c, o) && !topology_same_node(c, o) && intel_snc)
+	if (match_pkg(c, o) && !topology_same_node(c, o) && snc)
 		return false;
 
 	return topology_sane(c, o, "llc");
@@ -983,7 +977,7 @@ static void announce_cpu(int cpu, int apicid)
 		first = 0;
 
 		pr_cont("%*s#%d", width - num_digits(cpu), " ", cpu);
-	} else
+	} else if (!cpuhp_in_batch())
 		pr_info("Booting Node %d Processor %d APIC 0x%x\n",
 			node, cpu, apicid);
 }
@@ -1024,6 +1018,8 @@ static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 	if (IS_ENABLED(CONFIG_X86_32)) {
 		early_gdt_descr.address = (unsigned long)get_cpu_gdt_rw(cpu);
 		initial_stack  = idle->thread.sp;
+	} else if (x86_cpuinit.parallel_bringup) {
+		smpboot_control = STARTUP_READ_APICID;
 	} else if (!(smpboot_control & STARTUP_PARALLEL_MASK)) {
 		smpboot_control = cpu;
 	}
@@ -1143,7 +1139,7 @@ void arch_cpuhp_cleanup_dead_cpu(unsigned int cpu)
 	if (smp_ops.cleanup_dead_cpu)
 		smp_ops.cleanup_dead_cpu(cpu);
 
-	if (system_state == SYSTEM_RUNNING)
+	if (system_state == SYSTEM_RUNNING && !cpuhp_in_batch())
 		pr_info("CPU %u is now offline\n", cpu);
 }
 
@@ -1361,6 +1357,14 @@ static void remove_cpu_from_maps(int cpu)
 	numa_remove_cpu(cpu);
 }
 
+static DEFINE_RAW_SPINLOCK(cpu_disable_lock);
+static atomic_t cpuhp_batch_disable_todo;
+
+void arch_cpuhp_batch_disable_set(int nr)
+{
+	atomic_set(&cpuhp_batch_disable_todo, nr);
+}
+
 void cpu_disable_common(void)
 {
 	int cpu = smp_processor_id();
@@ -1384,6 +1388,34 @@ void cpu_disable_common(void)
 int native_cpu_disable(void)
 {
 	int ret;
+
+	if (atomic_read(&cpuhp_batch_disable_todo) > 0) {
+		int cpu = smp_processor_id();
+
+		raw_spin_lock(&cpu_disable_lock);
+		ret = lapic_can_unplug_cpu();
+		if (!ret) {
+			remove_siblinginfo(cpu);
+			this_cpu_write(kernel_fpu_allowed, false);
+			lock_vector_lock();
+			remove_cpu_from_maps(cpu);
+			unlock_vector_lock();
+			fixup_irqs_migrate();
+		}
+		raw_spin_unlock(&cpu_disable_lock);
+
+		if (atomic_dec_return(&cpuhp_batch_disable_todo) > 0) {
+			while (atomic_read(&cpuhp_batch_disable_todo) > 0)
+				cpu_relax();
+		}
+		if (ret)
+			return ret;
+
+		fixup_irqs_drain();
+		lapic_offline();
+		apic_soft_disable();
+		return 0;
+	}
 
 	ret = lapic_can_unplug_cpu();
 	if (ret)

@@ -2110,22 +2110,28 @@ static void identify_cpu(struct cpuinfo_x86 *c)
 	 * common between the CPUs.  The first time this routine gets
 	 * executed, c == &boot_cpu_data.
 	 */
-	if (c != &boot_cpu_data) {
-		/* AND the already accumulated flags with these */
-		for (i = 0; i < NCAPINTS; i++)
-			boot_cpu_data.x86_capability[i] &= c->x86_capability[i];
+	{
+		static DEFINE_RAW_SPINLOCK(identify_cpu_lock);
+		unsigned long flags;
 
-		/* OR, i.e. replicate the bug flags */
-		for (i = NCAPINTS; i < NCAPINTS + NBUGINTS; i++)
-			c->x86_capability[i] |= boot_cpu_data.x86_capability[i];
+		raw_spin_lock_irqsave(&identify_cpu_lock, flags);
+		if (c != &boot_cpu_data) {
+			/* AND the already accumulated flags with these */
+			for (i = 0; i < NCAPINTS; i++)
+				boot_cpu_data.x86_capability[i] &= c->x86_capability[i];
+
+			/* OR, i.e. replicate the bug flags */
+			for (i = NCAPINTS; i < NCAPINTS + NBUGINTS; i++)
+				c->x86_capability[i] |= boot_cpu_data.x86_capability[i];
+		}
+		numa_add_cpu(raw_smp_processor_id());
+		raw_spin_unlock_irqrestore(&identify_cpu_lock, flags);
 	}
 
 	ppin_init(c);
 
 	/* Init Machine Check Exception if available. */
 	mcheck_cpu_init(c);
-
-	numa_add_cpu(smp_processor_id());
 }
 
 /*

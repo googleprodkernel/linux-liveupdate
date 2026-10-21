@@ -108,6 +108,7 @@ void native_smp_cpus_done(unsigned int max_cpus);
 int common_cpu_up(unsigned int cpunum, struct task_struct *tidle);
 int native_kick_ap(unsigned int cpu, struct task_struct *tidle);
 int native_cpu_disable(void);
+void arch_cpuhp_batch_disable_set(int nr);
 void __noreturn hlt_play_dead(void);
 void __noreturn native_play_dead(void);
 void play_dead_common(void);

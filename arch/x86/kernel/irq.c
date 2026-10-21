@@ -463,15 +463,17 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_posted_msi_notification)
 #endif /* X86_POSTED_MSI */
 
 #ifdef CONFIG_HOTPLUG_CPU
-/* A cpu has been removed from cpu_online_mask.  Reset irq affinities. */
-void fixup_irqs(void)
+void fixup_irqs_migrate(void)
+{
+	irq_migrate_all_off_this_cpu();
+}
+
+void fixup_irqs_drain(void)
 {
 	unsigned int vector;
 	struct irq_desc *desc;
 	struct irq_data *data;
 	struct irq_chip *chip;
-
-	irq_migrate_all_off_this_cpu();
 
 	/*
 	 * We can remove mdelay() and then send spurious interrupts to
@@ -508,6 +510,13 @@ void fixup_irqs(void)
 		if (__this_cpu_read(vector_irq[vector]) != VECTOR_RETRIGGERED)
 			__this_cpu_write(vector_irq[vector], VECTOR_UNUSED);
 	}
+}
+
+/* A cpu has been removed from cpu_online_mask.  Reset irq affinities. */
+void fixup_irqs(void)
+{
+	fixup_irqs_migrate();
+	fixup_irqs_drain();
 }
 #endif
 
