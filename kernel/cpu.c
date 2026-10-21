@@ -1747,7 +1747,7 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
 		goto out;
 	}
 
-	if (cpu_is_preserved(cpu)) {
+	if (cpu_is_preserved(cpu) && target >= CPUHP_BP_KICK_AP) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -2114,6 +2114,20 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(cpuhp_online_mask);
+
+static int __init cpuhp_prewarm_present_cpus(void)
+{
+	unsigned int cpu;
+
+	cpu_maps_update_begin();
+	for_each_present_cpu(cpu) {
+		if (!cpu_online(cpu))
+			_cpu_up(cpu, 0, CPUHP_BP_PREPARE_DYN_END);
+	}
+	cpu_maps_update_done();
+	return 0;
+}
+late_initcall(cpuhp_prewarm_present_cpus);
 
 /**
  * bringup_hibernate_cpu - Bring up the CPU that we hibernated on
