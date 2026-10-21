@@ -615,13 +615,15 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 	if (!found)
 		return -ENOENT;
 
+	bool incoming = container_of(file_set, struct luo_session, file_set)->retrieved;
+
 	guard(mutex)(&luo_file->mutex);
-	if (luo_file->retrieve_status < 0) {
+	if (incoming && luo_file->retrieve_status < 0) {
 		/* Retrieve was attempted and it failed. Return the error code. */
 		return luo_file->retrieve_status;
 	}
 
-	if (luo_file->retrieve_status > 0) {
+	if (incoming && luo_file->retrieve_status > 0) {
 		/*
 		 * The argument only applies to the retrieve that restores the
 		 * file. Don't silently ignore it.
@@ -652,32 +654,35 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 		 * the failure as retryable (e.g. invalid user argument before
 		 * preserved state was consumed).
 		 */
-		if (!args.retryable)
+		if (incoming && !args.retryable)
 			luo_file->retrieve_status = err;
 		return err;
 	}
 
-	err = xa_insert(&luo_preserved_files,
-			luo_get_id(luo_file->fh, args.file), args.file,
-			GFP_KERNEL);
-	if (err) {
-		/*
-		 * The handler has consumed the preserved state, so the retrieve
-		 * can't be retried. Keep the file until the file set is
-		 * finished, so that its resources are released at the same
-		 * time as those of other retrieved files.
-		 */
+	if (incoming) {
+		err = xa_insert(&luo_preserved_files,
+				luo_get_id(luo_file->fh, args.file), args.file,
+				GFP_KERNEL);
+		if (err) {
+			/*
+			 * The handler has consumed the preserved state, so the retrieve
+			 * can't be retried. Keep the file until the file set is
+			 * finished, so that its resources are released at the same
+			 * time as those of other retrieved files.
+			 */
+			luo_file->file = args.file;
+			luo_file->retrieve_status = err;
+			return err;
+		}
+
 		luo_file->file = args.file;
-		luo_file->retrieve_status = err;
-		return err;
+		/* Get reference so we can keep this file in LUO until finish */
+		get_file(luo_file->file);
 	}
 
-	luo_file->file = args.file;
-	/* Get reference so we can keep this file in LUO until finish */
-	get_file(luo_file->file);
-
-	*filep = luo_file->file;
-	luo_file->retrieve_status = 1;
+	*filep = args.file;
+	if (incoming)
+		luo_file->retrieve_status = 1;
 
 	return 0;
 }

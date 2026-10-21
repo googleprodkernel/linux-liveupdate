@@ -349,6 +349,9 @@ static int luo_session_finish(struct luo_session *session,
 	if (argp->reserved)
 		return -EINVAL;
 
+	if (!session->retrieved)
+		return luo_ucmd_respond(ucmd, sizeof(*argp));
+
 	err = luo_session_finish_one(session);
 	if (err)
 		return err;
@@ -449,8 +452,8 @@ static bool luo_ioctl_type_valid(struct luo_session *session,
 {
 	switch (op->type) {
 	case LUO_IOCTL_INCOMING:
-		/* Retrieved is only set on incoming sessions */
-		return session->retrieved;
+		/* Allow retrieval on incoming sessions and frozen outgoing sessions */
+		return session->retrieved || session->user_frozen;
 	case LUO_IOCTL_OUTGOING:
 		return !session->retrieved;
 	case LUO_IOCTL_ALL:
