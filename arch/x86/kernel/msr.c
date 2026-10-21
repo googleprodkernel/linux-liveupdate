@@ -34,6 +34,8 @@
 #include <linux/fs.h>
 #include <linux/device.h>
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
+#include <linux/workqueue.h>
 #include <linux/notifier.h>
 #include <linux/uaccess.h>
 #include <linux/gfp.h>
@@ -247,18 +249,67 @@ static const struct class msr_class = {
 	.devnode	= msr_devnode,
 };
 
+static cpumask_t msr_dev_created_mask;
+static cpumask_t msr_dev_pending_map;
+static DEFINE_SPINLOCK(msr_dev_pending_lock);
+
+static void msr_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		bool do_add = false;
+
+		scoped_guard(spinlock_irqsave, &msr_dev_pending_lock) {
+			if (cpumask_test_and_clear_cpu(cpu, &msr_dev_pending_map))
+				do_add = true;
+		}
+		if (!do_add)
+			continue;
+		cpus_read_lock();
+		if (cpu_online(cpu) && !cpumask_test_cpu(cpu, &msr_dev_created_mask)) {
+			struct device *dev = device_create(&msr_class, NULL,
+							   MKDEV(MSR_MAJOR, cpu),
+							   NULL, "msr%d", cpu);
+			if (!IS_ERR(dev))
+				cpumask_set_cpu(cpu, &msr_dev_created_mask);
+		}
+		cpus_read_unlock();
+	}
+}
+static DECLARE_DELAYED_WORK(msr_add_dev_work, msr_add_dev_work_fn);
+
 static int msr_device_create(unsigned int cpu)
 {
 	struct device *dev;
 
+	if (cpumask_test_cpu(cpu, &msr_dev_created_mask))
+		return 0;
+
+	if (cpuhp_in_batch()) {
+		scoped_guard(spinlock_irqsave, &msr_dev_pending_lock)
+			cpumask_set_cpu(cpu, &msr_dev_pending_map);
+		schedule_delayed_work(&msr_add_dev_work, HZ);
+		return 0;
+	}
+
 	dev = device_create(&msr_class, NULL, MKDEV(MSR_MAJOR, cpu), NULL,
 			    "msr%d", cpu);
+	if (!IS_ERR(dev))
+		cpumask_set_cpu(cpu, &msr_dev_created_mask);
 	return PTR_ERR_OR_ZERO(dev);
 }
 
 static int msr_device_destroy(unsigned int cpu)
 {
-	device_destroy(&msr_class, MKDEV(MSR_MAJOR, cpu));
+	scoped_guard(spinlock_irqsave, &msr_dev_pending_lock)
+		cpumask_clear_cpu(cpu, &msr_dev_pending_map);
+
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
+
+	if (cpumask_test_and_clear_cpu(cpu, &msr_dev_created_mask))
+		device_destroy(&msr_class, MKDEV(MSR_MAJOR, cpu));
 	return 0;
 }
 

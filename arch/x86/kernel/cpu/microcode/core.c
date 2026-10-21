@@ -28,6 +28,9 @@
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
+#include <linux/cpu_preserve.h>
+#include <linux/workqueue.h>
 #include <linux/nmi.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -843,10 +846,33 @@ static struct syscore mc_syscore = {
 	.ops = &mc_syscore_ops,
 };
 
+static cpumask_t mc_dev_created_mask;
+
+static void mc_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
+		if (!cpumask_test_and_set_cpu(cpu, &mc_dev_created_mask)) {
+			struct device *dev = get_cpu_device(cpu);
+
+			if (dev && sysfs_create_group(&dev->kobj, &mc_attr_group))
+				pr_err("Failed to create group for CPU%d\n", cpu);
+		}
+	}
+	cpus_read_unlock();
+}
+
+static DECLARE_DELAYED_WORK(mc_add_dev_work, mc_add_dev_work_fn);
+
 static int mc_cpu_online(unsigned int cpu)
 {
 	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
 	struct device *dev = get_cpu_device(cpu);
+
+	if (cpumask_test_cpu(cpu, &mc_dev_created_mask))
+		return 0;
 
 	memset(uci, 0, sizeof(*uci));
 
@@ -855,8 +881,15 @@ static int mc_cpu_online(unsigned int cpu)
 	if (!cpu)
 		boot_cpu_data.microcode = uci->cpu_sig.rev;
 
+	if (cpuhp_in_batch()) {
+		schedule_delayed_work(&mc_add_dev_work, HZ);
+		return 0;
+	}
+
 	if (sysfs_create_group(&dev->kobj, &mc_attr_group))
 		pr_err("Failed to create group for CPU%d\n", cpu);
+	else
+		cpumask_set_cpu(cpu, &mc_dev_created_mask);
 	return 0;
 }
 
@@ -864,8 +897,12 @@ static int mc_cpu_down_prep(unsigned int cpu)
 {
 	struct device *dev = get_cpu_device(cpu);
 
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu))
+		return 0;
+
 	microcode_fini_cpu(cpu);
-	sysfs_remove_group(&dev->kobj, &mc_attr_group);
+	if (cpumask_test_and_clear_cpu(cpu, &mc_dev_created_mask))
+		sysfs_remove_group(&dev->kobj, &mc_attr_group);
 	return 0;
 }
 

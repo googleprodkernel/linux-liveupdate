@@ -10,6 +10,9 @@
 
 #include <linux/cpuhotplug.h>
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
+#include <linux/cpumask.h>
+#include <linux/workqueue.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
@@ -185,13 +188,39 @@ static const struct attribute_group intel_epb_attr_group = {
 	.attrs =  intel_epb_attrs
 };
 
+static cpumask_t epb_dev_created_mask;
+
+static void epb_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
+		if (!cpumask_test_and_set_cpu(cpu, &epb_dev_created_mask)) {
+			struct device *cpu_dev = get_cpu_device(cpu);
+
+			if (cpu_dev)
+				sysfs_merge_group(&cpu_dev->kobj, &intel_epb_attr_group);
+		}
+	}
+	cpus_read_unlock();
+}
+
+static DECLARE_DELAYED_WORK(epb_add_dev_work, epb_add_dev_work_fn);
+
 static int intel_epb_online(unsigned int cpu)
 {
 	struct device *cpu_dev = get_cpu_device(cpu);
 
 	intel_epb_restore(NULL);
-	if (!cpuhp_tasks_frozen)
-		sysfs_merge_group(&cpu_dev->kobj, &intel_epb_attr_group);
+	if (!cpuhp_tasks_frozen && !cpumask_test_cpu(cpu, &epb_dev_created_mask)) {
+		if (cpuhp_in_batch()) {
+			schedule_delayed_work(&epb_add_dev_work, HZ);
+		} else {
+			sysfs_merge_group(&cpu_dev->kobj, &intel_epb_attr_group);
+			cpumask_set_cpu(cpu, &epb_dev_created_mask);
+		}
+	}
 
 	return 0;
 }
@@ -200,8 +229,10 @@ static int intel_epb_offline(unsigned int cpu)
 {
 	struct device *cpu_dev = get_cpu_device(cpu);
 
-	if (!cpuhp_tasks_frozen)
-		sysfs_unmerge_group(&cpu_dev->kobj, &intel_epb_attr_group);
+	if (!cpuhp_tasks_frozen && !cpuhp_in_batch() && !cpu_is_preserved(cpu)) {
+		if (cpumask_test_and_clear_cpu(cpu, &epb_dev_created_mask))
+			sysfs_unmerge_group(&cpu_dev->kobj, &intel_epb_attr_group);
+	}
 
 	intel_epb_save(NULL);
 	return 0;

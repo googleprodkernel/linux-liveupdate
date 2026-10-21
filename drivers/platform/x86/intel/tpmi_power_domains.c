@@ -189,6 +189,9 @@ static int tpmi_cpu_online(unsigned int cpu)
 	struct tpmi_cpu_info *info = &per_cpu(tpmi_cpu_info, cpu);
 	int ret, index;
 
+	if (!hlist_unhashed(&info->hnode))
+		return 0;
+
 	/* Don't fail CPU online for some bad mapping of CPUs */
 	ret = tpmi_get_logical_id(cpu, info);
 	if (ret)

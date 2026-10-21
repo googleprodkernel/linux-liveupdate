@@ -17,9 +17,11 @@
 #define pr_fmt(fmt)	"resctrl: " fmt
 
 #include <linux/cpu.h>
+#include <linux/cpu_preserve.h>
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/cpuhotplug.h>
+#include <linux/workqueue.h>
 
 #include <asm/cpu_device_id.h>
 #include <asm/cpuid/api.h>
@@ -737,17 +739,63 @@ static void clear_closid_rmid(int cpu)
 	wrmsrq(MSR_IA32_PQR_ASSOC, val.q);
 }
 
+static cpumask_t resctrl_cpu_init_mask;
+static cpumask_t resctrl_cpu_pending_map;
+static DEFINE_SPINLOCK(resctrl_cpu_pending_lock);
+
+static void resctrl_add_dev_work_fn(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu) {
+		bool do_add = false;
+
+		scoped_guard(spinlock_irqsave, &resctrl_cpu_pending_lock) {
+			if (cpumask_test_and_clear_cpu(cpu, &resctrl_cpu_pending_map))
+				do_add = true;
+		}
+		if (!do_add)
+			continue;
+		cpus_read_lock();
+		if (cpu_online(cpu) && !cpumask_test_cpu(cpu, &resctrl_cpu_init_mask)) {
+			struct rdt_resource *r;
+
+			mutex_lock(&domain_list_lock);
+			for_each_capable_rdt_resource(r)
+				domain_add_cpu(cpu, r);
+			mutex_unlock(&domain_list_lock);
+
+			resctrl_online_cpu(cpu);
+			cpumask_set_cpu(cpu, &resctrl_cpu_init_mask);
+		}
+		cpus_read_unlock();
+	}
+}
+static DECLARE_DELAYED_WORK(resctrl_add_dev_work, resctrl_add_dev_work_fn);
+
 static int resctrl_arch_online_cpu(unsigned int cpu)
 {
 	struct rdt_resource *r;
+
+	clear_closid_rmid(cpu);
+
+	if (cpumask_test_cpu(cpu, &resctrl_cpu_init_mask))
+		return 0;
+
+	if (cpuhp_in_batch()) {
+		scoped_guard(spinlock_irqsave, &resctrl_cpu_pending_lock)
+			cpumask_set_cpu(cpu, &resctrl_cpu_pending_map);
+		schedule_delayed_work(&resctrl_add_dev_work, HZ);
+		return 0;
+	}
 
 	mutex_lock(&domain_list_lock);
 	for_each_capable_rdt_resource(r)
 		domain_add_cpu(cpu, r);
 	mutex_unlock(&domain_list_lock);
 
-	clear_closid_rmid(cpu);
 	resctrl_online_cpu(cpu);
+	cpumask_set_cpu(cpu, &resctrl_cpu_init_mask);
 
 	return 0;
 }
@@ -756,12 +804,22 @@ static int resctrl_arch_offline_cpu(unsigned int cpu)
 {
 	struct rdt_resource *r;
 
-	resctrl_offline_cpu(cpu);
+	scoped_guard(spinlock_irqsave, &resctrl_cpu_pending_lock)
+		cpumask_clear_cpu(cpu, &resctrl_cpu_pending_map);
 
-	mutex_lock(&domain_list_lock);
-	for_each_capable_rdt_resource(r)
-		domain_remove_cpu(cpu, r);
-	mutex_unlock(&domain_list_lock);
+	if (cpuhp_in_batch() || cpu_is_preserved(cpu)) {
+		clear_closid_rmid(cpu);
+		return 0;
+	}
+
+	if (cpumask_test_and_clear_cpu(cpu, &resctrl_cpu_init_mask)) {
+		resctrl_offline_cpu(cpu);
+
+		mutex_lock(&domain_list_lock);
+		for_each_capable_rdt_resource(r)
+			domain_remove_cpu(cpu, r);
+		mutex_unlock(&domain_list_lock);
+	}
 
 	clear_closid_rmid(cpu);
 
