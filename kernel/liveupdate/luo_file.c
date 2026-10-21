@@ -937,6 +937,27 @@ void luo_file_set_destroy(struct luo_file_set *file_set)
 	WARN_ON(!kho_block_set_is_empty(&file_set->block_set));
 }
 
+int luo_session_for_each_file(struct liveupdate_session *session,
+			      struct liveupdate_file_handler *fh,
+			      int (*cb)(u64 token, u64 data, void *arg),
+			      void *arg)
+{
+	struct luo_session *s = (struct luo_session *)session;
+	struct luo_file_set *file_set = &s->file_set;
+	struct luo_file *luo_file;
+	int ret = 0;
+
+	lockdep_assert_held(&s->mutex);
+	list_for_each_entry(luo_file, &file_set->files_list, list) {
+		if (fh && luo_file->fh != fh)
+			continue;
+		ret = cb(luo_file->token, luo_file->serialized_data, arg);
+		if (ret)
+			break;
+	}
+	return ret;
+}
+
 /**
  * liveupdate_register_file_handler - Register a file handler with LUO.
  * @fh: Pointer to a caller-allocated &struct liveupdate_file_handler.

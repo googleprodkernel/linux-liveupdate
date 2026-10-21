@@ -99,6 +99,10 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 			 struct luo_file_set_ser *file_set_ser);
 void luo_file_set_init(struct luo_file_set *file_set);
 void luo_file_set_destroy(struct luo_file_set *file_set);
+int luo_session_for_each_file(struct liveupdate_session *session,
+			      struct liveupdate_file_handler *fh,
+			      int (*cb)(u64 token, u64 data, void *arg),
+			      void *arg);
 
 int luo_flb_file_preserve(struct liveupdate_file_handler *fh);
 void luo_flb_file_unpreserve(struct liveupdate_file_handler *fh);
