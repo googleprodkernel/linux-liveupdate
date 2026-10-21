@@ -233,10 +233,8 @@ int smpboot_unpark_threads(unsigned int cpu)
 {
 	struct smp_hotplug_thread *cur;
 
-	mutex_lock(&smpboot_threads_lock);
 	list_for_each_entry(cur, &hotplug_threads, list)
 		smpboot_unpark_thread(cur, cpu);
-	mutex_unlock(&smpboot_threads_lock);
 	return 0;
 }
 
@@ -252,10 +250,8 @@ int smpboot_park_threads(unsigned int cpu)
 {
 	struct smp_hotplug_thread *cur;
 
-	mutex_lock(&smpboot_threads_lock);
 	list_for_each_entry_reverse(cur, &hotplug_threads, list)
 		smpboot_park_thread(cur, cpu);
-	mutex_unlock(&smpboot_threads_lock);
 	return 0;
 }
 

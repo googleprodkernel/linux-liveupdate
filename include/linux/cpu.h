@@ -123,6 +123,9 @@ extern void cpu_maps_update_done(void);
 int bringup_hibernate_cpu(unsigned int sleep_cpu);
 void bringup_nonboot_cpus(unsigned int max_cpus);
 int arch_cpu_rescan_dead_smt_siblings(void);
+void sched_domains_defer_begin(void);
+void sched_domains_defer_end(void);
+void sched_cpu_deactivate_prepare_mask(const struct cpumask *cpus);
 
 #else	/* CONFIG_SMP */
 #define cpuhp_tasks_frozen	0
@@ -138,6 +141,10 @@ static inline void cpu_maps_update_done(void)
 static inline int add_cpu(unsigned int cpu) { return 0;}
 
 static inline int arch_cpu_rescan_dead_smt_siblings(void) { return 0; }
+
+static inline void sched_domains_defer_begin(void) { }
+static inline void sched_domains_defer_end(void) { }
+static inline void sched_cpu_deactivate_prepare_mask(const struct cpumask *cpus) { }
 
 #endif /* CONFIG_SMP */
 extern const struct bus_type cpu_subsys;

@@ -4088,6 +4088,8 @@ static int dl_bw_manage(enum dl_bw_request req, int cpu, u64 dl_bw)
 			else
 				overflow = 1;
 		}
+		if (!overflow && dl_server_bw)
+			__dl_sub(dl_b, dl_server_bw, max(dl_bw_cpus(cpu) - 1, 1));
 
 		break;
 	}

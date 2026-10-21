@@ -2631,6 +2631,48 @@ void sched_domains_numa_masks_clear(unsigned int cpu)
 	}
 }
 
+void sched_domains_numa_sync(void)
+{
+	bool need_reinit = false;
+	int i, j, k;
+
+	if (!sched_domains_numa_levels || !sched_domains_numa_masks ||
+	    !sched_domains_numa_masks[0]) {
+		need_reinit = true;
+	} else {
+		for (j = 0; j < nr_node_ids; j++) {
+			if ((sched_domains_numa_masks[0][j] != NULL) !=
+			    node_state(j, N_CPU)) {
+				need_reinit = true;
+				break;
+			}
+		}
+	}
+
+	if (need_reinit) {
+		sched_reset_numa();
+		sched_init_numa(NUMA_NO_NODE);
+		return;
+	}
+
+	for (i = 0; i < sched_domains_numa_levels; i++) {
+		for (j = 0; j < nr_node_ids; j++) {
+			struct cpumask *mask = sched_domains_numa_masks[i][j];
+
+			if (!mask)
+				continue;
+			cpumask_clear(mask);
+			if (!node_state(j, N_CPU))
+				continue;
+			for_each_node_state(k, N_CPU) {
+				if (arch_sched_node_distance(j, k) <=
+				    sched_domains_numa_distance[i])
+					cpumask_or(mask, mask, cpumask_of_node(k));
+			}
+		}
+	}
+}
+
 /*
  * sched_numa_find_closest() - given the NUMA topology, find the cpu
  *                             closest to @cpu from @cpumask.

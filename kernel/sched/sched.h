@@ -2101,6 +2101,7 @@ extern void sched_init_numa(int offline_node);
 extern void sched_update_numa(int cpu, bool online);
 extern void sched_domains_numa_masks_set(unsigned int cpu);
 extern void sched_domains_numa_masks_clear(unsigned int cpu);
+extern void sched_domains_numa_sync(void);
 extern int sched_numa_find_closest(const struct cpumask *cpus, int cpu);
 
 #else /* !CONFIG_NUMA: */
@@ -2109,6 +2110,7 @@ static inline void sched_init_numa(int offline_node) { }
 static inline void sched_update_numa(int cpu, bool online) { }
 static inline void sched_domains_numa_masks_set(unsigned int cpu) { }
 static inline void sched_domains_numa_masks_clear(unsigned int cpu) { }
+static inline void sched_domains_numa_sync(void) { }
 
 static inline int sched_numa_find_closest(const struct cpumask *cpus, int cpu)
 {

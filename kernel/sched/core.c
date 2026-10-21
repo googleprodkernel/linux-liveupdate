@@ -3142,7 +3142,9 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 		 * SCA_MIGRATE_ENABLE, otherwise we'll not call
 		 * set_cpus_allowed_common() and actually reset p->cpus_ptr.
 		 */
-		cpu_valid_mask = cpu_online_mask;
+		if (is_migration_disabled(p) || kthread_is_per_cpu(p) ||
+		    !cpumask_intersects(ctx->new_mask, cpu_active_mask))
+			cpu_valid_mask = cpu_online_mask;
 	}
 
 	if (!kthread && !cpumask_subset(ctx->new_mask, cpu_allowed_mask)) {
@@ -8641,6 +8643,9 @@ static inline void sched_set_rq_offline(struct rq *rq, int cpu)
  * used to mark begin/end of suspend/resume:
  */
 static int num_cpus_frozen;
+static int sched_domains_defer_depth;
+static bool sched_domains_defer_pending;
+static struct cpumask sched_deactivate_prepared_cpus;
 
 /*
  * Update cpusets according to cpu_active mask.  If cpusets are
@@ -8652,6 +8657,10 @@ static int num_cpus_frozen;
  */
 static void cpuset_cpu_active(void)
 {
+	if (sched_domains_defer_depth > 0) {
+		sched_domains_defer_pending = true;
+		return;
+	}
 	if (cpuhp_tasks_frozen) {
 		/*
 		 * num_cpus_frozen tracks how many CPUs are involved in suspend
@@ -8674,6 +8683,10 @@ static void cpuset_cpu_active(void)
 
 static void cpuset_cpu_inactive(unsigned int cpu)
 {
+	if (sched_domains_defer_depth > 0) {
+		sched_domains_defer_pending = true;
+		return;
+	}
 	if (!cpuhp_tasks_frozen) {
 		cpuset_update_active_cpus();
 	} else {
@@ -8682,14 +8695,108 @@ static void cpuset_cpu_inactive(unsigned int cpu)
 	}
 }
 
+void sched_domains_defer_begin(void)
+{
+	lockdep_assert_cpus_held();
+	sched_domains_defer_depth++;
+}
+EXPORT_SYMBOL_GPL(sched_domains_defer_begin);
+
+void sched_domains_defer_end(void)
+{
+	unsigned int cpu;
+	int smt_cores = 0, cur_cnt;
+
+	lockdep_assert_cpus_held();
+	if (WARN_ON_ONCE(sched_domains_defer_depth <= 0))
+		return;
+	if (--sched_domains_defer_depth > 0)
+		return;
+
+	for_each_cpu(cpu, &sched_deactivate_prepared_cpus) {
+		balance_push_set(cpu, false);
+		if (cpu_online(cpu))
+			set_cpu_active(cpu, true);
+	}
+	cpumask_clear(&sched_deactivate_prepared_cpus);
+
+	for_each_online_cpu(cpu) {
+		if (cpu == cpumask_first(cpu_smt_mask(cpu)) &&
+		    cpumask_weight(cpu_smt_mask(cpu)) >= 2)
+			smt_cores++;
+	}
+	cur_cnt = static_key_count(&sched_smt_present.key);
+	if (smt_cores > cur_cnt) {
+		if (cur_cnt == 0) {
+			static_branch_inc_cpuslocked(&sched_smt_present);
+			cur_cnt++;
+		}
+		if (smt_cores > cur_cnt)
+			atomic_add(smt_cores - cur_cnt, &sched_smt_present.key.enabled);
+	} else if (smt_cores < cur_cnt) {
+		if (smt_cores == 0) {
+			if (cur_cnt > 1)
+				atomic_sub(cur_cnt - 1, &sched_smt_present.key.enabled);
+			static_branch_dec_cpuslocked(&sched_smt_present);
+		} else {
+			atomic_sub(cur_cnt - smt_cores, &sched_smt_present.key.enabled);
+		}
+	}
+
+	if (sched_domains_defer_pending) {
+		sched_domains_defer_pending = false;
+		if (sched_smp_initialized) {
+			sched_domains_numa_sync();
+			cpuset_force_rebuild();
+			cpuset_update_active_cpus();
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(sched_domains_defer_end);
+
+void sched_cpu_deactivate_prepare_mask(const struct cpumask *cpus)
+{
+	unsigned int cpu;
+	bool any = false;
+
+	if (!cpus || cpumask_empty(cpus))
+		return;
+
+	for_each_cpu(cpu, cpus) {
+		struct rq *rq;
+
+		if (!cpu || !cpu_online(cpu) || !cpu_active(cpu))
+			continue;
+		if (dl_bw_deactivate(cpu))
+			continue;
+
+		rq = cpu_rq(cpu);
+		scoped_guard (rcu)
+			nohz_balance_exit_idle(rq);
+
+		set_cpu_active(cpu, false);
+		balance_push_set(cpu, true);
+		cpumask_set_cpu(cpu, &sched_deactivate_prepared_cpus);
+		any = true;
+	}
+
+	if (any)
+		synchronize_rcu();
+}
+EXPORT_SYMBOL_GPL(sched_cpu_deactivate_prepare_mask);
+
 static inline void sched_smt_present_inc(int cpu)
 {
+	if (sched_domains_defer_depth > 0)
+		return;
 	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
 		static_branch_inc_cpuslocked(&sched_smt_present);
 }
 
 static inline void sched_smt_present_dec(int cpu)
 {
+	if (sched_domains_defer_depth > 0)
+		return;
 	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
 		static_branch_dec_cpuslocked(&sched_smt_present);
 }
@@ -8711,8 +8818,10 @@ int sched_cpu_activate(unsigned int cpu)
 	set_cpu_active(cpu, true);
 
 	if (sched_smp_initialized) {
-		sched_update_numa(cpu, true);
-		sched_domains_numa_masks_set(cpu);
+		if (sched_domains_defer_depth <= 0) {
+			sched_update_numa(cpu, true);
+			sched_domains_numa_masks_set(cpu);
+		}
 		cpuset_cpu_active();
 	}
 
@@ -8737,39 +8846,41 @@ int sched_cpu_deactivate(unsigned int cpu)
 	struct rq *rq = cpu_rq(cpu);
 	int ret;
 
-	ret = dl_bw_deactivate(cpu);
+	if (!cpumask_test_and_clear_cpu(cpu, &sched_deactivate_prepared_cpus)) {
+		ret = dl_bw_deactivate(cpu);
 
-	if (ret)
-		return ret;
+		if (ret)
+			return ret;
 
-	/*
-	 * Remove CPU from nohz.idle_cpus_mask to prevent participating in
-	 * load balancing when not active
-	 */
-	scoped_guard (rcu)
-		nohz_balance_exit_idle(rq);
+		/*
+		 * Remove CPU from nohz.idle_cpus_mask to prevent participating in
+		 * load balancing when not active
+		 */
+		scoped_guard (rcu)
+			nohz_balance_exit_idle(rq);
 
-	set_cpu_active(cpu, false);
+		set_cpu_active(cpu, false);
 
-	/*
-	 * From this point forward, this CPU will refuse to run any task that
-	 * is not: migrate_disable() or KTHREAD_IS_PER_CPU, and will actively
-	 * push those tasks away until this gets cleared, see
-	 * sched_cpu_dying().
-	 */
-	balance_push_set(cpu, true);
+		/*
+		 * From this point forward, this CPU will refuse to run any task that
+		 * is not: migrate_disable() or KTHREAD_IS_PER_CPU, and will actively
+		 * push those tasks away until this gets cleared, see
+		 * sched_cpu_dying().
+		 */
+		balance_push_set(cpu, true);
 
-	/*
-	 * We've cleared cpu_active_mask / set balance_push, wait for all
-	 * preempt-disabled and RCU users of this state to go away such that
-	 * all new such users will observe it.
-	 *
-	 * Specifically, we rely on ttwu to no longer target this CPU, see
-	 * ttwu_queue_cond() and is_cpu_allowed().
-	 *
-	 * Do sync before park smpboot threads to take care the RCU boost case.
-	 */
-	synchronize_rcu();
+		/*
+		 * We've cleared cpu_active_mask / set balance_push, wait for all
+		 * preempt-disabled and RCU users of this state to go away such that
+		 * all new such users will observe it.
+		 *
+		 * Specifically, we rely on ttwu to no longer target this CPU, see
+		 * ttwu_queue_cond() and is_cpu_allowed().
+		 *
+		 * Do sync before park smpboot threads to take care the RCU boost case.
+		 */
+		synchronize_rcu();
+	}
 
 	sched_domains_free_llc_id(cpu);
 
@@ -8787,9 +8898,11 @@ int sched_cpu_deactivate(unsigned int cpu)
 	if (!sched_smp_initialized)
 		return 0;
 
-	sched_update_numa(cpu, false);
+	if (sched_domains_defer_depth <= 0) {
+		sched_update_numa(cpu, false);
+		sched_domains_numa_masks_clear(cpu);
+	}
 	cpuset_cpu_inactive(cpu);
-	sched_domains_numa_masks_clear(cpu);
 	return 0;
 }
 
