@@ -272,4 +272,39 @@ struct liveupdate_session_freeze {
 #define LIVEUPDATE_SESSION_FREEZE					\
 	_IO(LIVEUPDATE_IOCTL_TYPE, LIVEUPDATE_CMD_SESSION_FREEZE)
 
+/**
+ * struct liveupdate_shmem_retrieve_arg - Argument to retrieve a tmpfs file
+ * @size:  Input; sizeof(struct liveupdate_shmem_retrieve_arg)
+ * @dirfd: Input; A file descriptor for a directory on the tmpfs mount to create
+ *         the file on.
+ * @flags: Input; The flags of the file, like the flags argument of open(),
+ *         except for O_TMPFILE, which is implied, and O_PATH, which is not
+ *         allowed.
+ * @mode:  Input; The mode of the file, like the mode argument of open().
+ *
+ * Passed via &struct liveupdate_session_retrieve_fd.arg to retrieve a file that
+ * was preserved from a tmpfs mount. Such files can only be retrieved with this
+ * argument, and memfds, i.e. files that were preserved from the kernel's
+ * internal shmem mount, can only be retrieved without it. Otherwise, the
+ * retrieve fails with -EINVAL.
+ *
+ * The kernel creates a new file as if by openat(@dirfd, ".", O_TMPFILE |
+ * @flags, @mode), fills it with the preserved contents, and returns it in
+ * &struct liveupdate_session_retrieve_fd.fd. Like any O_TMPFILE file, the file
+ * is not linked into the filesystem. Userspace can link it with linkat(),
+ * unless @flags contains O_EXCL.
+ *
+ * If @flags contains unknown flags or O_PATH, if @mode contains unknown mode
+ * bits, or if @dirfd is not on a tmpfs mount, the retrieve fails with -EINVAL.
+ * If the file can't be created, the retrieve fails with the same errors as
+ * open(). A retrieve that fails before the preserved contents are restored can
+ * be retried.
+ */
+struct liveupdate_shmem_retrieve_arg {
+	__u32		size;
+	__s32		dirfd;
+	__aligned_u64	flags;
+	__aligned_u64	mode;
+};
+
 #endif /* _UAPI_LIVEUPDATE_H */

@@ -9,19 +9,20 @@
  */
 
 /**
- * DOC: Memfd Preservation via LUO
+ * DOC: Memfd and Tmpfs Preservation via LUO
  *
  * Overview
  * ========
  *
- * Memory file descriptors (memfd) can be preserved over a kexec using the Live
- * Update Orchestrator (LUO) file preservation. This allows userspace to
- * transfer its memory contents to the next kernel after a kexec.
+ * Memory file descriptors (memfd) and tmpfs files can be preserved over a kexec
+ * using the Live Update Orchestrator (LUO) file preservation. This allows
+ * userspace to transfer its memory contents to the next kernel after a kexec.
  *
  * Here, a memfd is a memfd created without ``MFD_HUGETLB``, which is a shmem
- * file on the kernel's internal shmem mount. Memfds created with
- * ``MFD_HUGETLB`` are hugetlbfs files, which this file handler doesn't
- * preserve. Preserving them fails with ``-ENOENT``.
+ * file on the kernel's internal shmem mount, and a tmpfs file is a file on any
+ * other tmpfs mount. Memfds created with ``MFD_HUGETLB`` and other files on
+ * hugetlbfs are not shmem files, and this file handler doesn't preserve them.
+ * Preserving them fails with ``-ENOENT``.
  *
  * The preservation is not intended to be transparent. Only select properties of
  * the file are preserved. All others are reset to default. The preserved
@@ -29,12 +30,13 @@
  *
  * .. note::
  *    The LUO API is not stabilized yet, so the preserved properties of a memfd
- *    are also not stable and are subject to backwards incompatible changes.
+ *    or tmpfs file are also not stable and are subject to backwards
+ *    incompatible changes.
  *
  * Preserved Properties
  * ====================
  *
- * The following properties of the memfd are preserved across kexec:
+ * The following properties of the file are preserved across kexec:
  *
  * File Contents
  *   All data stored in the file is preserved.
@@ -50,10 +52,12 @@
  *
  * File Status Flags
  *   memfds are always opened with ``O_RDWR`` and ``O_LARGEFILE``. This property
- *   is maintained.
+ *   is maintained. The file status flags of tmpfs files are not preserved.
+ *   Userspace chooses the flags when retrieving them, as described in
+ *   "Retrieving Tmpfs Files" below.
  *
  * Seals
- *   File seals set on the memfd are preserved and re-applied on restore.
+ *   The seals of the file are preserved and re-applied on restore.
  *   Only seals known to this LUO version (see ``SHMEM_LUO_ALL_SEALS``) may
  *   be present; preservation fails with ``-EOPNOTSUPP`` otherwise.
  *
@@ -68,12 +72,50 @@
  *   A memfd can be created with the ``MFD_CLOEXEC`` flag that sets the
  *   ``FD_CLOEXEC`` on the file. This flag is not preserved and must be set
  *   again after restore via ``fcntl()``.
+ *
+ * Inode Attributes
+ *   The name, path, owner, mode, timestamps and extended attributes of the
+ *   file are not preserved.
+ *
+ * Retrieving Tmpfs Files
+ * ======================
+ *
+ * A tmpfs file can be retrieved onto any tmpfs mount that userspace chooses.
+ * The mount that the file was on doesn't exist in the new kernel, and userspace
+ * may want to put the file elsewhere anyway.
+ *
+ * To retrieve a tmpfs file, userspace passes a
+ * ``struct liveupdate_shmem_retrieve_arg`` to
+ * ``LIVEUPDATE_SESSION_RETRIEVE_FD``. The argument specifies a directory on the
+ * target mount, and the flags and mode of the new file. The kernel creates the
+ * file as if by ``openat(dirfd, ".", O_TMPFILE | flags, mode)``, so the file
+ * gets the same flags, owner, permission checks and security labels as any
+ * other new file in that directory. The kernel then fills the file with the
+ * preserved contents, size, position and seals before it returns the file, so
+ * nothing else can access the file before it is complete.
+ *
+ * Like any ``O_TMPFILE`` file, the new file is not linked into the filesystem.
+ * Userspace can link it at the path it wants with ``linkat()``, unless it asked
+ * for ``O_EXCL``. Like with ``open()``, the file must be opened for writing.
+ * LUO keeps the file open until the session is finished, so a retrieved binary
+ * can't be executed until then.
+ *
+ * The blocks of the file are charged to the target mount, so the size limit
+ * and quotas of the mount apply. If the file doesn't fit, the retrieve fails
+ * permanently, since the preserved contents have already been restored at that
+ * point. If the argument is invalid or the file can't be created, the retrieve
+ * fails before the preserved contents are restored, so it can be retried.
+ *
+ * memfds can only be retrieved as memfds, and files on tmpfs mounts can only be
+ * retrieved onto tmpfs mounts. Retrieving a memfd with the argument, or a tmpfs
+ * file without it, fails with ``-EINVAL``.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/bits.h>
 #include <linux/err.h>
+#include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/io.h>
 #include <linux/kexec_handover.h>
@@ -82,6 +124,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/vmalloc.h>
 #include <linux/memfd.h>
+#include <uapi/linux/magic.h>
 #include <uapi/linux/memfd.h>
 
 #include "internal.h"
@@ -301,6 +344,8 @@ static int shmem_luo_preserve(struct liveupdate_file_op_args *args)
 
 	ser->size = inode_size;
 	ser->seals = seals;
+	if (!shmem_inode_on_internal_mount(inode))
+		ser->flags |= SHMEM_LUO_FLAG_TMPFS;
 
 	err = shmem_luo_preserve_folios(args->file, &ser->folios,
 					&folios_ser, &nr_folios);
@@ -517,6 +562,92 @@ put_folios:
 	return err;
 }
 
+/* Create the memfd to retrieve a file from the internal shmem mount into. */
+static struct file *shmem_luo_create_memfd(const struct liveupdate_shmem_retrieve_arg *arg,
+					   unsigned int seals)
+{
+	struct file *file;
+	int err;
+
+	/* memfds are retrieved as memfds, so there is nothing to choose. */
+	if (arg)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * The seals are preserved. Allow sealing here so they can be added
+	 * later.
+	 */
+	file = memfd_alloc_file("", MFD_ALLOW_SEALING);
+	if (IS_ERR(file)) {
+		pr_err("failed to setup file: %pe\n", file);
+		return file;
+	}
+
+	err = memfd_add_seals(file, seals);
+	if (err) {
+		pr_err("failed to add seals: %pe\n", ERR_PTR(err));
+		fput(file);
+		return ERR_PTR(err);
+	}
+
+	return file;
+}
+
+/*
+ * Create the file to retrieve a file from a tmpfs mount into, on the tmpfs
+ * mount chosen by userspace.
+ */
+static struct file *shmem_luo_create_tmpfs_file(const struct liveupdate_shmem_retrieve_arg *arg,
+						unsigned int seals)
+{
+	struct file *file;
+	int err;
+
+	if (!arg)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * Like openat2(), reject unknown flags and mode bits instead of
+	 * ignoring them. Also reject O_PATH, which would make file_open_root()
+	 * ignore O_TMPFILE and open the directory instead of creating a file.
+	 */
+	if (arg->flags & ~(u64)VALID_OPEN_FLAGS || arg->flags & O_PATH ||
+	    arg->mode & ~(u64)S_IALLUGO)
+		return ERR_PTR(-EINVAL);
+
+	CLASS(fd_raw, dir)(arg->dirfd);
+	if (fd_empty(dir))
+		return ERR_PTR(-EBADF);
+
+	if (fd_file(dir)->f_path.dentry->d_sb->s_magic != TMPFS_MAGIC)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * Create the file like open(O_TMPFILE) does, so that it gets the same
+	 * flag checks, permission checks, owner and security labels.
+	 */
+	file = file_open_root(&fd_file(dir)->f_path, ".",
+			      O_TMPFILE | O_LARGEFILE | arg->flags, arg->mode);
+	if (IS_ERR(file))
+		return file;
+
+	/*
+	 * Nothing else can access the new file yet, so set the preserved seals
+	 * directly. memfd_add_seals() refuses to, since files on tmpfs mounts
+	 * are created with F_SEAL_SEAL.
+	 */
+	if (seals & F_SEAL_WRITE) {
+		err = mapping_deny_writable(file->f_mapping);
+		if (err) {
+			fput(file);
+			return ERR_PTR(err);
+		}
+	}
+	SHMEM_I(file_inode(file))->seals = seals;
+
+	return file;
+}
+
 static int shmem_luo_retrieve(struct liveupdate_file_op_args *args)
 {
 	struct shmem_luo_folio_ser *folios_ser;
@@ -535,25 +666,18 @@ static int shmem_luo_retrieve(struct liveupdate_file_op_args *args)
 	 */
 	args->retryable = true;
 
-	/* Make sure the file only has seals supported by this version. */
-	if (ser->seals & ~SHMEM_LUO_ALL_SEALS)
+	/* Make sure the file only has seals and flags this version supports. */
+	if ((ser->seals & ~SHMEM_LUO_ALL_SEALS) ||
+	    (ser->flags & ~SHMEM_LUO_ALL_FLAGS))
 		return -EOPNOTSUPP;
 
-	/*
-	 * The seals are preserved. Allow sealing here so they can be added
-	 * later.
-	 */
-	file = memfd_alloc_file("", MFD_ALLOW_SEALING);
-	if (IS_ERR(file)) {
-		pr_err("failed to setup file: %pe\n", file);
+	/* Retrieve memfds as memfds, and other files onto a tmpfs mount. */
+	if (ser->flags & SHMEM_LUO_FLAG_TMPFS)
+		file = shmem_luo_create_tmpfs_file(args->arg, ser->seals);
+	else
+		file = shmem_luo_create_memfd(args->arg, ser->seals);
+	if (IS_ERR(file))
 		return PTR_ERR(file);
-	}
-
-	err = memfd_add_seals(file, ser->seals);
-	if (err) {
-		pr_err("failed to add seals: %pe\n", ERR_PTR(err));
-		goto put_file;
-	}
 
 	vfs_setpos(file, ser->pos, MAX_LFS_FILESIZE);
 	i_size_write(file_inode(file), ser->size);
@@ -581,7 +705,6 @@ static int shmem_luo_retrieve(struct liveupdate_file_op_args *args)
 
 free_ser:
 	kho_restore_free(ser);
-put_file:
 	fput(file);
 	return err;
 }
@@ -607,6 +730,7 @@ static const struct liveupdate_file_ops shmem_luo_file_ops = {
 	.unpreserve = shmem_luo_unpreserve,
 	.can_preserve = shmem_luo_can_preserve,
 	.get_id = shmem_luo_get_id,
+	.rarg = LIVEUPDATE_ARG(struct liveupdate_shmem_retrieve_arg, mode),
 	.owner = THIS_MODULE,
 };
 
