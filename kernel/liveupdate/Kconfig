@@ -70,7 +70,7 @@ config LIVEUPDATE
 
 	  If unsure, say N.
 
-config LIVEUPDATE_MEMFD
+config LIVEUPDATE_SHMEM
 	bool "Live update support for memfd"
 	depends on LIVEUPDATE
 	depends on MEMFD_CREATE
