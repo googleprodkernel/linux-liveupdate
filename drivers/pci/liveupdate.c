@@ -130,10 +130,47 @@
  * The PCI core enforces the following restrictions on which devices can be
  * preserved. These may be relaxed in the future:
  *
- *  * The device cannot be a Virtual Function (VF).
+ *  * A Virtual Function (VF) can only be preserved if its Physical Function
+ *    (PF) is preserved (see SR-IOV below).
  *
  *  * The device cannot require device-specific quirks to enable Access
  *    Control Services (ACS).
+ *
+ * SR-IOV
+ * ======
+ *
+ * The VFs of a PF are controlled by the PF's SR-IOV capability, so a VF can
+ * only be preserved if its PF is also preserved, and the PF's SR-IOV
+ * configuration (e.g. NumVFs, VF Enable, and the VF BARs) must not change
+ * across the Live Update. The PCI core does not preserve PFs automatically, and
+ * leaves it up to drivers to manage the dependencies between the preserved
+ * PF and its preserved VFs, with the following help from the PCI core:
+ *
+ *  * pci_liveupdate_preserve() refuses to preserve a VF unless its PF is
+ *    preserved.
+ *
+ *  * pci_liveupdate_freeze() refuses to freeze a VF unless its PF is still
+ *    preserved and is already frozen. Since the PF's driver may not be able to
+ *    refuse unpreserving the PF (e.g. because userspace closed the LUO session
+ *    the PF was preserved in), this is where a Live Update with a VF whose PF
+ *    is no longer preserved fails. Userspace must therefore preserve a PF in a
+ *    session that is frozen before the sessions its VFs are preserved in.
+ *
+ *  * pci_liveupdate_can_finish() returns false for a PF while any of its VFs
+ *    are still incoming-preserved, so that drivers can refuse to finish a PF
+ *    before its VFs.
+ *
+ *  * The number of VFs of a preserved PF cannot be changed through sysfs, and
+ *    pci_disable_sriov() does nothing on a preserved PF.
+ *
+ * In the next kernel, the PCI core leaves the VFs of an incoming PF enabled
+ * and does not write to the PF's SR-IOV capability during enumeration, using
+ * the VF BAR sizes and VF bus numbers passed by the previous kernel instead.
+ * The VFs are not enumerated until the PF's driver calls pci_enable_sriov()
+ * with the number of VFs that are enabled (e.g. when userspace writes to the
+ * PF's ``sriov_numvfs`` sysfs file), which adopts the VFs without disabling
+ * them. Incoming VFs are then matched to the state passed by the previous
+ * kernel like any other device.
  *
  * Driver Binding
  * ==============
@@ -230,6 +267,10 @@
  *    on incoming preserved devices, neither while probing whether INTx masking
  *    works nor when the device is enabled, since the device could then raise
  *    interrupts before its driver is ready to handle them.
+ *
+ *  * The PCI core does not disable or reconfigure SR-IOV on incoming preserved
+ *    PFs, and does not size their VF BARs, since that would destroy or disrupt
+ *    their VFs. See SR-IOV above.
  */
 
 #define pr_fmt(fmt) "PCI: liveupdate: " fmt
@@ -738,11 +779,6 @@ static void pci_liveupdate_preserve_probed(struct pci_dev *dev,
 static int pci_liveupdate_preserve_device(struct pci_flb_outgoing *outgoing,
 					  struct pci_dev *dev)
 {
-	if (dev->is_virtfn) {
-		pci_warn(dev, "Cannot preserve Virtual Functions\n");
-		return -EINVAL;
-	}
-
 	/*
 	 * Do not preserve devices that rely on device-specific ACS equivalents
 	 * (for now) since that would complicate keeping ACS constant across
@@ -807,6 +843,9 @@ static int pci_liveupdate_preserve_device(struct pci_flb_outgoing *outgoing,
  * pci_liveupdate_preserve() automatically preserves all bridges upstream of
  * @dev.
  *
+ * A VF can only be preserved if its PF is already preserved, since the PF's
+ * SR-IOV configuration must not change across the Live Update.
+ *
  * Returns: 0 on success, <0 on failure.
  */
 int pci_liveupdate_preserve(struct pci_dev *dev)
@@ -816,6 +855,11 @@ int pci_liveupdate_preserve(struct pci_dev *dev)
 	int ret = -ENODEV;
 
 	guard(rwsem_write)(&pci_liveupdate.rwsem);
+
+	if (dev->is_virtfn && !dev->physfn->liveupdate.outgoing) {
+		pci_warn(dev, "Cannot preserve VF unless its PF is preserved\n");
+		return -EINVAL;
+	}
 
 	outgoing = pci_liveupdate_flb_get_outgoing();
 	if (IS_ERR(outgoing))
@@ -1002,6 +1046,18 @@ void pci_liveupdate_setup_device(struct pci_dev *dev)
 		return;
 	}
 
+	/*
+	 * The VFs of a PF are only left enabled if the PF itself is
+	 * incoming-preserved (see sriov_init()). Otherwise this is a new VF
+	 * that happens to have the same BDF as a VF preserved by the previous
+	 * kernel.
+	 */
+	if (dev->is_virtfn && !dev->physfn->liveupdate.incoming) {
+		pci_warn(dev, "Not treating VF as preserved since its PF is not preserved\n");
+		pci_liveupdate_flb_put_incoming();
+		return;
+	}
+
 	pci_info(dev, "Device was preserved by previous kernel across Live Update\n");
 	dev->liveupdate.incoming = dev_ser;
 	dev->liveupdate.was_incoming = true;
@@ -1053,12 +1109,33 @@ static void __pci_liveupdate_freeze(struct pci_dev *dev)
  * preserved, and pci_liveupdate_unfreeze() from their unfreeze() callback.
  * Devices that are not frozen by a driver are frozen during shutdown.
  *
- * Return: 0 on success, or <0 if the preservation status of @dev cannot be
- * frozen, in which case the Live Update must be aborted.
+ * A preserved VF can only be frozen once its PF is frozen, and only if its PF
+ * is still preserved. Otherwise the PF's SR-IOV configuration could still
+ * change, or the next kernel might not be able to adopt the VF.
+ *
+ * Return: 0 on success, or -EBUSY if @dev is a preserved VF whose PF is not
+ * preserved or not frozen yet.
  */
 int pci_liveupdate_freeze(struct pci_dev *dev)
 {
+	struct pci_dev *pf;
+
 	guard(rwsem_write)(&pci_liveupdate.rwsem);
+
+	if (dev->is_virtfn && dev->liveupdate.outgoing) {
+		pf = dev->physfn;
+
+		if (!pf->liveupdate.outgoing) {
+			pci_err(dev, "Cannot freeze VF since its PF is no longer preserved\n");
+			return -EBUSY;
+		}
+
+		if (!pf->liveupdate.frozen) {
+			pci_err(dev, "Cannot freeze VF before its PF is frozen\n");
+			return -EBUSY;
+		}
+	}
+
 	__pci_liveupdate_freeze(dev);
 	return 0;
 }
@@ -1081,9 +1158,80 @@ void pci_liveupdate_shutdown(struct pci_dev *dev)
 {
 	guard(rwsem_write)(&pci_liveupdate.rwsem);
 
+	/*
+	 * Drivers that preserve VFs should have frozen them, which fails if
+	 * the PF is no longer preserved (see pci_liveupdate_freeze()).
+	 */
+	if (dev->is_virtfn && dev->liveupdate.outgoing &&
+	    !dev->physfn->liveupdate.outgoing)
+		pci_err(dev, "VF is preserved across Live Update but its PF is not\n");
+
 	if (!dev->liveupdate.frozen)
 		__pci_liveupdate_freeze(dev);
 }
+
+/*
+ * Check if any VF of the PF @dev is still incoming-preserved, including VFs
+ * that have not been enumerated yet (see sriov_enable()), by looking up the BDF
+ * of each enabled VF in the incoming FLB.
+ */
+static bool pci_liveupdate_has_incoming_vfs(struct pci_flb_incoming *incoming,
+					    struct pci_dev *dev)
+{
+#ifdef CONFIG_PCI_IOV
+	struct pci_dev_ser *dev_ser;
+	u16 num_vfs, bdf;
+	int i;
+
+	if (!dev->is_physfn)
+		return false;
+
+	pci_read_config_word(dev, dev->sriov->pos + PCI_SRIOV_NUM_VF, &num_vfs);
+	if (num_vfs > dev->sriov->total_VFs)
+		return false;
+
+	for (i = 0; i < num_vfs; i++) {
+		bdf = PCI_DEVID(pci_iov_virtfn_bus(dev, i),
+				pci_iov_virtfn_devfn(dev, i));
+		dev_ser = xa_load(&incoming->xa,
+				  pci_ser_xa_key(pci_domain_nr(dev->bus), bdf));
+		if (dev_ser && dev_ser->refcount)
+			return true;
+	}
+#endif
+
+	return false;
+}
+
+/**
+ * pci_liveupdate_can_finish() - Check if a device can finish Live Update
+ * @dev: The PCI device
+ *
+ * Check if the incoming preserved device @dev can finish participating in Live
+ * Update. A PF cannot finish while any of its VFs are still incoming-preserved,
+ * since the PF's SR-IOV configuration and resources must not change while its
+ * VFs may be in use. Drivers should call pci_liveupdate_can_finish() from their
+ * struct liveupdate_file_handler can_finish() callback, before calling
+ * pci_liveupdate_finish().
+ *
+ * Return: True if @dev can finish, false otherwise.
+ */
+bool pci_liveupdate_can_finish(struct pci_dev *dev)
+{
+	struct pci_flb_incoming *incoming;
+	bool ret;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	incoming = pci_liveupdate_flb_get_incoming();
+	if (!incoming)
+		return true;
+
+	ret = !pci_liveupdate_has_incoming_vfs(incoming, dev);
+	pci_liveupdate_flb_put_incoming();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pci_liveupdate_can_finish);
 
 static int pci_liveupdate_finish_device(struct pci_ser *ser, struct pci_dev *dev)
 {

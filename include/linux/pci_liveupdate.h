@@ -40,6 +40,7 @@ int pci_liveupdate_preserve(struct pci_dev *dev);
 void pci_liveupdate_unpreserve(struct pci_dev *dev);
 int pci_liveupdate_freeze(struct pci_dev *dev);
 void pci_liveupdate_unfreeze(struct pci_dev *dev);
+bool pci_liveupdate_can_finish(struct pci_dev *dev);
 void pci_liveupdate_finish(struct pci_dev *dev);
 bool pci_liveupdate_is_incoming(struct pci_dev *dev);
 bool pci_liveupdate_is_preserved(struct pci_dev *dev);
@@ -69,6 +70,11 @@ static inline int pci_liveupdate_freeze(struct pci_dev *dev)
 
 static inline void pci_liveupdate_unfreeze(struct pci_dev *dev)
 {
+}
+
+static inline bool pci_liveupdate_can_finish(struct pci_dev *dev)
+{
+	return true;
 }
 
 static inline void pci_liveupdate_finish(struct pci_dev *dev)
