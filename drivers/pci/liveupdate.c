@@ -101,6 +101,15 @@
  * This allows the PCI core to keep its FLB data (struct pci_ser) up to date
  * with the list of **outgoing** preserved devices for the next kernel.
  *
+ * Drivers should also freeze the preservation status of each device they
+ * preserved from their struct liveupdate_file_handler freeze() callback, and
+ * unfreeze it if the Live Update is aborted:
+ *
+ *  * ``pci_liveupdate_freeze(pci_dev)``
+ *  * ``pci_liveupdate_unfreeze(pci_dev)``
+ *
+ * Devices that are not frozen by a driver are frozen during shutdown.
+ *
  * After kexec, whenever a device is enumerated, the PCI core will check if it
  * is an **incoming** preserved device (i.e. preserved by the previous kernel)
  * by checking the incoming FLB data (struct pci_ser).
@@ -968,9 +977,10 @@ void pci_liveupdate_cleanup_device(struct pci_dev *dev)
 		pci_WARN(dev, 1, "Destroying incoming-preserved device!\n");
 }
 
-void pci_liveupdate_freeze(struct pci_dev *dev)
+static void __pci_liveupdate_freeze(struct pci_dev *dev)
 {
-	guard(rwsem_write)(&pci_liveupdate.rwsem);
+	lockdep_assert_held_write(&pci_liveupdate.rwsem);
+
 	dev->liveupdate.frozen = true;
 
 	/*
@@ -980,6 +990,49 @@ void pci_liveupdate_freeze(struct pci_dev *dev)
 	 */
 	if (dev->liveupdate.outgoing)
 		pci_liveupdate_save_bar_masks(dev, dev->liveupdate.outgoing);
+}
+
+/**
+ * pci_liveupdate_freeze() - Freeze the preservation status of a PCI device
+ * @dev: The PCI device
+ *
+ * Freeze the preservation status of @dev, so that it can no longer be
+ * preserved or unpreserved, and save the state the PCI core passes to the next
+ * kernel about @dev. Drivers should call pci_liveupdate_freeze() from their
+ * struct liveupdate_file_handler freeze() callback for each device they
+ * preserved, and pci_liveupdate_unfreeze() from their unfreeze() callback.
+ * Devices that are not frozen by a driver are frozen during shutdown.
+ *
+ * Return: 0 on success, or <0 if the preservation status of @dev cannot be
+ * frozen, in which case the Live Update must be aborted.
+ */
+int pci_liveupdate_freeze(struct pci_dev *dev)
+{
+	guard(rwsem_write)(&pci_liveupdate.rwsem);
+	__pci_liveupdate_freeze(dev);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pci_liveupdate_freeze);
+
+/**
+ * pci_liveupdate_unfreeze() - Unfreeze the preservation status of a PCI device
+ * @dev: The PCI device
+ *
+ * Undo pci_liveupdate_freeze(), e.g. because the Live Update was aborted.
+ */
+void pci_liveupdate_unfreeze(struct pci_dev *dev)
+{
+	guard(rwsem_write)(&pci_liveupdate.rwsem);
+	dev->liveupdate.frozen = false;
+}
+EXPORT_SYMBOL_GPL(pci_liveupdate_unfreeze);
+
+void pci_liveupdate_shutdown(struct pci_dev *dev)
+{
+	guard(rwsem_write)(&pci_liveupdate.rwsem);
+
+	if (!dev->liveupdate.frozen)
+		__pci_liveupdate_freeze(dev);
 }
 
 static int pci_liveupdate_finish_device(struct pci_ser *ser, struct pci_dev *dev)

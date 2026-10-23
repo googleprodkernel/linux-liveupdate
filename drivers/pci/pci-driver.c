@@ -560,7 +560,7 @@ static void pci_device_shutdown(struct device *dev)
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	struct pci_driver *drv = pci_dev->driver;
 
-	pci_liveupdate_freeze(pci_dev);
+	pci_liveupdate_shutdown(pci_dev);
 	pm_runtime_resume(dev);
 
 	if (drv && drv->shutdown)
