@@ -17,6 +17,7 @@
 #include <linux/string.h>
 #include <linux/delay.h>
 #include <asm/div64.h>
+#include "liveupdate.h"
 #include "pci.h"
 
 #define VIRTFN_ID_LEN	17	/* "virtfn%u\0" for 2^32 - 1 */
@@ -86,13 +87,20 @@ EXPORT_SYMBOL_GPL(pci_iov_get_pf_drvdata);
  *
  * Update iov->offset and iov->stride when NumVFs is written.
  */
+static inline void pci_iov_read_offset_stride(struct pci_dev *dev)
+{
+	struct pci_sriov *iov = dev->sriov;
+
+	pci_read_config_word(dev, iov->pos + PCI_SRIOV_VF_OFFSET, &iov->offset);
+	pci_read_config_word(dev, iov->pos + PCI_SRIOV_VF_STRIDE, &iov->stride);
+}
+
 static inline void pci_iov_set_numvfs(struct pci_dev *dev, int nr_virtfn)
 {
 	struct pci_sriov *iov = dev->sriov;
 
 	pci_write_config_word(dev, iov->pos + PCI_SRIOV_NUM_VF, nr_virtfn);
-	pci_read_config_word(dev, iov->pos + PCI_SRIOV_VF_OFFSET, &iov->offset);
-	pci_read_config_word(dev, iov->pos + PCI_SRIOV_VF_STRIDE, &iov->stride);
+	pci_iov_read_offset_stride(dev);
 }
 
 /*
@@ -476,8 +484,24 @@ static ssize_t sriov_numvfs_store(struct device *dev,
 
 	device_lock(&pdev->dev);
 
-	if (num_vfs == pdev->sriov->num_VFs)
+	/*
+	 * VFs left enabled across Live Update that have not been adopted yet
+	 * (see sriov_init()) are not counted in num_VFs, but can be disabled.
+	 */
+	if (num_vfs == pdev->sriov->num_VFs &&
+	    !(!num_vfs && (pdev->sriov->ctrl & PCI_SRIOV_CTRL_VFE)))
 		goto exit;
+
+	/*
+	 * The PF's driver does not know about VFs that were never adopted, so
+	 * disable them directly.
+	 */
+	if (!num_vfs && !pdev->sriov->num_VFs) {
+		pci_lock_rescan_remove();
+		pci_disable_sriov(pdev);
+		pci_unlock_rescan_remove();
+		goto exit;
+	}
 
 	/* is PF driver loaded */
 	if (!pdev->driver) {
@@ -664,6 +688,14 @@ static int sriov_enable(struct pci_dev *dev, int nr_virtfn)
 	if (iov->num_VFs)
 		return -EINVAL;
 
+	/*
+	 * VF Enable can only be set without any VFs if the VFs of a PF
+	 * preserved across Live Update were left enabled (see sriov_init()).
+	 * Enabling VFs would require disabling them first.
+	 */
+	if (iov->ctrl & PCI_SRIOV_CTRL_VFE)
+		return -EBUSY;
+
 	pci_read_config_word(dev, iov->pos + PCI_SRIOV_INITIAL_VF, &initial);
 	if (initial > iov->total_VFs ||
 	    (!(iov->cap & PCI_SRIOV_CAP_VFM) && (initial != iov->total_VFs)))
@@ -773,8 +805,14 @@ static void sriov_del_vfs(struct pci_dev *dev)
 static void sriov_disable(struct pci_dev *dev)
 {
 	struct pci_sriov *iov = dev->sriov;
+	bool enumerated = iov->num_VFs;
 
-	if (!iov->num_VFs)
+	/*
+	 * VFs that the previous kernel left enabled across Live Update and that
+	 * were never adopted (see sriov_init()) have no struct pci_dev, but
+	 * must still be disabled.
+	 */
+	if (!enumerated && !(iov->ctrl & PCI_SRIOV_CTRL_VFE))
 		return;
 
 	sriov_del_vfs(dev);
@@ -784,10 +822,12 @@ static void sriov_disable(struct pci_dev *dev)
 	ssleep(1);
 	pci_cfg_access_unlock(dev);
 
-	pcibios_sriov_disable(dev);
+	if (enumerated) {
+		pcibios_sriov_disable(dev);
 
-	if (iov->link != dev->devfn)
-		sysfs_remove_link(&dev->dev.kobj, "dep_link");
+		if (iov->link != dev->devfn)
+			sysfs_remove_link(&dev->dev.kobj, "dep_link");
+	}
 
 	iov->num_VFs = 0;
 	pci_iov_set_numvfs(dev, 0);
@@ -805,45 +845,77 @@ static int sriov_init(struct pci_dev *dev, int pos)
 	const char *res_name;
 	struct pci_dev *pdev;
 	u32 sriovbars[PCI_SRIOV_NUM_BARS];
+	u64 vf_bar_sizes[PCI_SRIOV_NUM_BARS];
+	u8 max_vf_bus = 0;
+	u16 num_vfs = 0;
+	bool adopt;
 
 	pci_read_config_word(dev, pos + PCI_SRIOV_CTRL, &ctrl);
-	if (ctrl & PCI_SRIOV_CTRL_VFE) {
+
+	/*
+	 * Leave the VFs of a PF preserved across Live Update enabled, since
+	 * they may still be in use, and adopt the SR-IOV configuration left by
+	 * the previous kernel. This requires the state that would otherwise
+	 * have to be probed by writing to the SR-IOV capability, which the
+	 * previous kernel passes (including the VF BAR masks).
+	 */
+	adopt = (ctrl & PCI_SRIOV_CTRL_VFE) &&
+		!pci_liveupdate_read_sriov(dev, sriovbars, &max_vf_bus,
+					   vf_bar_sizes);
+
+	if ((ctrl & PCI_SRIOV_CTRL_VFE) && !adopt) {
 		pci_write_config_word(dev, pos + PCI_SRIOV_CTRL, 0);
 		ssleep(1);
 	}
 
-	ctrl = 0;
 	list_for_each_entry(pdev, &dev->bus->devices, bus_list)
 		if (pdev->is_physfn)
 			goto found;
 
 	pdev = NULL;
-	if (pci_ari_enabled(dev->bus))
-		ctrl |= PCI_SRIOV_CTRL_ARI;
 
 found:
-	pci_write_config_word(dev, pos + PCI_SRIOV_CTRL, ctrl);
+	if (!adopt) {
+		ctrl = 0;
+		if (!pdev && pci_ari_enabled(dev->bus))
+			ctrl |= PCI_SRIOV_CTRL_ARI;
+
+		pci_write_config_word(dev, pos + PCI_SRIOV_CTRL, ctrl);
+	}
 
 	pci_read_config_word(dev, pos + PCI_SRIOV_TOTAL_VF, &total);
 	if (!total)
 		return 0;
 
-	pci_read_config_dword(dev, pos + PCI_SRIOV_SUP_PGSIZE, &pgsz);
-	i = PAGE_SHIFT > 12 ? PAGE_SHIFT - 12 : 0;
-	pgsz &= ~((1 << i) - 1);
-	if (!pgsz)
-		return -EIO;
+	if (adopt) {
+		pci_read_config_dword(dev, pos + PCI_SRIOV_SYS_PGSIZE, &pgsz);
+		if (!pgsz) {
+			rc = -EIO;
+			goto disable_vfs;
+		}
 
-	pgsz &= ~(pgsz - 1);
-	pci_write_config_dword(dev, pos + PCI_SRIOV_SYS_PGSIZE, pgsz);
+		pci_read_config_word(dev, pos + PCI_SRIOV_NUM_VF, &num_vfs);
+	} else {
+		pci_read_config_dword(dev, pos + PCI_SRIOV_SUP_PGSIZE, &pgsz);
+		i = PAGE_SHIFT > 12 ? PAGE_SHIFT - 12 : 0;
+		pgsz &= ~((1 << i) - 1);
+		if (!pgsz)
+			return -EIO;
+
+		pgsz &= ~(pgsz - 1);
+		pci_write_config_dword(dev, pos + PCI_SRIOV_SYS_PGSIZE, pgsz);
+	}
 
 	iov = kzalloc_obj(*iov);
-	if (!iov)
-		return -ENOMEM;
+	if (!iov) {
+		rc = -ENOMEM;
+		goto disable_vfs;
+	}
 
 	/* Sizing SR-IOV BARs with VF Enable cleared - no decode */
-	__pci_size_stdbars(dev, PCI_SRIOV_NUM_BARS,
-			   pos + PCI_SRIOV_BAR, sriovbars);
+	if (!adopt)
+		__pci_size_stdbars(dev, PCI_SRIOV_NUM_BARS,
+				   pos + PCI_SRIOV_BAR, sriovbars);
 
 	nres = 0;
 	for (i = 0; i < PCI_SRIOV_NUM_BARS; i++) {
@@ -869,7 +941,20 @@ found:
 			goto failed;
 		}
 		iov->barsz[i] = resource_size(res);
-		resource_set_size(res, resource_size(res) * total);
+
+		/*
+		 * Reserve the same address range as the previous kernel did
+		 * for adopted VFs, which may not match the size of the VF BAR
+		 * times TotalVFs if the VF BARs were resized. It must contain
+		 * the VF BAR of every enabled VF though.
+		 */
+		if (adopt && vf_bar_sizes[i] &&
+		    IS_ALIGNED(vf_bar_sizes[i], iov->barsz[i]) &&
+		    vf_bar_sizes[i] >= (u64)iov->barsz[i] * num_vfs)
+			resource_set_size(res, vf_bar_sizes[i]);
+		else
+			resource_set_size(res, resource_size(res) * total);
+
 		pci_info(dev, "%s %pR: contains BAR %d for %d VFs\n",
 			 res_name, res, i, total);
 		i += bar64;
@@ -898,9 +983,15 @@ found:
 
 	dev->sriov = iov;
 	dev->is_physfn = 1;
-	rc = compute_max_vf_buses(dev);
-	if (rc)
-		goto fail_max_buses;
+
+	if (adopt) {
+		iov->max_VF_buses = max_vf_bus;
+		pci_iov_read_offset_stride(dev);
+	} else {
+		rc = compute_max_vf_buses(dev);
+		if (rc)
+			goto fail_max_buses;
+	}
 
 	return 0;
 
@@ -914,6 +1005,16 @@ failed:
 	}
 
 	kfree(iov);
+disable_vfs:
+	/*
+	 * Don't leave adopted VFs enabled if the PF cannot be set up, since
+	 * nothing would manage them or reserve the address ranges they decode.
+	 */
+	if (adopt) {
+		pci_write_config_word(dev, pos + PCI_SRIOV_CTRL, 0);
+		ssleep(1);
+	}
+
 	return rc;
 }
 
@@ -966,6 +1067,13 @@ static void sriov_restore_state(struct pci_dev *dev)
 	pci_read_config_word(dev, iov->pos + PCI_SRIOV_CTRL, &ctrl);
 	if (ctrl & PCI_SRIOV_CTRL_VFE)
 		return;
+
+	/*
+	 * VFs left enabled across Live Update that were never adopted (see
+	 * sriov_init()) do not survive a reset of the PF.
+	 */
+	if (!iov->num_VFs)
+		iov->ctrl &= ~(PCI_SRIOV_CTRL_VFE | PCI_SRIOV_CTRL_MSE);
 
 	sriov_restore_vf_rebar_state(dev);
 

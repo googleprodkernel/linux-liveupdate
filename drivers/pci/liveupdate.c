@@ -1408,6 +1408,25 @@ static bool pci_liveupdate_windows_read(struct pci_dev *bridge)
 	return false;
 }
 
+/*
+ * Check if resource @resno of @dev is decoded by hardware regardless of whether
+ * it was ever assigned an address by software: bridge windows that are not
+ * disabled, and the VF BARs of a PF whose VFs are enabled with VF MSE set.
+ */
+static bool pci_liveupdate_resource_decoded(struct pci_dev *dev, int resno)
+{
+	if (pci_resource_is_bridge_win(resno))
+		return true;
+
+#ifdef CONFIG_PCI_IOV
+	if (pci_resource_is_iov(resno) && dev->is_physfn &&
+	    (dev->sriov->ctrl & PCI_SRIOV_CTRL_MSE))
+		return true;
+#endif
+
+	return false;
+}
+
 static void pci_liveupdate_claim_resource(struct pci_dev *dev, int resno)
 {
 	struct resource *r = pci_resource_n(dev, resno);
@@ -1424,14 +1443,15 @@ static void pci_liveupdate_claim_resource(struct pci_dev *dev, int resno)
 	/*
 	 * Panic if something else has already claimed part of the range, since
 	 * memory transactions still targeting the device may be corrupting it.
-	 * Also panic if a bridge window cannot be claimed at all, since the
-	 * bridge forwards the range even though the resource tree considers it
-	 * free. BARs that fail for other reasons were never assigned an address
-	 * (e.g. a ROM BAR that was left unassigned), so there is nothing to
-	 * claim.
+	 * Also panic if a resource that hardware decodes regardless (e.g. a
+	 * bridge window) cannot be claimed at all, since the device responds
+	 * to the range even though the resource tree considers it free. BARs
+	 * that fail for other reasons were never assigned an address (e.g. a
+	 * ROM BAR that was left unassigned), so there is nothing to claim.
 	 */
 	ret = pci_claim_resource(dev, resno);
-	if (ret == -EBUSY || (ret && pci_resource_is_bridge_win(resno)))
+	if (ret == -EBUSY ||
+	    (ret && pci_liveupdate_resource_decoded(dev, resno)))
 		panic("%s %s %pR: Failed to claim resource of device preserved across Live Update\n",
 		      pci_name(dev), pci_resource_name(dev, resno), r);
 }
