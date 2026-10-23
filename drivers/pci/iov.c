@@ -493,6 +493,17 @@ static ssize_t sriov_numvfs_store(struct device *dev,
 		goto exit;
 
 	/*
+	 * The SR-IOV configuration of a PF preserved for the next Live Update
+	 * must not change. The VFs of a PF preserved by the previous kernel can
+	 * only be adopted (see sriov_enable()), not disabled.
+	 */
+	if (pci_liveupdate_sriov_locked(pdev, num_vfs)) {
+		pci_info(pdev, "cannot change number of VFs of PF preserved across Live Update\n");
+		ret = -EBUSY;
+		goto exit;
+	}
+
+	/*
 	 * The PF's driver does not know about VFs that were never adopted, so
 	 * disable them directly.
 	 */
@@ -838,6 +849,15 @@ static void sriov_disable(struct pci_dev *dev)
 	 */
 	if (!enumerated && !(iov->ctrl & PCI_SRIOV_CTRL_VFE))
 		return;
+
+	/*
+	 * The VFs of a PF preserved across Live Update, or the PF itself, may
+	 * still be in use and must not be destroyed.
+	 */
+	if (pci_liveupdate_is_preserved(dev)) {
+		pci_warn(dev, "Not disabling SR-IOV on PF preserved across Live Update\n");
+		return;
+	}
 
 	sriov_del_vfs(dev);
 	iov->ctrl &= ~(PCI_SRIOV_CTRL_VFE | PCI_SRIOV_CTRL_MSE);

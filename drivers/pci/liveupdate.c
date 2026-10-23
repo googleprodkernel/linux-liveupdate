@@ -1506,6 +1506,44 @@ void pci_liveupdate_claim_bus_resources(struct pci_bus *bus)
 }
 
 /**
+ * pci_liveupdate_is_preserved() - Check if a device is preserved
+ * @dev: The PCI device to check
+ *
+ * Check if @dev is preserved for the next Live Update (outgoing-preserved) or
+ * was preserved by the previous kernel and has not finished participating in
+ * Live Update yet (incoming-preserved). Unlike pci_liveupdate_is_outgoing(),
+ * this can be called before the preservation status of @dev is frozen, so
+ * the result may be stale by the time it is used unless the caller
+ * synchronizes with preserving, unpreserving, and finishing @dev.
+ *
+ * Return: True if @dev is outgoing-preserved or incoming-preserved.
+ */
+bool pci_liveupdate_is_preserved(struct pci_dev *dev)
+{
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+	return dev->liveupdate.outgoing || dev->liveupdate.incoming;
+}
+EXPORT_SYMBOL_GPL(pci_liveupdate_is_preserved);
+
+/**
+ * pci_liveupdate_sriov_locked() - Check if the number of VFs of a PF can change
+ * @dev: The PF
+ * @num_vfs: The new number of VFs
+ *
+ * The SR-IOV configuration of a PF that is preserved for the next Live Update
+ * must not change. The VFs of a PF preserved by the previous kernel can only be
+ * adopted (see sriov_enable()), not disabled.
+ *
+ * Return: True if the number of VFs of @dev must not be changed to @num_vfs.
+ */
+bool pci_liveupdate_sriov_locked(struct pci_dev *dev, u16 num_vfs)
+{
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+	return dev->liveupdate.outgoing ||
+	       (!num_vfs && dev->liveupdate.incoming);
+}
+
+/**
  * pci_liveupdate_is_incoming() - Check if a device is incoming-preserved
  * @dev: The PCI device to check
  *
