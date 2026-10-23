@@ -967,6 +967,8 @@ static void sriov_restore_state(struct pci_dev *dev)
 	if (ctrl & PCI_SRIOV_CTRL_VFE)
 		return;
 
+	sriov_restore_vf_rebar_state(dev);
+
 	/*
 	 * Restore PCI_SRIOV_CTRL_ARI before pci_iov_set_numvfs() because
 	 * it reads offset & stride, which depend on PCI_SRIOV_CTRL_ARI.
@@ -1117,10 +1119,8 @@ resource_size_t pci_sriov_resource_alignment(const struct pci_dev *dev,
  */
 void pci_restore_iov_state(struct pci_dev *dev)
 {
-	if (dev->is_physfn) {
-		sriov_restore_vf_rebar_state(dev);
+	if (dev->is_physfn)
 		sriov_restore_state(dev);
-	}
 }
 
 /**
