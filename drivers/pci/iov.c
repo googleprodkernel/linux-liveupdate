@@ -681,6 +681,8 @@ static int sriov_enable(struct pci_dev *dev, int nr_virtfn)
 	struct pci_sriov *iov = dev->sriov;
 	int bars = 0;
 	int bus;
+	bool adopt;
+	u16 num_vfs;
 
 	if (!nr_virtfn)
 		return 0;
@@ -691,10 +693,22 @@ static int sriov_enable(struct pci_dev *dev, int nr_virtfn)
 	/*
 	 * VF Enable can only be set without any VFs if the VFs of a PF
 	 * preserved across Live Update were left enabled (see sriov_init()).
-	 * Enabling VFs would require disabling them first.
+	 * Adopt them, as long as the caller asks for the same number of VFs,
+	 * since NumVFs cannot change while VF Enable is set. Note that
+	 * pcibios_sriov_enable() and pcibios_sriov_disable() are still called,
+	 * which is fine since the architectures that implement them (powerpc)
+	 * do not support Live Update.
 	 */
-	if (iov->ctrl & PCI_SRIOV_CTRL_VFE)
-		return -EBUSY;
+	adopt = iov->ctrl & PCI_SRIOV_CTRL_VFE;
+	if (adopt) {
+		pci_read_config_word(dev, iov->pos + PCI_SRIOV_NUM_VF,
+				     &num_vfs);
+		if (nr_virtfn != num_vfs) {
+			pci_err(dev, "can't enable %d VFs, %u VFs preserved across Live Update are enabled\n",
+				nr_virtfn, num_vfs);
+			return -EBUSY;
+		}
+	}
 
 	pci_read_config_word(dev, iov->pos + PCI_SRIOV_INITIAL_VF, &initial);
 	if (initial > iov->total_VFs ||
@@ -761,12 +775,17 @@ static int sriov_enable(struct pci_dev *dev, int nr_virtfn)
 		goto err_pcibios;
 	}
 
-	pci_iov_set_numvfs(dev, nr_virtfn);
-	iov->ctrl |= PCI_SRIOV_CTRL_VFE | PCI_SRIOV_CTRL_MSE;
-	pci_cfg_access_lock(dev);
-	pci_write_config_word(dev, iov->pos + PCI_SRIOV_CTRL, iov->ctrl);
-	msleep(100);
-	pci_cfg_access_unlock(dev);
+	if (adopt) {
+		pci_iov_read_offset_stride(dev);
+	} else {
+		pci_iov_set_numvfs(dev, nr_virtfn);
+		iov->ctrl |= PCI_SRIOV_CTRL_VFE | PCI_SRIOV_CTRL_MSE;
+		pci_cfg_access_lock(dev);
+		pci_write_config_word(dev, iov->pos + PCI_SRIOV_CTRL,
+				      iov->ctrl);
+		msleep(100);
+		pci_cfg_access_unlock(dev);
+	}
 
 	rc = sriov_add_vfs(dev, initial);
 	if (rc)
@@ -778,18 +797,23 @@ static int sriov_enable(struct pci_dev *dev, int nr_virtfn)
 	return 0;
 
 err_pcibios:
-	iov->ctrl &= ~(PCI_SRIOV_CTRL_VFE | PCI_SRIOV_CTRL_MSE);
-	pci_cfg_access_lock(dev);
-	pci_write_config_word(dev, iov->pos + PCI_SRIOV_CTRL, iov->ctrl);
-	ssleep(1);
-	pci_cfg_access_unlock(dev);
+	/* Leave adopted VFs enabled, so they can be adopted again later. */
+	if (!adopt) {
+		iov->ctrl &= ~(PCI_SRIOV_CTRL_VFE | PCI_SRIOV_CTRL_MSE);
+		pci_cfg_access_lock(dev);
+		pci_write_config_word(dev, iov->pos + PCI_SRIOV_CTRL,
+				      iov->ctrl);
+		ssleep(1);
+		pci_cfg_access_unlock(dev);
+	}
 
 	pcibios_sriov_disable(dev);
 
 	if (iov->link != dev->devfn)
 		sysfs_remove_link(&dev->dev.kobj, "dep_link");
 
-	pci_iov_set_numvfs(dev, 0);
+	if (!adopt)
+		pci_iov_set_numvfs(dev, 0);
 	return rc;
 }
 
