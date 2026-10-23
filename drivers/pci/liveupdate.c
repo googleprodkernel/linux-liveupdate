@@ -309,7 +309,8 @@ struct pci_flb_incoming {
  * This kernel also provides all of them to the next kernel.
  */
 #define PCI_SER_OPTIONAL_FLAGS_SUPPORTED \
-	(PCI_SER_OPTIONAL_BAR_MASKS | PCI_SER_OPTIONAL_PROBED)
+	(PCI_SER_OPTIONAL_BAR_MASKS | PCI_SER_OPTIONAL_PROBED | \
+	 (IS_ENABLED(CONFIG_PCI_IOV) ? PCI_SER_OPTIONAL_SRIOV : 0))
 
 #define PCI_DEV_SER_PROBED_WINDOWS		\
 	(PCI_DEV_SER_PROBED_IO_WINDOW |		\
@@ -329,6 +330,9 @@ static u32 pci_dev_ser_min_size(u64 optional_flags)
 
 	if (optional_flags & PCI_SER_OPTIONAL_PROBED)
 		size = max(size, offsetofend(struct pci_dev_ser, probed));
+
+	if (optional_flags & PCI_SER_OPTIONAL_SRIOV)
+		size = max(size, offsetofend(struct pci_dev_ser, vf_bar_sizes));
 
 	return size;
 }
@@ -661,6 +665,50 @@ static void pci_liveupdate_save_bar_masks(struct pci_dev *dev,
 	dev_ser->rom_mask = lower_32_bits(mask);
 }
 
+/*
+ * Save the SR-IOV state of the PF @dev that the next kernel would otherwise
+ * have to probe by writing to the PF's SR-IOV capability: the VF BAR masks
+ * (computed from the size of each VF BAR) and the highest bus number its VFs
+ * can use. Also save the size of the address range reserved for each VF BAR,
+ * so that the next kernel reserves the same ranges.
+ */
+static void pci_liveupdate_save_sriov(struct pci_dev *dev,
+				      struct pci_dev_ser *dev_ser)
+{
+#ifdef CONFIG_PCI_IOV
+	struct pci_sriov *iov = dev->sriov;
+	struct resource *res;
+	u64 mask;
+	int i;
+
+	if (!dev->is_physfn)
+		return;
+
+	memset(dev_ser->vf_bar_masks, 0, sizeof(dev_ser->vf_bar_masks));
+	memset(dev_ser->vf_bar_sizes, 0, sizeof(dev_ser->vf_bar_sizes));
+
+	for (i = 0; i < PCI_SRIOV_NUM_BARS; i++) {
+		res = pci_resource_n(dev, pci_resource_num_from_vf_bar(i));
+
+		/* Skip VF BARs that are not decoded by the VF BAR register. */
+		if (!res->flags || !iov->barsz[i] ||
+		    (res->flags & IORESOURCE_PCI_EA_BEI))
+			continue;
+
+		mask = ~((u64)iov->barsz[i] - 1);
+		dev_ser->vf_bar_masks[i] = lower_32_bits(mask);
+		dev_ser->vf_bar_sizes[i] = resource_size(res);
+
+		/* The upper half of a 64-bit BAR is in the next register. */
+		if ((res->flags & IORESOURCE_MEM_64) &&
+		    i + 1 < PCI_SRIOV_NUM_BARS)
+			dev_ser->vf_bar_masks[++i] = upper_32_bits(mask);
+	}
+
+	dev_ser->max_vf_bus = iov->max_VF_buses;
+#endif
+}
+
 static void pci_liveupdate_preserve_probed(struct pci_dev *dev,
 					   struct pci_dev_ser *dev_ser)
 {
@@ -988,8 +1036,10 @@ static void __pci_liveupdate_freeze(struct pci_dev *dev)
 	 * is frozen, rather than when the devices are preserved, in case the
 	 * size of a BAR changes in between (e.g. via Resizable BAR).
 	 */
-	if (dev->liveupdate.outgoing)
+	if (dev->liveupdate.outgoing) {
 		pci_liveupdate_save_bar_masks(dev, dev->liveupdate.outgoing);
+		pci_liveupdate_save_sriov(dev, dev->liveupdate.outgoing);
+	}
 }
 
 /**
@@ -1221,6 +1271,46 @@ int pci_liveupdate_read_bar_masks(struct pci_dev *dev, unsigned int nr_bars,
 	if (rom_mask)
 		*rom_mask = dev_ser->rom_mask;
 
+	return 0;
+}
+
+/**
+ * pci_liveupdate_read_sriov() - Get the SR-IOV state of an incoming PF
+ * @dev: The PCI device
+ * @vf_bar_masks: Array of PCI_SRIOV_NUM_BARS entries to fill with the values
+ *                that the VF BARs of @dev return when read after writing all 1s
+ *                to them
+ * @max_vf_bus: Filled with the highest bus number the VFs of @dev can use
+ * @vf_bar_sizes: Array of PCI_SRIOV_NUM_BARS entries to fill with the size of
+ *                the address range reserved for each VF BAR of @dev
+ *
+ * Get the SR-IOV state of @dev passed by the previous kernel, so that the VF
+ * BARs do not need to be sized, NumVFs does not need to be written to find
+ * out which bus numbers the VFs can use, and the same address ranges can be
+ * reserved for the VF BARs.
+ *
+ * Return: 0 on success, or <0 if @dev is not incoming-preserved or the
+ * previous kernel did not pass its SR-IOV state.
+ */
+int pci_liveupdate_read_sriov(struct pci_dev *dev, u32 *vf_bar_masks,
+			      u8 *max_vf_bus, u64 *vf_bar_sizes)
+{
+	struct pci_dev_ser *dev_ser;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	dev_ser = dev->liveupdate.incoming;
+	if (!dev_ser)
+		return -EINVAL;
+
+	if (!(pci_liveupdate.incoming_optional_flags & PCI_SER_OPTIONAL_SRIOV))
+		return -EOPNOTSUPP;
+
+	memcpy(vf_bar_masks, dev_ser->vf_bar_masks,
+	       sizeof(dev_ser->vf_bar_masks));
+	*max_vf_bus = dev_ser->max_vf_bus;
+	memcpy(vf_bar_sizes, dev_ser->vf_bar_sizes,
+	       sizeof(dev_ser->vf_bar_sizes));
 	return 0;
 }
 

@@ -73,6 +73,21 @@
  *          next kernel instead of probing the device again, which would
  *          disrupt memory transactions targeting the device or devices below
  *          it.
+ * @vf_bar_masks: For an SR-IOV PF, the value each VF BAR register in the SR-IOV
+ *                capability returns when read after writing all 1s to it,
+ *                encoded like @bar_masks. 0 for other devices. Used by the next
+ *                kernel instead of sizing the VF BARs, which would disrupt
+ *                memory transactions targeting the VFs.
+ * @max_vf_bus: For an SR-IOV PF, the highest bus number any of its VFs can use
+ *              (for any NumVFs). 0 for other devices. Used by the next kernel
+ *              instead of probing it, which requires writing NumVFs.
+ * @vf_bar_sizes: For an SR-IOV PF, the size of the address range reserved for
+ *                each VF BAR, i.e. the range that starts at the VF BAR of the
+ *                first VF and contains that BAR of all VFs. Indexed like
+ *                @vf_bar_masks; 0 for the upper half of a 64-bit VF BAR, for
+ *                unimplemented VF BARs, and for other devices. Used by the next
+ *                kernel to reserve the same address ranges, which cannot be
+ *                derived from the VF BAR masks if the VF BARs were resized.
  *
  * Each field after @refcount is only present if the ``PCI_SER_OPTIONAL_*``
  * flag that covers it is set in ``pci_ser.optional_flags``.
@@ -85,6 +100,9 @@ struct pci_dev_ser {
 	u32 rom_mask;
 	u64 probed_supported;
 	u64 probed;
+	u32 vf_bar_masks[PCI_SRIOV_NUM_BARS];
+	u8 max_vf_bus;
+	u64 vf_bar_sizes[PCI_SRIOV_NUM_BARS];
 } __packed;
 
 /*
@@ -139,8 +157,10 @@ struct pci_ser {
  *
  *  * PCI_SER_OPTIONAL_BAR_MASKS: @bar_masks and @rom_mask
  *  * PCI_SER_OPTIONAL_PROBED: @probed_supported and @probed
+ *  * PCI_SER_OPTIONAL_SRIOV: @vf_bar_masks, @max_vf_bus, and @vf_bar_sizes
  */
 #define PCI_SER_OPTIONAL_BAR_MASKS	BIT_ULL(0)
 #define PCI_SER_OPTIONAL_PROBED		BIT_ULL(1)
+#define PCI_SER_OPTIONAL_SRIOV		BIT_ULL(2)
 
 #endif /* _LINUX_KHO_ABI_PCI_H */
