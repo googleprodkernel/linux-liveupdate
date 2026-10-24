@@ -156,6 +156,51 @@ void liveupdate_flb_put_outgoing(struct liveupdate_flb *flb)
 }
 EXPORT_SYMBOL_GPL(liveupdate_flb_put_outgoing);
 
+static int luo_flb_ro_setup_incoming(void)
+{
+	static DEFINE_MUTEX(luo_flb_ro_init_lock);
+	struct luo_flb_header_ser *header_ser;
+	const struct luo_ser *luo_ser;
+	phys_addr_t luo_ser_pa;
+	size_t luo_ser_size;
+	u64 flbs_pa;
+	int err;
+
+	guard(mutex)(&luo_flb_ro_init_lock);
+	if (smp_load_acquire(&luo_flb_global.incoming.active))
+		return 0;
+
+	err = kho_retrieve_subtree(LUO_KHO_ENTRY_NAME, &luo_ser_pa,
+				   &luo_ser_size);
+	if (err)
+		return err;
+	if (luo_ser_size < sizeof(*luo_ser))
+		return -EINVAL;
+
+	luo_ser = kho_ro_map_folio(luo_ser_pa, PAGE_KERNEL_RO);
+	if (!luo_ser)
+		return -ENOMEM;
+
+	if (strncmp(luo_ser->compatible, LUO_ABI_COMPATIBLE,
+		    LUO_ABI_COMPAT_LEN))
+		return -EINVAL;
+
+	flbs_pa = luo_ser->flbs_pa;
+
+	if (!flbs_pa)
+		return -ENODATA;
+
+	header_ser = kho_ro_map_folio(flbs_pa, PAGE_KERNEL_RO);
+	if (!header_ser)
+		return -ENOMEM;
+
+	luo_flb_global.incoming.header_ser = header_ser;
+	luo_flb_global.incoming.ser = (void *)(header_ser + 1);
+	smp_store_release(&luo_flb_global.incoming.active, true);
+
+	return 0;
+}
+
 static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 {
 	struct luo_flb_private *private = luo_flb_get_private(flb);
@@ -174,6 +219,12 @@ static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 
 	if (private->incoming.retrieve_status > 0)
 		return 0;
+
+	if (!smp_load_acquire(&fh->active) && kho_is_ro()) {
+		err = luo_flb_ro_setup_incoming();
+		if (err)
+			return err;
+	}
 
 	if (!fh->active)
 		return -ENODATA;
@@ -527,7 +578,8 @@ int liveupdate_flb_get_incoming(struct liveupdate_flb *flb, void **objp)
 			return err;
 	}
 
-	refcount_inc(&private->incoming.count);
+	if (!kho_is_ro())
+		refcount_inc(&private->incoming.count);
 	*objp = private->incoming.obj;
 
 	return 0;
