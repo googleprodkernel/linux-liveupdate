@@ -154,6 +154,7 @@ void liveupdate_flb_put_outgoing(struct liveupdate_flb *flb)
 		}
 	}
 }
+EXPORT_SYMBOL_GPL(liveupdate_flb_put_outgoing);
 
 static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 {
@@ -234,6 +235,7 @@ void liveupdate_flb_put_incoming(struct liveupdate_flb *flb)
 		module_put(flb->ops->owner);
 	}
 }
+EXPORT_SYMBOL_GPL(liveupdate_flb_put_incoming);
 
 /**
  * luo_flb_file_preserve - Notifies FLBs that a file is about to be preserved.
@@ -459,6 +461,7 @@ int liveupdate_register_flb(struct liveupdate_file_handler *fh,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(liveupdate_register_flb);
 
 /**
  * liveupdate_unregister_flb - Remove an FLB dependency from a file handler.
@@ -485,6 +488,7 @@ void liveupdate_unregister_flb(struct liveupdate_file_handler *fh,
 
 	luo_flb_unregister_one(fh, flb);
 }
+EXPORT_SYMBOL_GPL(liveupdate_unregister_flb);
 
 /**
  * liveupdate_flb_get_incoming - Retrieve the incoming FLB object.
@@ -525,6 +529,7 @@ int liveupdate_flb_get_incoming(struct liveupdate_flb *flb, void **objp)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(liveupdate_flb_get_incoming);
 
 /**
  * liveupdate_flb_get_outgoing - Retrieve the outgoing FLB object.
@@ -556,6 +561,7 @@ int liveupdate_flb_get_outgoing(struct liveupdate_flb *flb, void **objp)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(liveupdate_flb_get_outgoing);
 
 int __init luo_flb_setup_outgoing(u64 *flbs_pa)
 {
