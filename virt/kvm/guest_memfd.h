@@ -66,6 +66,9 @@ static inline struct gmem_inode *GMEM_I(struct inode *inode)
 }
 
 struct file *__kvm_gmem_create_file(struct kvm *kvm, loff_t size, u64 flags);
+struct file *kvm_gmem_create_ro_file(loff_t size,
+				     const struct file_operations *fops,
+				     void *priv);
 void kvm_gmem_freeze(struct inode *inode, bool freeze);
 bool kvm_gmem_is_frozen(struct inode *inode);
 

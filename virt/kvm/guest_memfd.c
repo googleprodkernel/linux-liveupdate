@@ -293,8 +293,13 @@ static int kvm_gmem_release(struct inode *inode, struct file *file)
 {
 	struct gmem_file *f = file->private_data;
 	struct kvm_memory_slot *slot;
-	struct kvm *kvm = f->kvm;
+	struct kvm *kvm;
 	unsigned long index;
+
+	if (!f)
+		return 0;
+
+	kvm = f->kvm;
 
 	/*
 	 * Prevent concurrent attempts to *unbind* a memslot.  This is the last
@@ -579,6 +584,35 @@ err_gmem:
 	return ERR_PTR(err);
 }
 
+struct file *kvm_gmem_create_ro_file(loff_t size,
+				     const struct file_operations *fops,
+				     void *priv)
+{
+	static const char *name = "[kvm-gmem-ro]";
+	struct inode *inode;
+	struct file *file;
+
+	inode = anon_inode_make_secure_inode(kvm_gmem_mnt->mnt_sb, name, NULL);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
+
+	inode->i_op = &kvm_gmem_iops;
+	inode->i_fop = fops;
+	inode->i_private = priv;
+	inode->i_mode |= S_IFREG;
+	inode->i_size = size;
+
+	file = alloc_file_pseudo(inode, kvm_gmem_mnt, name, O_RDWR, fops);
+	if (IS_ERR(file)) {
+		iput(inode);
+		return file;
+	}
+
+	file->f_flags |= O_LARGEFILE;
+	file->private_data = priv;
+	return file;
+}
+
 static int __kvm_gmem_create(struct kvm *kvm, loff_t size, u64 flags)
 {
 	struct file *file;
@@ -637,7 +671,7 @@ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
 		goto err;
 
 	f = file->private_data;
-	if (f->kvm != kvm)
+	if (!f || f->kvm != kvm)
 		goto err;
 
 	inode = file_inode(file);
