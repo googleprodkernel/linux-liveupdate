@@ -103,6 +103,43 @@ static int kvm_luo_preserve(struct liveupdate_file_op_args *args)
 
 static atomic_t restored_vm_id = ATOMIC_INIT(0);
 
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+static int kvm_luo_retrieve_ro(struct liveupdate_file_op_args *args)
+{
+	char fdname[ITOA_MAX_LEN + 1];
+	struct kvm_luo_ser *ser;
+	struct file *file;
+	struct kvm *kvm;
+	u64 type;
+
+	if (!args->serialized_data)
+		return -EINVAL;
+
+	ser = kho_ro_map_folio(args->serialized_data, PAGE_KERNEL_RO);
+	if (!ser)
+		return -EINVAL;
+
+	type = ser->type;
+
+	snprintf(fdname, sizeof(fdname), "%d",
+		 atomic_inc_return(&restored_vm_id));
+
+	file = kvm_create_vm_file(type, fdname);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	kvm = file->private_data;
+	args->file = file;
+	kvm_uevent_notify_vm_create(kvm);
+	return 0;
+}
+#else
+static int kvm_luo_retrieve_ro(struct liveupdate_file_op_args *args)
+{
+	return -EOPNOTSUPP;
+}
+#endif /* CONFIG_KEXEC_HANDOVER_READONLY */
+
 static int kvm_luo_retrieve(struct liveupdate_file_op_args *args)
 {
 	char fdname[ITOA_MAX_LEN + 1];
@@ -110,6 +147,9 @@ static int kvm_luo_retrieve(struct liveupdate_file_op_args *args)
 	struct file *file;
 	struct kvm *kvm;
 	int err = 0;
+
+	if (kho_is_ro())
+		return kvm_luo_retrieve_ro(args);
 
 	if (!args->serialized_data)
 		return -EINVAL;
@@ -194,6 +234,7 @@ static const struct liveupdate_file_ops kvm_luo_file_ops = {
 static struct liveupdate_file_handler kvm_luo_handler = {
 	.ops = &kvm_luo_file_ops,
 	.compatible = KVM_LUO_FH_COMPATIBLE,
+	.flags = LIVEUPDATE_FH_RO_RETRIEVE,
 };
 
 static bool kvm_vcpu_luo_can_preserve(struct liveupdate_file_handler *handler,
