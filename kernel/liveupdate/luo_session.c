@@ -207,10 +207,12 @@ static void luo_session_remove(struct luo_session_header *sh,
 			       struct luo_session *session)
 {
 	guard(rwsem_write)(&sh->rwsem);
-	list_del(&session->list);
-	sh->count--;
-	if (sh == &luo_session_global.outgoing)
-		kho_block_set_shrink(&sh->block_set, sh->count);
+	if (!list_empty(&session->list)) {
+		list_del_init(&session->list);
+		sh->count--;
+		if (sh == &luo_session_global.outgoing)
+			kho_block_set_shrink(&sh->block_set, sh->count);
+	}
 }
 
 static int luo_session_finish_one(struct luo_session *session)
@@ -253,6 +255,60 @@ static int luo_session_serialize_one(struct luo_session *session,
 	return 0;
 }
 
+static void luo_session_reset_blocks(struct kho_block_set *bs)
+{
+	struct kho_block *block;
+
+	kho_block_set_clear(bs);
+	list_for_each_entry(block, &bs->blocks, list) {
+		if (list_is_last(&block->list, &bs->blocks))
+			block->ser->next = 0;
+		else
+			block->ser->next =
+				virt_to_phys(list_next_entry(block, list)->ser);
+	}
+}
+
+static void luo_session_publish_frozen(void)
+{
+	struct luo_session_header *sh = &luo_session_global.outgoing;
+	struct luo_session *session;
+	struct kho_block_set_it it;
+	long frozen_count = 0;
+
+	guard(rwsem_write)(&sh->rwsem);
+	if (!sh->active || !sh->sessions_pa)
+		return;
+
+	luo_session_reset_blocks(&sh->block_set);
+	kho_block_set_it_init(&it, &sh->block_set);
+
+	list_for_each_entry(session, &sh->list, list) {
+		struct luo_session_ser *ser;
+
+		if (!session->user_frozen)
+			continue;
+
+		ser = kho_block_set_it_reserve_entry(&it);
+		if (WARN_ON_ONCE(!ser))
+			break;
+
+		ser->file_set_ser.count = session->file_set.count;
+		ser->file_set_ser.files =
+			kho_block_set_head_pa(&session->file_set.block_set);
+		strscpy(ser->name, session->name, sizeof(ser->name));
+		frozen_count++;
+	}
+
+	if (frozen_count > 0 && it.block)
+		it.block->ser->next = 0;
+
+	luo_flb_serialize();
+	smp_wmb();
+	WRITE_ONCE(*sh->sessions_pa,
+		   frozen_count > 0 ? kho_block_set_head_pa(&sh->block_set) : 0);
+}
+
 static int luo_session_release(struct inode *inodep, struct file *filep)
 {
 	struct luo_session *session = filep->private_data;
@@ -261,24 +317,38 @@ static int luo_session_release(struct inode *inodep, struct file *filep)
 	guard(rwsem_read)(&luo_session_serialize_rwsem);
 	/* If retrieved is set, it means this session is from incoming list */
 	if (session->retrieved) {
-		int err = luo_session_finish_one(session);
-
-		if (err) {
-			pr_warn("Unable to finish session [%s] on release\n",
-				session->name);
-			return err;
-		}
 		sh = &luo_session_global.incoming;
+		if (!session->finished) {
+			int err = luo_session_finish_one(session);
+
+			if (err) {
+				pr_warn("Unable to finish session [%s] on release\n",
+					session->name);
+				return err;
+			}
+			session->finished = true;
+			if (!session->ro && !kho_is_ro())
+				luo_session_remove(sh, session);
+		}
+		luo_session_remove(sh, session);
+		luo_session_free(session);
+		return 0;
 	} else {
+		bool was_frozen = false;
+
 		scoped_guard(mutex, &session->mutex) {
-			if (session->user_frozen)
+			if (session->user_frozen) {
+				was_frozen = true;
 				luo_file_unfreeze(&session->file_set);
+			}
 			luo_file_unpreserve_files(&session->file_set);
 		}
 		sh = &luo_session_global.outgoing;
+		luo_session_remove(sh, session);
+		if (was_frozen)
+			luo_session_publish_frozen();
 	}
 
-	luo_session_remove(sh, session);
 	luo_session_free(session);
 
 	return 0;
@@ -346,9 +416,16 @@ static int luo_session_finish(struct luo_session *session,
 	if (!session->retrieved)
 		return luo_ucmd_respond(ucmd, sizeof(*argp));
 
+	if (session->finished)
+		return -EINVAL;
+
 	err = luo_session_finish_one(session);
 	if (err)
 		return err;
+
+	session->finished = true;
+	if (!session->ro && !kho_is_ro())
+		luo_session_remove(&luo_session_global.incoming, session);
 
 	return luo_ucmd_respond(ucmd, sizeof(*argp));
 }
@@ -375,21 +452,24 @@ static int luo_session_freeze(struct luo_session *session,
 	if (argp->reserved)
 		return -EINVAL;
 
-	guard(mutex)(&session->mutex);
-	if (session->user_frozen)
-		return -EBUSY;
+	scoped_guard(mutex, &session->mutex) {
+		if (session->user_frozen)
+			return -EBUSY;
 
-	err = luo_file_freeze(&session->file_set);
-	if (err)
-		return err;
+		err = luo_file_freeze(&session->file_set);
+		if (err)
+			return err;
 
-	err = luo_ucmd_respond(ucmd, sizeof(*argp));
-	if (err) {
-		luo_file_unfreeze(&session->file_set);
-		return err;
+		err = luo_ucmd_respond(ucmd, sizeof(*argp));
+		if (err) {
+			luo_file_unfreeze(&session->file_set);
+			return err;
+		}
+
+		session->user_frozen = true;
 	}
 
-	session->user_frozen = true;
+	luo_session_publish_frozen();
 
 	return 0;
 }
@@ -556,6 +636,58 @@ err_free:
 	return err;
 }
 
+static int luo_session_deserialize_one(struct luo_session_header *sh,
+				       struct luo_session_ser *ser);
+
+static int luo_session_ro_deserialize_by_name(struct luo_session_header *sh,
+					      const char *name)
+{
+	struct kho_block_set bs;
+	struct kho_block_set_it it;
+	struct luo_session_ser *ser;
+	phys_addr_t luo_ser_pa;
+	struct luo_ser *luo_ser;
+	u64 sessions_pa;
+	size_t len;
+	int err;
+
+	err = kho_retrieve_subtree(LUO_KHO_ENTRY_NAME, &luo_ser_pa, &len);
+	if (err)
+		return err;
+	if (len < sizeof(*luo_ser))
+		return -EINVAL;
+
+	luo_ser = kho_ro_map_folio(luo_ser_pa, PAGE_KERNEL_RO);
+	if (!luo_ser)
+		return -ENOMEM;
+
+	if (strncmp(luo_ser->compatible, LUO_ABI_COMPATIBLE,
+		    LUO_ABI_COMPAT_LEN))
+		return -EINVAL;
+
+	sessions_pa = READ_ONCE(luo_ser->sessions_pa);
+	smp_rmb();
+
+	kho_block_set_init(&bs, sizeof(struct luo_session_ser));
+	err = kho_block_set_restore(&bs, sessions_pa);
+	if (err)
+		return err;
+
+	err = -ENOENT;
+	kho_block_set_it_init(&it, &bs);
+	while ((ser = kho_block_set_it_read_entry(&it))) {
+		if (!strncmp(ser->name, name, sizeof(ser->name))) {
+			struct luo_session_ser matched = *ser;
+
+			kho_block_set_destroy(&bs);
+			return luo_session_deserialize_one(sh, &matched);
+		}
+	}
+
+	kho_block_set_destroy(&bs);
+	return err;
+}
+
 int luo_session_retrieve(const char *name, struct file **filep)
 {
 	struct luo_session_header *sh = &luo_session_global.incoming;
@@ -564,11 +696,32 @@ int luo_session_retrieve(const char *name, struct file **filep)
 	int err;
 
 	guard(rwsem_read)(&luo_session_serialize_rwsem);
-	guard(rwsem_read)(&sh->rwsem);
-	list_for_each_entry(it, &sh->list, list) {
-		if (!strncmp(it->name, name, sizeof(it->name))) {
-			session = it;
-			break;
+	scoped_guard(rwsem_read, &sh->rwsem) {
+		list_for_each_entry(it, &sh->list, list) {
+			if (!strncmp(it->name, name, sizeof(it->name))) {
+				session = it;
+				break;
+			}
+		}
+	}
+
+	if (session && session->finished && (session->ro || kho_is_ro())) {
+		luo_session_remove(sh, session);
+		session = NULL;
+	}
+
+	if (!session && kho_is_ro()) {
+		err = luo_session_ro_deserialize_by_name(sh, name);
+		if (err && err != -EEXIST)
+			return err;
+
+		scoped_guard(rwsem_read, &sh->rwsem) {
+			list_for_each_entry(it, &sh->list, list) {
+				if (!strncmp(it->name, name, sizeof(it->name))) {
+					session = it;
+					break;
+				}
+			}
 		}
 	}
 
@@ -621,13 +774,7 @@ static int luo_session_deserialize_one(struct luo_session_header *sh,
 		return PTR_ERR(session);
 	}
 
-	err = luo_session_insert(sh, session);
-	if (err) {
-		pr_warn("Failed to insert session [%s] %pe\n",
-			session->name, ERR_PTR(err));
-		luo_session_free(session);
-		return err;
-	}
+	session->ro = kho_is_ro();
 
 	scoped_guard(mutex, &session->mutex) {
 		err = luo_file_deserialize(&session->file_set,
@@ -636,6 +783,15 @@ static int luo_session_deserialize_one(struct luo_session_header *sh,
 	if (err) {
 		pr_warn("Failed to deserialize files for session [%s] %pe\n",
 			session->name, ERR_PTR(err));
+		luo_session_free(session);
+		return err;
+	}
+
+	err = luo_session_insert(sh, session);
+	if (err) {
+		pr_warn("Failed to insert session [%s] %pe\n",
+			session->name, ERR_PTR(err));
+		luo_session_free(session);
 		return err;
 	}
 
@@ -702,6 +858,7 @@ int luo_session_serialize(void)
 	down_write(&sh->rwsem);
 	*sh->sessions_pa = 0;
 
+	luo_session_reset_blocks(&sh->block_set);
 	kho_block_set_it_init(&it, &sh->block_set);
 
 	list_for_each_entry(session, &sh->list, list) {

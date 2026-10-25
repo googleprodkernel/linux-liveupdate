@@ -74,6 +74,8 @@ struct luo_session {
 	struct list_head list;
 	bool retrieved;
 	bool user_frozen;
+	bool finished;
+	bool ro;
 	struct luo_file_set file_set;
 	struct mutex mutex;
 };

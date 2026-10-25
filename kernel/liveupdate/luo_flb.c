@@ -214,6 +214,9 @@ void liveupdate_flb_put_incoming(struct liveupdate_flb *flb)
 	struct luo_flb_private *private = luo_flb_get_private(flb);
 	struct liveupdate_flb_op_args args = {0};
 
+	if (kho_is_ro())
+		return;
+
 	scoped_guard(mutex, &private->incoming.lock) {
 		if (!refcount_dec_and_test(&private->incoming.count))
 			return;

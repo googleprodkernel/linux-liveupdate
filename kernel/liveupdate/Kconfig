@@ -61,7 +61,7 @@ config KEXEC_HANDOVER_READONLY
 
 config LIVEUPDATE
 	bool "Live Update Orchestrator"
-	depends on KEXEC_HANDOVER
+	depends on KEXEC_HANDOVER || KEXEC_HANDOVER_READONLY
 	help
 	  Enable the Live Update Orchestrator. Live Update is a mechanism,
 	  typically based on kexec, that allows the kernel to be updated

@@ -7,6 +7,7 @@
 #ifndef _LINUX_LIVEUPDATE_H
 #define _LINUX_LIVEUPDATE_H
 
+#include <linux/bits.h>
 #include <linux/bug.h>
 #include <linux/compiler.h>
 #include <linux/kho/abi/luo.h>
@@ -136,12 +137,23 @@ struct liveupdate_file_ops {
 };
 
 /**
+ * enum liveupdate_fh_flags - Flags controlling file handler behavior.
+ * @LIVEUPDATE_FH_RO_RETRIEVE: Safe to call .retrieve() when kho_is_ro().
+ * @LIVEUPDATE_FH_RO_PRESERVE: Safe to call .preserve() on retrieved RO session.
+ */
+enum liveupdate_fh_flags {
+	LIVEUPDATE_FH_RO_RETRIEVE = BIT(0),
+	LIVEUPDATE_FH_RO_PRESERVE = BIT(1),
+};
+
+/**
  * struct liveupdate_file_handler - Represents a handler for a live-updatable file type.
  * @ops:                Callback functions
  * @compatible:         The compatibility string (e.g., "memfd-v1", "vfiofd-v1")
  *                      that uniquely identifies the file type this handler
  *                      supports. This is matched against the compatible string
  *                      associated with individual &struct file instances.
+ * @flags:              Bitmask of &enum liveupdate_fh_flags.
  *
  * Modules that want to support live update for specific file types should
  * register an instance of this structure. LUO uses this registration to
@@ -151,6 +163,7 @@ struct liveupdate_file_ops {
 struct liveupdate_file_handler {
 	const struct liveupdate_file_ops *ops;
 	const char compatible[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	unsigned long flags;
 
 	/* private: */
 

@@ -623,6 +623,8 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 	int err;
 
 	scoped_guard(mutex, &session->mutex) {
+		if (session->finished)
+			return -EINVAL;
 		if (list_empty(&file_set->files_list))
 			return -ENOENT;
 
@@ -646,6 +648,8 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 	}
 
 	if (incoming && luo_file->retrieve_status > 0) {
+		if (!luo_file->file)
+			return -EBUSY;
 		/*
 		 * The argument only applies to the retrieve that restores the
 		 * file. Don't silently ignore it.
@@ -661,6 +665,9 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 		*filep = luo_file->file;
 		return 0;
 	}
+
+	if (kho_is_ro() && !(luo_file->fh->flags & LIVEUPDATE_FH_RO_RETRIEVE))
+		return -EOPNOTSUPP;
 
 	err = luo_copy_user_arg(arg, &args.arg, &luo_file->fh->ops->rarg);
 	if (err)
@@ -681,7 +688,7 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 		return err;
 	}
 
-	if (incoming) {
+	if (incoming && !kho_is_ro()) {
 		err = xa_insert(&luo_preserved_files,
 				luo_get_id(luo_file->fh, args.file), args.file,
 				GFP_KERNEL);
@@ -733,6 +740,9 @@ static void luo_file_finish_one(struct luo_file_set *file_set,
 				struct luo_file *luo_file)
 {
 	struct liveupdate_file_op_args args = {0};
+
+	if (kho_is_ro())
+		return;
 
 	guard(mutex)(&luo_file->mutex);
 
@@ -927,6 +937,9 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 		err = -EINVAL;
 		goto err_destroy_blocks;
 	}
+
+	if (kho_is_ro())
+		kho_block_set_destroy(&file_set->block_set);
 
 	return 0;
 

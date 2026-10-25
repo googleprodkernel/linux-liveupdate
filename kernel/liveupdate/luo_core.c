@@ -88,6 +88,11 @@ static int __init luo_early_startup(void)
 	size_t len;
 	int err;
 
+	if (kho_is_ro()) {
+		luo_global.enabled = true;
+		return 0;
+	}
+
 	if (!kho_is_enabled()) {
 		if (liveupdate_enabled())
 			pr_warn("Disabling liveupdate because KHO is disabled\n");
@@ -194,7 +199,7 @@ static int __init luo_late_startup(void)
 {
 	int err;
 
-	if (!liveupdate_enabled())
+	if (!liveupdate_enabled() || kho_is_ro())
 		return 0;
 
 	err = luo_state_setup();
@@ -221,7 +226,7 @@ int liveupdate_reboot(void)
 {
 	int err;
 
-	if (!liveupdate_enabled())
+	if (!liveupdate_enabled() || kho_is_ro())
 		return 0;
 
 	err = luo_session_serialize();
@@ -272,6 +277,9 @@ static int luo_ioctl_create_session(struct luo_ucmd *ucmd)
 	struct liveupdate_ioctl_create_session *argp = ucmd->cmd;
 	struct file *file;
 	int err;
+
+	if (kho_is_ro())
+		return -EOPNOTSUPP;
 
 	argp->fd = get_unused_fd_flags(O_CLOEXEC);
 	if (argp->fd < 0)
@@ -337,7 +345,7 @@ static int luo_open(struct inode *inodep, struct file *filep)
 		return -EBUSY;
 
 	/* Always return -EIO to user if deserialization fail */
-	if (luo_session_deserialize()) {
+	if (!kho_is_ro() && luo_session_deserialize()) {
 		atomic_set(&ldev->in_use, 0);
 		return -EIO;
 	}
