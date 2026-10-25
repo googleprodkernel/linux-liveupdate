@@ -1814,6 +1814,11 @@ err:
 
 void __init kho_memory_init(void)
 {
+	if (kho_is_ro()) {
+		kho_enable = false;
+		return;
+	}
+
 	if (kho_in.scratch_phys)
 		kho_mem_retrieve();
 	else
@@ -1829,6 +1834,9 @@ void __init kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
 	void *fdt = NULL;
 	bool populated = false;
 	int err;
+
+	if (kho_ro_cmdline_enabled())
+		return;
 
 	/* Validate the input FDT */
 	fdt = early_memremap(fdt_phys, fdt_len);
