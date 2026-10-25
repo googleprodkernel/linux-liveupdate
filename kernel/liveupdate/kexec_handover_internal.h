@@ -18,7 +18,20 @@ struct kho_vmalloc_walk_ops {
 	int (*entry)(phys_addr_t pa, void *priv);
 };
 
+#ifdef CONFIG_KEXEC_HANDOVER
 const void *kho_get_fdt(void);
+#else
+static inline const void *kho_get_fdt(void) { return NULL; }
+#endif
+
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+const void *kho_ro_get_fdt(void);
+bool kho_ro_cmdline_enabled(void);
+#else
+static inline const void *kho_ro_get_fdt(void) { return NULL; }
+static inline bool kho_ro_cmdline_enabled(void) { return false; }
+#endif
+
 bool kho_vmalloc_validate(const struct kho_vmalloc *preservation,
 			  unsigned int *vm_flags);
 int kho_vmalloc_walk(const struct kho_vmalloc *preservation,

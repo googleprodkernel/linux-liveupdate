@@ -86,6 +86,9 @@ Public API
 .. kernel-doc:: kernel/liveupdate/kexec_handover_common.c
   :export:
 
+.. kernel-doc:: kernel/liveupdate/kexec_handover_ro.c
+  :export:
+
 KHO Serialization Blocks API
 ============================
 
