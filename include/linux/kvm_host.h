@@ -399,6 +399,10 @@ struct kvm_vcpu {
 	struct kvm_memory_slot *last_used_slot;
 	u64 last_used_slot_gen;
 	bool luo_preserved;
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+	const struct kvm_vcpu_ser *luo_ro_ser;
+	void *luo_ro_arch_state;
+#endif
 };
 
 /*
@@ -2694,6 +2698,13 @@ static inline int kvm_arch_vcpu_luo_retrieve(struct kvm_vcpu *vcpu,
 
 static inline void kvm_arch_vcpu_luo_unpreserve(struct kvm_vcpu_ser *ser) {}
 static inline void kvm_arch_vcpu_luo_finish(struct kvm_vcpu_ser *ser) {}
+#endif
+
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+int kvm_arch_vcpu_luo_preserve_ro(struct kvm_vcpu *vcpu,
+				  const struct kvm_vcpu_ser *ser);
+int kvm_arch_vcpu_luo_retrieve_ro(struct kvm_vcpu *vcpu,
+				  const struct kvm_vcpu_ser *ser);
 #endif
 #endif /* CONFIG_LIVEUPDATE_GUEST_MEMFD */
 

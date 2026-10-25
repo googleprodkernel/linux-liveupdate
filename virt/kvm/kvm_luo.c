@@ -243,6 +243,21 @@ static bool kvm_vcpu_luo_can_preserve(struct liveupdate_file_handler *handler,
 	return file_is_kvm_vcpu(file);
 }
 
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+static int kvm_vcpu_luo_preserve_ro(struct liveupdate_file_op_args *args);
+static int kvm_vcpu_luo_retrieve_ro(struct liveupdate_file_op_args *args);
+#else
+static int kvm_vcpu_luo_preserve_ro(struct liveupdate_file_op_args *args)
+{
+	return -EOPNOTSUPP;
+}
+
+static int kvm_vcpu_luo_retrieve_ro(struct liveupdate_file_op_args *args)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static int kvm_vcpu_luo_preserve(struct liveupdate_file_op_args *args)
 {
 	struct kvm_vcpu *vcpu = args->file->private_data;
@@ -250,6 +265,9 @@ static int kvm_vcpu_luo_preserve(struct liveupdate_file_op_args *args)
 	struct file *kvm_file;
 	u64 vm_token;
 	int err;
+
+	if (kho_is_ro())
+		return kvm_vcpu_luo_preserve_ro(args);
 
 	if (!mutex_trylock(&vcpu->mutex))
 		return -EBUSY;
@@ -346,6 +364,9 @@ static int kvm_vcpu_luo_retrieve(struct liveupdate_file_op_args *args)
 	struct kvm *kvm;
 	int err;
 
+	if (kho_is_ro())
+		return kvm_vcpu_luo_retrieve_ro(args);
+
 	if (!args->serialized_data)
 		return -EINVAL;
 
@@ -405,6 +426,107 @@ static int kvm_vcpu_luo_retrieve(struct liveupdate_file_op_args *args)
 	return 0;
 }
 
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+int __weak kvm_arch_vcpu_luo_preserve_ro(struct kvm_vcpu *vcpu,
+					 const struct kvm_vcpu_ser *ser)
+{
+	return -EOPNOTSUPP;
+}
+
+int __weak kvm_arch_vcpu_luo_retrieve_ro(struct kvm_vcpu *vcpu,
+					 const struct kvm_vcpu_ser *ser)
+{
+	return -EOPNOTSUPP;
+}
+
+static int kvm_vcpu_luo_preserve_ro(struct liveupdate_file_op_args *args)
+{
+	struct kvm_vcpu *vcpu = args->file->private_data;
+	const struct kvm_vcpu_ser *ser;
+	int err;
+
+	if (!args->serialized_data)
+		return -EINVAL;
+
+	if (!mutex_trylock(&vcpu->mutex))
+		return -EBUSY;
+
+	if (vcpu->luo_preserved) {
+		mutex_unlock(&vcpu->mutex);
+		return -EBUSY;
+	}
+
+	ser = vcpu->luo_ro_ser ?: kho_ro_map_folio(args->serialized_data,
+						   PAGE_KERNEL_RO);
+	if (!ser) {
+		mutex_unlock(&vcpu->mutex);
+		return -EINVAL;
+	}
+	vcpu->luo_ro_ser = ser;
+
+	if (ser->reserved || ser->vcpu_id != vcpu->vcpu_id) {
+		mutex_unlock(&vcpu->mutex);
+		return -EINVAL;
+	}
+
+	err = kvm_arch_vcpu_luo_preserve_ro(vcpu, ser);
+	if (!err)
+		vcpu->luo_preserved = true;
+	mutex_unlock(&vcpu->mutex);
+	return err;
+}
+
+static int kvm_vcpu_luo_retrieve_ro(struct liveupdate_file_op_args *args)
+{
+	const struct kvm_vcpu_ser *ser;
+	struct kvm_vcpu *vcpu;
+	struct file *file;
+	int err;
+
+	if (!args->serialized_data)
+		return -EINVAL;
+
+	if (!args->arg) {
+		args->retryable = true;
+		return -EINVAL;
+	}
+
+	ser = kho_ro_map_folio(args->serialized_data, PAGE_KERNEL_RO);
+	if (!ser)
+		return -EINVAL;
+
+	if (ser->reserved)
+		return -EINVAL;
+
+	file = kvm_vcpu_luo_get_target_file(args, ser->vcpu_id);
+	if (IS_ERR(file)) {
+		args->retryable = true;
+		return PTR_ERR(file);
+	}
+
+	vcpu = file->private_data;
+	if (mutex_lock_killable(&vcpu->mutex)) {
+		fput(file);
+		args->retryable = true;
+		return -EINTR;
+	}
+
+	vcpu->luo_ro_ser = ser;
+	err = kvm_arch_vcpu_luo_retrieve_ro(vcpu, ser);
+	if (!err)
+		vcpu->luo_preserved = false;
+	mutex_unlock(&vcpu->mutex);
+
+	if (err) {
+		fput(file);
+		return err;
+	}
+
+	args->file = file;
+	return 0;
+}
+#endif /* CONFIG_KEXEC_HANDOVER_READONLY */
+
 static void kvm_vcpu_luo_unpreserve(struct liveupdate_file_op_args *args)
 {
 	struct kvm_vcpu *vcpu = args->file ? args->file->private_data : NULL;
@@ -451,6 +573,7 @@ static const struct liveupdate_file_ops kvm_vcpu_luo_file_ops = {
 static struct liveupdate_file_handler kvm_vcpu_luo_handler = {
 	.ops = &kvm_vcpu_luo_file_ops,
 	.compatible = KVM_VCPU_LUO_FH_COMPATIBLE,
+	.flags = LIVEUPDATE_FH_RO_RETRIEVE | LIVEUPDATE_FH_RO_PRESERVE,
 };
 
 int kvm_luo_init(void)
