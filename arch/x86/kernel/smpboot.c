@@ -1015,14 +1015,9 @@ int common_cpu_up(unsigned int cpu, struct task_struct *idle)
  */
 static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 {
-	unsigned long start_ip = real_mode_header->trampoline_start;
+	unsigned long start_ip;
 	int ret;
 
-#ifdef CONFIG_X86_64
-	/* If 64-bit wakeup method exists, use the 64-bit mode trampoline IP */
-	if (apic->wakeup_secondary_cpu_64)
-		start_ip = real_mode_header->trampoline_start64;
-#endif
 	idle->thread.sp = (unsigned long)task_pt_regs(idle);
 	initial_code = (unsigned long)start_secondary;
 
@@ -1044,6 +1039,13 @@ static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 	if (!apic->wakeup_secondary_cpu_64 && !apic->wakeup_secondary_cpu &&
 	    !arch_cpupr_wakeup_ap(cpu))
 		return 0;
+
+	start_ip = real_mode_header->trampoline_start;
+#ifdef CONFIG_X86_64
+	/* If 64-bit wakeup method exists, use the 64-bit mode trampoline IP */
+	if (apic->wakeup_secondary_cpu_64)
+		start_ip = real_mode_header->trampoline_start64;
+#endif
 
 	/*
 	 * This grunge runs the startup process for

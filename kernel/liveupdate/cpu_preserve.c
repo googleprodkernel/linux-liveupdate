@@ -230,6 +230,7 @@
 
 #define pr_fmt(fmt) "cpu_preserve: " fmt
 
+#include <linux/anon_inodes.h>
 #include <linux/capability.h>
 #include <linux/cpu.h>
 #include <linux/cpu_preserve.h>
@@ -242,6 +243,7 @@
 #include <linux/liveupdate.h>
 #include <linux/pagemap.h>
 #include <linux/reboot.h>
+#include <linux/sizes.h>
 #include <linux/suspend.h>
 
 /**
@@ -260,6 +262,9 @@ struct cpupr_session {
 	struct liveupdate_session *lsession;
 	struct cpumask cpus;
 	struct cpupr_as_ser *as;
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+	struct cpupr_as_ser *ro_as;
+#endif
 	bool incoming;
 	struct mutex as_lock;
 	struct file *mapped_mem_file;
@@ -284,6 +289,9 @@ static struct cpumask cpupr_incoming_mask;
 static struct cpumask cpupr_outgoing_mask;
 static DEFINE_PER_CPU(struct cpupr_ser *, cpupr_cpu_ser);
 static DEFINE_PER_CPU(struct cpupr_session *, cpupr_cpu_session);
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+static DEFINE_PER_CPU(struct cpupr_stack_context *, cpupr_ro_sctx);
+#endif
 /* The link that points to the descriptor of a CPU on the handover list */
 static DEFINE_PER_CPU(u64 *, cpupr_cpu_link);
 static struct cpupr_global_ser *cpupr_global_ser;
@@ -328,6 +336,16 @@ static void *__cpupr_as_alloc(struct cpupr_session *ps, unsigned int order)
 
 	if (WARN_ON_ONCE(ps->incoming || !ps->as))
 		return ERR_PTR(-EINVAL);
+
+	if (kho_is_ro()) {
+		struct folio *folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, order);
+
+		if (!folio)
+			return ERR_PTR(-ENOMEM);
+		ptr = folio_address(folio);
+		cpupr_clean_sz(ptr, PAGE_SIZE << order);
+		return ptr;
+	}
 
 	ptr = kho_alloc_preserve(PAGE_SIZE << order);
 	if (IS_ERR(ptr))
@@ -588,6 +606,15 @@ static void cpupr_as_unpreserve(struct cpupr_session *ps)
 	if (!ps->as)
 		return;
 
+	if (kho_is_ro()) {
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+		ps->ro_as = NULL;
+#endif
+		kfree(ps->as);
+		ps->as = NULL;
+		return;
+	}
+
 	for (blk = KHOSER_LOAD_PTR(ps->as->folios); blk; blk = next) {
 		next = KHOSER_LOAD_PTR(blk->next);
 		for (u64 i = 0; i < blk->count; i++) {
@@ -617,11 +644,17 @@ static int cpupr_as_create(struct cpupr_session *ps)
 	if (ret)
 		return ret;
 
-	ps->as = kho_alloc_preserve(sizeof(*ps->as));
-	if (IS_ERR(ps->as)) {
-		ret = PTR_ERR(ps->as);
-		ps->as = NULL;
-		return ret;
+	if (kho_is_ro()) {
+		ps->as = kzalloc_obj(*ps->as);
+		if (!ps->as)
+			return -ENOMEM;
+	} else {
+		ps->as = kho_alloc_preserve(sizeof(*ps->as));
+		if (IS_ERR(ps->as)) {
+			ret = PTR_ERR(ps->as);
+			ps->as = NULL;
+			return ret;
+		}
 	}
 	ps->as->size = sizeof(*ps->as);
 
@@ -729,6 +762,14 @@ struct cpupr_stack_context *cpupr_get_sctx(int cpu)
 	struct cpupr_stack_context *sctx;
 	struct cpupr_ser *ser;
 	phys_addr_t pa;
+
+	if ((unsigned int)cpu >= nr_cpu_ids)
+		return NULL;
+
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+	if (kho_is_ro())
+		return READ_ONCE(per_cpu(cpupr_ro_sctx, cpu));
+#endif
 
 	/* The stack of an incoming CPU is private to the previous kernel */
 	if (cpupr_is_incoming(cpu))
@@ -1040,9 +1081,9 @@ static int cpupr_wait_dead_timeout(int cpu, u64 timeout_us)
 	return cpupr_wait_dead_ser(cpu, cpupr_get_ser(cpu), timeout_us, false);
 }
 
-static int cpupr_wait_dead(int cpu)
+static int cpupr_wait_dead(int cpu, u64 timeout_us)
 {
-	return cpupr_wait_dead_ser(cpu, cpupr_get_ser(cpu), 100, true);
+	return cpupr_wait_dead_ser(cpu, cpupr_get_ser(cpu), timeout_us, true);
 }
 
 /**
@@ -1316,6 +1357,7 @@ static int cpupr_map_stack(struct cpupr_session *ps, void *stack)
 static int cpupr_unpreserve(unsigned int cpu)
 {
 	struct device *dev = get_cpu_device(cpu);
+	u64 timeout_us = 5 * CPUPR_WAIT_DEAD_TIMEOUT_US;
 	int ret;
 
 	scoped_guard(mutex, &cpupr_lock) {
@@ -1323,6 +1365,9 @@ static int cpupr_unpreserve(unsigned int cpu)
 			return 0;
 		if (!dev)
 			return -ENODEV;
+
+		if (cpupr_state(cpu) == CPUPR_WORKLOAD)
+			timeout_us = USEC_PER_MSEC;
 
 		cpupr_signal_exit(cpu);
 		arch_cpupr_kick(cpu);
@@ -1332,7 +1377,7 @@ static int cpupr_unpreserve(unsigned int cpu)
 	 * Do not hold cpupr_lock across the wait: it only reads the
 	 * CPU's ser, which stays valid for as long as the CPU is preserved.
 	 */
-	ret = cpupr_wait_dead(cpu);
+	ret = cpupr_wait_dead(cpu, timeout_us);
 	if (WARN_ON_ONCE(ret))
 		return ret;
 
@@ -2097,11 +2142,23 @@ static int cpupr_incoming_cpu(u64 data)
 	return -ENOENT;
 }
 
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+static int cpupr_retrieve_ro_cb(struct liveupdate_file_op_args *args);
+#else
+static int cpupr_retrieve_ro_cb(struct liveupdate_file_op_args *args)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static int cpupr_retrieve_cb(struct liveupdate_file_op_args *args)
 {
 	struct file *file;
 	char path[64];
 	int cpu;
+
+	if (kho_is_ro())
+		return cpupr_retrieve_ro_cb(args);
 
 	cpu = cpupr_incoming_cpu(args->serialized_data);
 	if (cpu < 0)
@@ -2139,6 +2196,154 @@ static void cpupr_finish_cb(struct liveupdate_file_op_args *args)
 	cpupr_session_remove_cpu(ps, cpu);
 }
 
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+static int cpupr_ro_setup_cpu(unsigned int cpu, struct liveupdate_session *s,
+			      struct cpupr_ser *ser, phys_addr_t ser_pa)
+{
+	struct cpupr_stack_context *sctx;
+	struct cpupr_session *ps;
+	void *stack;
+	int ret;
+
+	ps = cpupr_session_get(s);
+	if (IS_ERR(ps))
+		return PTR_ERR(ps);
+
+	stack = cpupr_as_alloc_folio(ps, CPUPR_STACK_ORDER);
+	if (IS_ERR(stack))
+		return PTR_ERR(stack);
+
+	ret = cpupr_map_stack(ps, stack);
+	if (ret)
+		return ret;
+
+	ret = cpupr_as_map(ps, ser_pa, (unsigned long)ser, sizeof(*ser),
+			   PAGE_KERNEL);
+	if (ret)
+		return ret;
+
+	sctx = stack;
+	sctx->magic = CPUPR_STACK_MAGIC;
+	sctx->workload_context = 0;
+	sctx->session_pgd_pa = ps->as->pgd_pa;
+	sctx->ser = ser;
+	sctx->entry_fn = NULL;
+	cpupr_clean(sctx);
+
+	WRITE_ONCE(ser->state, CPUPR_PARKING);
+	cpupr_clean(ser);
+
+	scoped_guard(mutex, &cpupr_lock) {
+		if (!ps->ro_as && ser->as.phys)
+			ps->ro_as = kho_ro_map_folio(ser->as.phys, PAGE_KERNEL);
+		WRITE_ONCE(per_cpu(cpupr_ro_sctx, cpu), sctx);
+		WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), ser);
+		per_cpu(cpupr_cpu_session, cpu) = ps;
+		cpumask_set_cpu(cpu, &cpupr_outgoing_mask);
+		cpumask_set_cpu(cpu, &cpupr_mask);
+	}
+
+	scoped_guard(mutex, &cpupr_sessions_lock)
+		cpumask_set_cpu(cpu, &ps->cpus);
+
+	return 0;
+}
+
+static int cpupr_ro_release(struct inode *inode, struct file *file)
+{
+	unsigned int cpu = (uintptr_t)file->private_data;
+	struct device *dev = get_cpu_device(cpu);
+
+	if (dev) {
+		lock_device_hotplug();
+		if (cpu_online(cpu)) {
+			struct cpupr_session *ps = per_cpu(cpupr_cpu_session, cpu);
+			struct cpupr_ser *ser = per_cpu(cpupr_cpu_ser, cpu);
+
+			if (ps && ps->as && ser) {
+				WRITE_ONCE(ser->state, CPUPR_PARKING);
+				cpupr_clean(ser);
+				if (ps->ro_as) {
+					WRITE_ONCE(ps->ro_as->pgd_pa, ps->as->pgd_pa);
+					cpupr_clean(ps->ro_as);
+				}
+			}
+			if (!device_offline(dev)) {
+				cpupr_wait_parked(cpu);
+				scoped_guard(mutex, &cpupr_lock) {
+					cpumask_clear_cpu(cpu, &cpupr_outgoing_mask);
+					cpumask_clear_cpu(cpu, &cpupr_mask);
+					WRITE_ONCE(per_cpu(cpupr_cpu_ser, cpu), NULL);
+					WRITE_ONCE(per_cpu(cpupr_ro_sctx, cpu), NULL);
+					per_cpu(cpupr_cpu_session, cpu) = NULL;
+				}
+			}
+		}
+		unlock_device_hotplug();
+	}
+	return 0;
+}
+
+static const struct file_operations cpupr_ro_fops = {
+	.owner		= THIS_MODULE,
+	.release	= cpupr_ro_release,
+};
+
+static int cpupr_retrieve_ro_cb(struct liveupdate_file_op_args *args)
+{
+	struct cpupr_ser *ser;
+	struct file *file;
+	int cpu, ret = 0;
+
+	if (!args->serialized_data)
+		return -ENOENT;
+
+	ser = kho_ro_map_folio(args->serialized_data, PAGE_KERNEL);
+	if (!ser)
+		return -ENOMEM;
+
+	cpu = cpupr_find_cpu_by_hwid(ser->hwid);
+	if (cpu < 0)
+		return cpu;
+
+	lock_device_hotplug();
+	if (!cpu_online(cpu)) {
+		struct device *dev = get_cpu_device(cpu);
+
+		if (!dev) {
+			ret = -ENODEV;
+		} else {
+			scoped_guard(mutex, &cpupr_lock) {
+				cpumask_set_cpu(cpu, &cpupr_mask);
+				cpupr_signal_exit_ser(ser);
+				arch_cpupr_kick(cpu);
+				cpumask_clear_cpu(cpu, &cpupr_mask);
+			}
+			ret = cpupr_wait_dead_ser(cpu, ser,
+						  5 * CPUPR_WAIT_DEAD_TIMEOUT_US,
+						  true);
+			if (!ret)
+				ret = device_online(dev);
+			if (!ret)
+				ret = cpupr_ro_setup_cpu(cpu, args->session,
+							 ser,
+							 args->serialized_data);
+		}
+	}
+	unlock_device_hotplug();
+	if (ret < 0)
+		return ret;
+
+	file = anon_inode_getfile("cpu_preserve_ro", &cpupr_ro_fops,
+				  (void *)(uintptr_t)cpu, O_RDONLY);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	args->file = file;
+	return 0;
+}
+#endif /* CONFIG_KEXEC_HANDOVER_READONLY */
+
 static const struct liveupdate_file_ops cpu_preserve_file_ops = {
 	.can_preserve = cpupr_can_preserve_cb,
 	.preserve     = cpupr_preserve_cb,
@@ -2155,6 +2360,7 @@ static const struct liveupdate_file_ops cpu_preserve_file_ops = {
 static struct liveupdate_file_handler cpu_preserve_handler = {
 	.ops        = &cpu_preserve_file_ops,
 	.compatible = CPUPR_LUO_FH_COMPATIBLE,
+	.flags      = LIVEUPDATE_FH_RO_RETRIEVE,
 };
 
 static int cpupr_reboot_notify(struct notifier_block *nb, unsigned long action,
@@ -2248,11 +2454,13 @@ static int __init cpu_preserve_early_init(void)
 		return err;
 	}
 
-	/* Retrieve incoming preserved CPUs before secondary CPU bringup */
-	if (!liveupdate_flb_get_incoming(&cpupr_flb, &obj))
-		liveupdate_flb_put_incoming(&cpupr_flb);
+	if (!kho_is_ro()) {
+		/* Retrieve incoming preserved CPUs before secondary CPU bringup */
+		if (!liveupdate_flb_get_incoming(&cpupr_flb, &obj))
+			liveupdate_flb_put_incoming(&cpupr_flb);
 
-	register_reboot_notifier(&cpupr_reboot_nb);
+		register_reboot_notifier(&cpupr_reboot_nb);
+	}
 	register_pm_notifier(&cpupr_pm_nb);
 
 	return 0;

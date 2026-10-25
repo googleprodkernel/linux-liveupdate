@@ -24,6 +24,76 @@
 #include "cpu_preserve_internal.h"
 
 static DEFINE_PER_CPU(struct cpupr_ser *, x86_cpupr_wake_ser);
+static pgd_t x86_cpupr_wake_pgd_entry;
+static u32 x86_cpupr_wake_start_ip;
+
+static void *x86_cpupr_alloc_pgt_page(void *context)
+{
+	return (void *)get_zeroed_page(GFP_KERNEL);
+}
+
+static int x86_cpupr_get_wake_trampoline(pgd_t *pgd_entry, u32 *start_ip)
+{
+	static DEFINE_MUTEX(wake_lock);
+
+	guard(mutex)(&wake_lock);
+	if (!x86_cpupr_wake_start_ip) {
+		static const u8 stub_code[] = {
+			0xbc, 0x00, 0x20, 0x00, 0x00,             /* mov $0x2000, %esp */
+			0x48, 0x8b, 0x05, 0x0c, 0x00, 0x00, 0x00, /* mov 12(%rip), %rax */
+			0x0f, 0x22, 0xd8,                         /* mov %rax, %cr3 */
+			0xff, 0x25, 0x0b, 0x00, 0x00, 0x00,       /* jmp *11(%rip) */
+			0x90, 0x90, 0x90,                         /* nop; nop; nop */
+		};
+		struct {
+			u8 code[24];
+			u64 cr3;
+			u64 rip;
+		} __packed *stub;
+		phys_addr_t stub_pa;
+		pgd_t *wake_pgd;
+		struct x86_mapping_info info = {
+			.alloc_pgt_page = x86_cpupr_alloc_pgt_page,
+			.page_flag = __PAGE_KERNEL_EXEC,
+			.force_pte = true,
+		};
+		int i;
+
+		wake_pgd = (pgd_t *)get_zeroed_page(GFP_KERNEL);
+		if (!wake_pgd)
+			return -ENOMEM;
+
+		stub = (void *)get_zeroed_page(GFP_KERNEL);
+		if (!stub) {
+			free_page((unsigned long)wake_pgd);
+			return -ENOMEM;
+		}
+
+		stub_pa = virt_to_phys(stub);
+		info.offset = PAGE_SIZE - stub_pa;
+		if (kernel_ident_mapping_init(&info, wake_pgd, stub_pa,
+					      stub_pa + PAGE_SIZE)) {
+			free_page((unsigned long)stub);
+			free_page((unsigned long)wake_pgd);
+			return -ENOMEM;
+		}
+
+		for (i = pgd_index(__PAGE_OFFSET); i < PTRS_PER_PGD; i++)
+			wake_pgd[i] = init_top_pgt[i];
+
+		memcpy(stub->code, stub_code, sizeof(stub_code));
+		stub->cr3 = virt_to_phys(wake_pgd) | sme_me_mask;
+		stub->rip = (u64)secondary_startup_64;
+		cpupr_clean(stub);
+
+		x86_cpupr_wake_pgd_entry = wake_pgd[0];
+		smp_store_release(&x86_cpupr_wake_start_ip, PAGE_SIZE);
+	}
+
+	*pgd_entry = x86_cpupr_wake_pgd_entry;
+	*start_ip = x86_cpupr_wake_start_ip;
+	return 0;
+}
 
 /*
  * Initialize the preserved IDT with exception handlers.
@@ -226,17 +296,54 @@ void arch_cpupr_wait_dead(int cpu, struct cpupr_ser *ser, bool bringup)
 	}
 
 	if (bringup) {
-		struct cpupr_as_ser *as = ser ? KHOSER_LOAD_PTR(ser->as) : NULL;
+		phys_addr_t pgd_pa = 0;
+		pgd_t wake_pgd_entry;
+		u32 wake_start_ip;
 
-		if (as && as->pgd_pa && READ_ONCE(ser->state) == CPUPR_DEAD) {
-			pgd_t *pgd = phys_to_virt(as->pgd_pa);
+		if (ser && READ_ONCE(ser->state) == CPUPR_DEAD &&
+		    !x86_cpupr_get_wake_trampoline(&wake_pgd_entry, &wake_start_ip)) {
+			if (kho_is_ro()) {
+				static phys_addr_t last_ro_as_pa;
+				static phys_addr_t last_ro_pgd_pa;
 
-			WRITE_ONCE(pgd[0], trampoline_pgd_entry);
-			per_cpu(x86_cpupr_wake_ser, cpu) = ser;
-		} else {
-			per_cpu(x86_cpupr_wake_ser, cpu) = NULL;
+				if (ser->as.phys == READ_ONCE(last_ro_as_pa) &&
+				    READ_ONCE(last_ro_pgd_pa)) {
+					pgd_pa = READ_ONCE(last_ro_pgd_pa);
+				} else {
+					struct cpupr_as_ser *as;
+
+					as = kho_ro_map_folio(ser->as.phys, PAGE_KERNEL_RO);
+					if (as)
+						pgd_pa = as->pgd_pa;
+					if (pgd_pa) {
+						pgd_t *pgd = kho_ro_map_folio(pgd_pa, PAGE_KERNEL);
+
+						if (pgd) {
+							WRITE_ONCE(pgd[0], wake_pgd_entry);
+							cpupr_clean(&pgd[0]);
+							WRITE_ONCE(last_ro_pgd_pa, pgd_pa);
+							WRITE_ONCE(last_ro_as_pa, ser->as.phys);
+						} else {
+							pgd_pa = 0;
+						}
+					}
+				}
+			} else {
+				struct cpupr_as_ser *as = KHOSER_LOAD_PTR(ser->as);
+
+				if (as && as->pgd_pa) {
+					pgd_t *pgd = phys_to_virt(as->pgd_pa);
+
+					WRITE_ONCE(pgd[0], wake_pgd_entry);
+					cpupr_clean(&pgd[0]);
+					pgd_pa = as->pgd_pa;
+				}
+			}
 		}
-		return;
+		if (pgd_pa) {
+			per_cpu(x86_cpupr_wake_ser, cpu) = ser;
+			return;
+		}
 	}
 
 	per_cpu(x86_cpupr_wake_ser, cpu) = NULL;
@@ -261,7 +368,9 @@ void arch_cpupr_wait_dead(int cpu, struct cpupr_ser *ser, bool bringup)
 
 int arch_cpupr_wakeup_ap(unsigned int cpu)
 {
+	pgd_t wake_pgd_entry;
 	struct cpupr_ser *ser;
+	u32 wake_start_ip;
 	unsigned int i;
 
 	if (cpu >= nr_cpu_ids)
@@ -271,11 +380,14 @@ int arch_cpupr_wakeup_ap(unsigned int cpu)
 	if (!ser)
 		return -ENODEV;
 
-	smp_store_release(&ser->state, real_mode_header->trampoline_start64);
+	if (x86_cpupr_get_wake_trampoline(&wake_pgd_entry, &wake_start_ip))
+		return -ENOMEM;
+
+	smp_store_release(&ser->state, wake_start_ip);
 	cpupr_clean(ser);
 	x86_cpupr_send_nmi((int)cpu);
 
-	for (i = 0; i < 1000; i++) {
+	for (i = 0; i < 1000000; i++) {
 		cpupr_clean(ser);
 		if (smp_load_acquire(&ser->state) == CPUPR_DEAD)
 			return 0;

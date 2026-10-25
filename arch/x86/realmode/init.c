@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/io.h>
+#include <linux/kexec_handover.h>
 #include <linux/slab.h>
 #include <linux/memblock.h>
 #include <linux/cc_platform.h>
@@ -207,8 +208,11 @@ static void __init set_real_mode_permissions(void)
 
 void __init init_real_mode(void)
 {
-	if (!real_mode_header)
+	if (!real_mode_header) {
+		if (kho_is_ro())
+			return;
 		panic("Real mode trampoline was not allocated");
+	}
 
 	setup_real_mode();
 	set_real_mode_permissions();
