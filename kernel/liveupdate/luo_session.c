@@ -360,8 +360,15 @@ static int luo_session_preserve_fd(struct luo_session *session,
 	struct liveupdate_session_preserve_fd *argp = ucmd->cmd;
 	int err;
 
-	err = luo_preserve_file(&session->file_set, argp->token, argp->fd,
-				argp->arg);
+	if (session->retrieved) {
+		if (!session->ro && !kho_is_ro())
+			return -EINVAL;
+		err = luo_preserve_file_ro(&session->file_set, argp->token,
+					   argp->fd, argp->arg);
+	} else {
+		err = luo_preserve_file(&session->file_set, argp->token,
+					argp->fd, argp->arg);
+	}
 	if (err)
 		return err;
 
@@ -529,6 +536,9 @@ static bool luo_ioctl_type_valid(struct luo_session *session,
 		/* Allow retrieval on incoming sessions and frozen outgoing sessions */
 		return session->retrieved || session->user_frozen;
 	case LUO_IOCTL_OUTGOING:
+		if (op->ioctl_num == LIVEUPDATE_SESSION_PRESERVE_FD &&
+		    session->retrieved && (session->ro || kho_is_ro()))
+			return true;
 		return !session->retrieved;
 	case LUO_IOCTL_ALL:
 		return true;

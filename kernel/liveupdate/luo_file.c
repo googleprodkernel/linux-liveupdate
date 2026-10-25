@@ -379,6 +379,53 @@ err_fput:
 	return err;
 }
 
+int luo_preserve_file_ro(struct luo_file_set *file_set, u64 token, int fd,
+			 u64 arg)
+{
+	struct luo_session *session =
+		container_of(file_set, struct luo_session, file_set);
+	struct liveupdate_file_op_args args = {0};
+	struct file *file __free(fput) = NULL;
+	struct luo_file *luo_file;
+	bool found = false;
+	int err;
+
+	file = fget(fd);
+	if (!file)
+		return -EBADF;
+
+	scoped_guard(mutex, &session->mutex) {
+		if (session->finished)
+			return -EINVAL;
+		list_for_each_entry(luo_file, &file_set->files_list, list) {
+			if (luo_file->token == token) {
+				found = true;
+				break;
+			}
+		}
+	}
+
+	if (!found)
+		return -ENOENT;
+
+	guard(mutex)(&luo_file->mutex);
+	if (!(luo_file->fh->flags & LIVEUPDATE_FH_RO_PRESERVE))
+		return -EOPNOTSUPP;
+	if (!luo_file->fh->ops->can_preserve(luo_file->fh, file))
+		return -EINVAL;
+
+	err = luo_copy_user_arg(arg, &args.arg, &luo_file->fh->ops->parg);
+	if (err)
+		return err;
+
+	args.handler = luo_file->fh;
+	args.file = file;
+	args.serialized_data = luo_file->serialized_data;
+	err = luo_file->fh->ops->preserve(&args);
+	kfree(args.arg);
+	return err;
+}
+
 /**
  * luo_file_unpreserve_files - Unpreserves all files from a file_set.
  * @file_set: The files to be cleaned up.

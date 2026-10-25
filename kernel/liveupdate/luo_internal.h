@@ -91,6 +91,8 @@ int luo_session_deserialize(void);
 
 int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd,
 		      u64 arg);
+int luo_preserve_file_ro(struct luo_file_set *file_set, u64 token, int fd,
+			 u64 arg);
 void luo_file_unpreserve_files(struct luo_file_set *file_set);
 int luo_file_freeze(struct luo_file_set *file_set);
 void luo_file_unfreeze(struct luo_file_set *file_set);
