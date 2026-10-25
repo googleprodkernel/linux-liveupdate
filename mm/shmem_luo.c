@@ -139,13 +139,334 @@
 #include <linux/kexec_handover.h>
 #include <linux/kho/abi/shmem.h>
 #include <linux/liveupdate.h>
+#include <linux/mm.h>
+#include <linux/mman.h>
+#include <linux/sched/mm.h>
 #include <linux/shmem_fs.h>
+#include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/memfd.h>
 #include <uapi/linux/magic.h>
 #include <uapi/linux/memfd.h>
 
+#include <linux/refcount.h>
 #include "internal.h"
+
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+struct shmem_luo_ro_extent {
+	pgoff_t index;
+	unsigned long pfn;
+	unsigned long nr_pages;
+};
+
+struct shmem_luo_ro_ctx {
+	struct shmem_luo_ro_extent *extents;
+	u64 nr_extents;
+	refcount_t refcount;
+	bool finished;
+	bool pat_tracked;
+};
+
+static const struct shmem_luo_ro_extent *
+shmem_luo_ro_find_extent(const struct shmem_luo_ro_ctx *ctx, pgoff_t pgoff)
+{
+	u64 lo = 0, hi;
+
+	if (!ctx || !ctx->nr_extents)
+		return NULL;
+
+	hi = ctx->nr_extents - 1;
+	while (lo <= hi) {
+		u64 mid = lo + ((hi - lo) >> 1);
+		const struct shmem_luo_ro_extent *ext = &ctx->extents[mid];
+
+		if (pgoff < ext->index) {
+			if (mid == 0)
+				break;
+			hi = mid - 1;
+		} else if (pgoff >= ext->index + ext->nr_pages) {
+			lo = mid + 1;
+		} else {
+			return ext;
+		}
+	}
+	return NULL;
+}
+
+static vm_fault_t shmem_luo_ro_fault(struct vm_fault *vmf)
+{
+	struct file *file = vmf->vma->vm_file;
+	struct shmem_luo_ro_ctx *ctx = file->private_data;
+	const struct shmem_luo_ro_extent *ext;
+	unsigned long pfn;
+
+	if (!ctx || READ_ONCE(ctx->finished))
+		return VM_FAULT_SIGBUS;
+
+	ext = shmem_luo_ro_find_extent(ctx, vmf->pgoff);
+	if (!ext)
+		return VM_FAULT_SIGBUS;
+
+	pfn = ext->pfn + (vmf->pgoff - ext->index);
+	return vmf_insert_pfn(vmf->vma, vmf->address, pfn);
+}
+
+static vm_fault_t shmem_luo_ro_huge_fault(struct vm_fault *vmf,
+					  unsigned int order)
+{
+	struct file *file = vmf->vma->vm_file;
+	struct shmem_luo_ro_ctx *ctx = file->private_data;
+	const struct shmem_luo_ro_extent *ext;
+	unsigned long nr = 1UL << order;
+	unsigned long hmask = ~(nr - 1);
+	pgoff_t hpgoff = vmf->pgoff & hmask;
+	unsigned long haddr = vmf->address & ~((PAGE_SIZE << order) - 1);
+	bool write = !!(vmf->vma->vm_flags & VM_WRITE);
+	unsigned long pfn;
+
+	if (!ctx || READ_ONCE(ctx->finished))
+		return VM_FAULT_SIGBUS;
+
+	if (order != PMD_ORDER && order != PUD_ORDER)
+		return VM_FAULT_FALLBACK;
+
+	if (haddr < vmf->vma->vm_start ||
+	    haddr + (PAGE_SIZE << order) > vmf->vma->vm_end)
+		return VM_FAULT_FALLBACK;
+
+	ext = shmem_luo_ro_find_extent(ctx, hpgoff);
+	if (!ext)
+		return VM_FAULT_FALLBACK;
+
+	if (hpgoff < ext->index ||
+	    hpgoff + nr > ext->index + ext->nr_pages)
+		return VM_FAULT_FALLBACK;
+
+	pfn = ext->pfn + (hpgoff - ext->index);
+	if (!IS_ALIGNED(pfn, nr))
+		return VM_FAULT_FALLBACK;
+
+	if (order == PUD_ORDER)
+		return vmf_insert_pfn_pud(vmf, pfn, write);
+	return vmf_insert_pfn_pmd(vmf, pfn, write);
+}
+
+static const struct vm_operations_struct shmem_luo_ro_vm_ops = {
+	.fault = shmem_luo_ro_fault,
+	.huge_fault = shmem_luo_ro_huge_fault,
+};
+
+static int shmem_luo_ro_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct shmem_luo_ro_ctx *ctx = file->private_data;
+
+	if (!ctx || READ_ONCE(ctx->finished))
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP | VM_HUGEPAGE);
+	vma->vm_ops = &shmem_luo_ro_vm_ops;
+	return 0;
+}
+
+static unsigned long shmem_luo_ro_get_unmapped_area(struct file *file,
+						    unsigned long addr,
+						    unsigned long len,
+						    unsigned long pgoff,
+						    unsigned long flags)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_unmapped_area_info info = {};
+	unsigned long align_size = 0;
+
+	if (flags & MAP_FIXED)
+		return addr;
+
+	if (len >= PUD_SIZE)
+		align_size = PUD_SIZE;
+	else if (len >= PMD_SIZE)
+		align_size = PMD_SIZE;
+
+	if (!align_size || addr)
+		return mm_get_unmapped_area(file, addr, len, pgoff, flags);
+
+	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+	info.length = len;
+	info.low_limit = FIRST_USER_ADDRESS;
+	info.high_limit = mm->mmap_base;
+	info.align_mask = align_size - 1;
+	info.align_offset = (pgoff << PAGE_SHIFT) & (align_size - 1);
+	addr = vm_unmapped_area(&info);
+	if (!offset_in_page(addr))
+		return addr;
+
+	return mm_get_unmapped_area(file, 0, len, pgoff, flags);
+}
+
+static long shmem_luo_ro_fallocate(struct file *file, int mode, loff_t offset,
+				   loff_t len)
+{
+	return -EPERM;
+}
+
+static int shmem_luo_ro_open(struct inode *inode, struct file *file)
+{
+	struct shmem_luo_ro_ctx *ctx = inode->i_private;
+
+	if (!ctx || READ_ONCE(ctx->finished))
+		return -EINVAL;
+	if (!refcount_inc_not_zero(&ctx->refcount))
+		return -EINVAL;
+	file->private_data = ctx;
+	return 0;
+}
+
+static int shmem_luo_ro_release(struct inode *inode, struct file *file)
+{
+	struct shmem_luo_ro_ctx *ctx = file->private_data;
+	u64 i;
+
+	if (ctx && refcount_dec_and_test(&ctx->refcount)) {
+		WRITE_ONCE(ctx->finished, true);
+		unmap_mapping_range(inode->i_mapping, 0, 0, 1);
+		inode->i_private = NULL;
+		if (ctx->pat_tracked) {
+			ctx->pat_tracked = false;
+			for (i = 0; i < ctx->nr_extents; i++) {
+				pfnmap_untrack(ctx->extents[i].pfn,
+					       ctx->extents[i].nr_pages << PAGE_SHIFT);
+			}
+		}
+		kvfree(ctx->extents);
+		kfree(ctx);
+	}
+	file->private_data = NULL;
+	return 0;
+}
+
+static int shmem_luo_ro_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+				struct iattr *attr)
+{
+	if (attr->ia_valid & ATTR_SIZE)
+		return -EPERM;
+	return simple_setattr(idmap, dentry, attr);
+}
+
+static struct file_operations shmem_luo_ro_fops;
+static struct inode_operations shmem_luo_ro_iops;
+static bool shmem_luo_ro_ops_initialized;
+
+static int shmem_luo_retrieve_ro(struct file *file,
+				 const struct shmem_luo_folio_ser *folios_ser,
+				 u64 nr_folios, u64 size)
+{
+	struct inode *inode = file_inode(file);
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct shmem_luo_ro_ctx *ctx;
+	struct shmem_luo_ro_extent *extents = NULL;
+	u64 nr_extents = 0;
+	u64 total_pages = DIV_ROUND_UP(size, PAGE_SIZE);
+	u64 i, j;
+	int err;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	if (nr_folios > 0) {
+		pgprot_t wb_prot = PAGE_KERNEL;
+
+		extents = kvmalloc_array(nr_folios, sizeof(*extents),
+					 GFP_KERNEL);
+		if (!extents) {
+			kfree(ctx);
+			return -ENOMEM;
+		}
+
+		for (i = 0; i < nr_folios; i++) {
+			const struct shmem_luo_folio_ser *pfolio = &folios_ser[i];
+			unsigned long nr_pages;
+			unsigned long pfn = pfolio->pfn;
+			pgoff_t index = pfolio->index;
+			int order;
+
+			if (!pfn)
+				continue;
+
+			order = kho_ro_lookup_folio_order(PFN_PHYS(pfn));
+
+			if (order >= 0) {
+				nr_pages = 1UL << order;
+			} else if (i + 1 < nr_folios) {
+				nr_pages = folios_ser[i + 1].index - index;
+			} else if (total_pages > index) {
+				nr_pages = total_pages - index;
+			} else {
+				nr_pages = 1;
+			}
+
+			if (nr_extents > 0 &&
+			    extents[nr_extents - 1].index + extents[nr_extents - 1].nr_pages == index &&
+			    extents[nr_extents - 1].pfn + extents[nr_extents - 1].nr_pages == pfn) {
+				extents[nr_extents - 1].nr_pages += nr_pages;
+			} else {
+				extents[nr_extents].index = index;
+				extents[nr_extents].pfn = pfn;
+				extents[nr_extents].nr_pages = nr_pages;
+				nr_extents++;
+			}
+		}
+
+		for (i = 0; i < nr_extents; i++) {
+			pgprot_t ext_prot = wb_prot;
+
+			err = pfnmap_track(extents[i].pfn,
+					   extents[i].nr_pages << PAGE_SHIFT,
+					   &ext_prot);
+			if (err) {
+				for (j = 0; j < i; j++) {
+					pfnmap_untrack(extents[j].pfn,
+						       extents[j].nr_pages << PAGE_SHIFT);
+				}
+				kvfree(extents);
+				kfree(ctx);
+				return err;
+			}
+		}
+		ctx->pat_tracked = true;
+	}
+
+	ctx->extents = extents;
+	ctx->nr_extents = nr_extents;
+	refcount_set(&ctx->refcount, 1);
+
+	if (!shmem_luo_ro_ops_initialized) {
+		shmem_luo_ro_fops = *file->f_op;
+		shmem_luo_ro_fops.open = shmem_luo_ro_open;
+		shmem_luo_ro_fops.mmap = shmem_luo_ro_mmap;
+		shmem_luo_ro_fops.mmap_prepare = NULL;
+		shmem_luo_ro_fops.get_unmapped_area = shmem_luo_ro_get_unmapped_area;
+		shmem_luo_ro_fops.fallocate = shmem_luo_ro_fallocate;
+		shmem_luo_ro_fops.release = shmem_luo_ro_release;
+
+		shmem_luo_ro_iops = *inode->i_op;
+		shmem_luo_ro_iops.setattr = shmem_luo_ro_setattr;
+		smp_wmb();
+		shmem_luo_ro_ops_initialized = true;
+	}
+
+	spin_lock_irq(&info->lock);
+	info->flags |= SHMEM_F_MAPPING_FROZEN;
+	info->seals |= F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW;
+	spin_unlock_irq(&info->lock);
+
+	inode->i_private = ctx;
+	inode->i_op = &shmem_luo_ro_iops;
+	inode->i_fop = &shmem_luo_ro_fops;
+	file->f_op = &shmem_luo_ro_fops;
+	file->private_data = ctx;
+	return 0;
+}
+#endif /* CONFIG_KEXEC_HANDOVER_READONLY */
 
 static int shmem_luo_preserve_folios(struct file *file,
 				     struct kho_vmalloc *kho_vmalloc,
@@ -713,12 +1034,77 @@ static struct file *shmem_luo_create_tmpfs_file(const struct liveupdate_shmem_re
 	return ro_file;
 }
 
+#ifdef CONFIG_KEXEC_HANDOVER_READONLY
+static int shmem_luo_retrieve_ro_cb(struct liveupdate_file_op_args *args)
+{
+	const struct shmem_luo_folio_ser *folios_ser = NULL;
+	const struct shmem_luo_ser *ser;
+	struct inode *inode;
+	struct file *file;
+	int err;
+
+	ser = kho_ro_map_folio(args->serialized_data, PAGE_KERNEL_RO);
+	if (!ser)
+		return -EINVAL;
+
+	args->retryable = true;
+
+	if ((ser->seals & ~SHMEM_LUO_ALL_SEALS) ||
+	    (ser->flags & ~SHMEM_LUO_ALL_FLAGS))
+		return -EOPNOTSUPP;
+
+	if (ser->flags & SHMEM_LUO_FLAG_TMPFS)
+		file = shmem_luo_create_tmpfs_file(args->arg, ser->seals);
+	else
+		file = shmem_luo_create_memfd(args->arg, ser->seals);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	inode = file_inode(file);
+	inode_lock(inode);
+
+	if (ser->nr_folios) {
+		folios_ser = kho_ro_map_vmalloc(&ser->folios);
+		if (!folios_ser) {
+			err = -EINVAL;
+			goto unlock_file;
+		}
+	}
+
+	err = shmem_luo_retrieve_ro(file, folios_ser, ser->nr_folios,
+				    ser->size);
+	if (err)
+		goto unlock_file;
+
+	vfs_setpos(file, ser->pos, MAX_LFS_FILESIZE);
+	i_size_write(inode, ser->size);
+	inode_unlock(inode);
+
+	args->file = file;
+
+	return 0;
+
+unlock_file:
+	inode_unlock(inode);
+	fput(file);
+	return err;
+}
+#else
+static int shmem_luo_retrieve_ro_cb(struct liveupdate_file_op_args *args)
+{
+	return -EOPNOTSUPP;
+}
+#endif /* CONFIG_KEXEC_HANDOVER_READONLY */
+
 static int shmem_luo_retrieve(struct liveupdate_file_op_args *args)
 {
 	struct shmem_luo_folio_ser *folios_ser;
 	struct shmem_luo_ser *ser;
 	struct file *file;
 	int err;
+
+	if (kho_is_ro())
+		return shmem_luo_retrieve_ro_cb(args);
 
 	ser = phys_to_virt(args->serialized_data);
 	if (!ser)
@@ -800,6 +1186,7 @@ static const struct liveupdate_file_ops shmem_luo_file_ops = {
 static struct liveupdate_file_handler shmem_luo_handler = {
 	.ops = &shmem_luo_file_ops,
 	.compatible = SHMEM_LUO_FH_COMPATIBLE,
+	.flags = LIVEUPDATE_FH_RO_RETRIEVE,
 };
 
 static int __init shmem_luo_init(void)

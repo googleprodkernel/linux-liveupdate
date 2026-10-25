@@ -1326,6 +1326,11 @@ static int shmem_getattr(struct mnt_idmap *idmap,
 	return 0;
 }
 
+static inline bool shmem_mapping_frozen(struct inode *inode)
+{
+	return SHMEM_I(inode)->flags & SHMEM_F_MAPPING_FROZEN;
+}
+
 static int shmem_setattr(struct mnt_idmap *idmap,
 			 struct dentry *dentry, struct iattr *attr)
 {
@@ -1355,7 +1360,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 			return -EPERM;
 
 		if (newsize != oldsize) {
-			if (info->flags & SHMEM_F_MAPPING_FROZEN)
+			if (shmem_mapping_frozen(inode))
 				return -EPERM;
 			error = shmem_reacct_size(SHMEM_I(inode)->flags,
 					oldsize, newsize);
@@ -3258,7 +3263,7 @@ shmem_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 			return -EPERM;
 	}
 
-	if (unlikely((info->flags & SHMEM_F_MAPPING_FROZEN) &&
+	if (unlikely(shmem_mapping_frozen(inode) &&
 		     pos + len > inode->i_size))
 		return -EPERM;
 
@@ -3636,7 +3641,7 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 
 	inode_lock(inode);
 
-	if (info->flags & SHMEM_F_MAPPING_FROZEN) {
+	if (shmem_mapping_frozen(inode)) {
 		error = -EPERM;
 		goto out;
 	}
