@@ -31,11 +31,20 @@ static int pci_pf_stub_probe(struct pci_dev *dev,
 	return 0;
 }
 
+/*
+ * pci-pf-stub has no state of its own: the PF only needs to stay enabled with
+ * its VFs, which the PCI core takes care of. So it supports Live Update without
+ * any callbacks, which lets the PCI core preserve the PF automatically when
+ * its VFs are preserved.
+ */
+static const struct pci_liveupdate_pf_ops pf_stub_liveupdate_ops = {};
+
 static struct pci_driver pf_stub_driver = {
 	.name			= "pci-pf-stub",
 	.id_table		= pci_pf_stub_whitelist,
 	.probe			= pci_pf_stub_probe,
 	.sriov_configure	= pci_sriov_configure_simple,
+	.liveupdate		= &pf_stub_liveupdate_ops,
 };
 module_pci_driver(pf_stub_driver);
 
