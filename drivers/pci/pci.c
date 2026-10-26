@@ -1024,15 +1024,6 @@ static void pci_std_enable_acs(struct pci_dev *dev, struct pci_acs *caps)
 }
 
 /*
- * Layout of the ACS save buffer. @ecv holds the ACS Egress Control Vector, if
- * implemented, and is sized by pci_allocate_acs_save_buffer().
- */
-struct pci_acs_saved_state {
-	u16 ctrl;
-	u32 ecv[];
-};
-
-/*
  * Return the number of DWORDs in the ACS Egress Control Vector, or 0 if the
  * device does not implement P2P Egress Control. The Egress Control Vector
  * Size is HwInit, so it is read directly from the ACS Capability register.
@@ -1054,20 +1045,9 @@ static unsigned int pci_acs_ecv_dwords(struct pci_dev *dev, int pos)
 	return DIV_ROUND_UP(bits, 32);
 }
 
-/*
- * Return the number of Egress Control Vector DWORDs held in @save_state, as
- * sized by pci_allocate_acs_save_buffer().
- */
-static unsigned int
-pci_acs_saved_ecv_dwords(struct pci_cap_saved_state *save_state)
+static void pci_acs_reserve_saved_caps(struct pci_dev *dev)
 {
-	return (save_state->cap.size -
-		offsetof(struct pci_acs_saved_state, ecv)) / sizeof(u32);
-}
-
-static void pci_allocate_acs_save_buffer(struct pci_dev *dev)
-{
-	size_t size;
+	unsigned int dwords;
 	int pos;
 
 	/* dev->acs_cap is not set yet, pci_acs_init() runs later */
@@ -1075,10 +1055,38 @@ static void pci_allocate_acs_save_buffer(struct pci_dev *dev)
 	if (!pos)
 		return;
 
-	size = struct_size_t(struct pci_acs_saved_state, ecv,
-			     pci_acs_ecv_dwords(dev, pos));
-	if (pci_add_ext_cap_save_buffer(dev, PCI_EXT_CAP_ID_ACS, size))
-		pci_err(dev, "unable to allocate suspend buffer for ACS\n");
+	if (pci_reserve_saved_cap(dev, pos + PCI_ACS_CTRL, sizeof(u16)))
+		goto err;
+
+	dwords = pci_acs_ecv_dwords(dev, pos);
+	if (dwords && pci_reserve_saved_cap(dev, pos + PCI_ACS_EGRESS_CTL_V,
+					    dwords * sizeof(u32)))
+		goto err;
+
+	return;
+
+err:
+	pci_err(dev, "unable to reserve ACS save state\n");
+}
+
+/*
+ * Return true if the saved capability store holds the ACS Control register
+ * and the Egress Control Vector, if implemented.
+ */
+static bool pci_acs_state_reserved(struct pci_dev *dev)
+{
+	unsigned int dwords;
+
+	if (!pci_saved_cap_reserved(dev, dev->acs_cap + PCI_ACS_CTRL))
+		return false;
+
+	dwords = pci_acs_ecv_dwords(dev, dev->acs_cap);
+	if (dwords && !pci_saved_cap_reserved(dev, dev->acs_cap +
+					      PCI_ACS_EGRESS_CTL_V +
+					      (dwords - 1) * sizeof(u32)))
+		return false;
+
+	return true;
 }
 
 /**
@@ -1090,27 +1098,18 @@ static void pci_allocate_acs_save_buffer(struct pci_dev *dev)
  */
 static void pci_save_acs_state(struct pci_dev *dev)
 {
-	struct pci_cap_saved_state *save_state;
-	struct pci_acs_saved_state *acs;
 	unsigned int i, dwords;
 	int ecv_pos;
 
 	if (!dev->acs_cap)
 		return;
 
-	save_state = pci_find_saved_ext_cap(dev, PCI_EXT_CAP_ID_ACS);
-	if (!save_state)
-		return;
-
-	acs = (struct pci_acs_saved_state *)save_state->cap.data;
-
-	pci_read_config_word(dev, dev->acs_cap + PCI_ACS_CTRL, &acs->ctrl);
+	pci_save_cap_word(dev, dev->acs_cap + PCI_ACS_CTRL);
 
 	ecv_pos = dev->acs_cap + PCI_ACS_EGRESS_CTL_V;
-	dwords = pci_acs_saved_ecv_dwords(save_state);
+	dwords = pci_acs_ecv_dwords(dev, dev->acs_cap);
 	for (i = 0; i < dwords; i++)
-		pci_read_config_dword(dev, ecv_pos + i * sizeof(u32),
-				      &acs->ecv[i]);
+		pci_save_cap_dword(dev, ecv_pos + i * sizeof(u32));
 }
 
 /**
@@ -1120,13 +1119,8 @@ static void pci_save_acs_state(struct pci_dev *dev)
  */
 static void pci_restore_acs_state(struct pci_dev *dev)
 {
-	struct pci_cap_saved_state *save_state = NULL;
-	struct pci_acs_saved_state *acs;
 	unsigned int i, dwords;
 	int ecv_pos;
-
-	if (dev->acs_cap && !pci_need_dev_specific_enable_acs(dev))
-		save_state = pci_find_saved_ext_cap(dev, PCI_EXT_CAP_ID_ACS);
 
 	/*
 	 * Devices that rely on device-specific quirks to enable an ACS
@@ -1135,12 +1129,11 @@ static void pci_restore_acs_state(struct pci_dev *dev)
 	 * ACS from scratch instead, which also covers devices that have no
 	 * saved ACS state at all.
 	 */
-	if (!save_state) {
+	if (!dev->acs_cap || pci_need_dev_specific_enable_acs(dev) ||
+	    !pci_acs_state_reserved(dev)) {
 		pci_enable_acs(dev);
 		return;
 	}
-
-	acs = (struct pci_acs_saved_state *)save_state->cap.data;
 
 	/*
 	 * Restore the Egress Control Vector before the ACS Control register.
@@ -1148,12 +1141,11 @@ static void pci_restore_acs_state(struct pci_dev *dev)
 	 * would briefly apply the reset vector instead of the saved one.
 	 */
 	ecv_pos = dev->acs_cap + PCI_ACS_EGRESS_CTL_V;
-	dwords = pci_acs_saved_ecv_dwords(save_state);
+	dwords = pci_acs_ecv_dwords(dev, dev->acs_cap);
 	for (i = 0; i < dwords; i++)
-		pci_write_config_dword(dev, ecv_pos + i * sizeof(u32),
-				       acs->ecv[i]);
+		pci_restore_cap_dword(dev, ecv_pos + i * sizeof(u32));
 
-	pci_write_config_word(dev, dev->acs_cap + PCI_ACS_CTRL, acs->ctrl);
+	pci_restore_cap_word(dev, dev->acs_cap + PCI_ACS_CTRL);
 }
 
 /**
@@ -3754,7 +3746,7 @@ void pci_reserve_saved_caps(struct pci_dev *dev)
 			pci_err(dev, "unable to reserve LTR save state\n");
 	}
 
-	pci_allocate_acs_save_buffer(dev);
+	pci_acs_reserve_saved_caps(dev);
 	pci_vc_reserve_saved_caps(dev);
 }
 
