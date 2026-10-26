@@ -5853,6 +5853,14 @@ static void quirk_nvidia_hda(struct pci_dev *gpu)
 	if (gpu->device < PCI_DEVICE_ID_NVIDIA_GEFORCE_320M)
 		return;
 
+	/*
+	 * Enabling the HDA controller changes the GPU into a multi-function
+	 * device, which would change what is behind a GPU preserved across
+	 * Live Update. Leave it as the previous kernel left it.
+	 */
+	if (pci_liveupdate_is_incoming(gpu))
+		return;
+
 	/* Bit 25 at offset 0x488 enables the HDA controller */
 	pci_read_config_dword(gpu, 0x488, &val);
 	if (val & BIT(25))
