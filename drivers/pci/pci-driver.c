@@ -524,6 +524,14 @@ static void pci_device_remove(struct device *dev)
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	struct pci_driver *drv = pci_dev->driver;
 
+	/*
+	 * Userspace can't unbind preserved devices (see pci_unbind_allowed()),
+	 * but drivers can still go away, e.g. when their module is unloaded.
+	 */
+	if (pci_liveupdate_is_preserved(pci_dev))
+		pci_warn(pci_dev, "Unbinding %s from device preserved across Live Update\n",
+			 drv->name);
+
 	if (drv->remove) {
 		pm_runtime_get_sync(dev);
 		/*
@@ -1752,6 +1760,22 @@ static const struct cpumask *pci_device_irq_get_affinity(struct device *dev,
 	return pci_irq_get_affinity(to_pci_dev(dev), irq_vec);
 }
 
+/*
+ * Refuse to let userspace unbind devices preserved across Live Update (outgoing
+ * or incoming), including the bridges above them, from their drivers, since
+ * that would disrupt them.
+ */
+static bool pci_unbind_allowed(struct device *dev)
+{
+	struct pci_dev *pci_dev = to_pci_dev(dev);
+
+	if (!pci_liveupdate_is_preserved(pci_dev))
+		return true;
+
+	pci_info(pci_dev, "Refusing to unbind device preserved across Live Update\n");
+	return false;
+}
+
 const struct bus_type pci_bus_type = {
 	.name		= "pci",
 	.driver_override = true,
@@ -1759,6 +1783,7 @@ const struct bus_type pci_bus_type = {
 	.uevent		= pci_uevent,
 	.probe		= pci_device_probe,
 	.remove		= pci_device_remove,
+	.unbind_allowed	= pci_unbind_allowed,
 	.shutdown	= pci_device_shutdown,
 	.irq_get_affinity = pci_device_irq_get_affinity,
 	.dev_groups	= pci_dev_groups,
