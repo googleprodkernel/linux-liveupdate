@@ -219,6 +219,38 @@ static void bind_device(const char *bdf)
 		fail_exit("%s bound to %s instead of " DRIVER, bdf, name);
 }
 
+/*
+ * Check that the kernel bound @bdf to pci-lu-test on its own, since the
+ * previous kernel passed the name of the driver the device was bound to.
+ */
+static int check_bound(const char *bdf)
+{
+	char path[LU_PATH_MAX], name[LU_PATH_MAX];
+
+	dev_path(path, bdf, "driver");
+	if (read_link_name(path, name, sizeof(name)) && !strcmp(name, DRIVER))
+		return 0;
+
+	ksft_print_msg("%s: not bound to " DRIVER " automatically\n", bdf);
+	return 1;
+}
+
+/* Check that driver_override of @bdf is cleared, i.e. reads "(null)". */
+static int check_no_override(const char *bdf)
+{
+	char path[LU_PATH_MAX], buf[64] = {};
+
+	dev_path(path, bdf, "driver_override");
+	if (read_file(path, buf, sizeof(buf) - 1) < 0)
+		fail_exit("Failed to read %s", path);
+
+	if (!strncmp(buf, "(null)", 6))
+		return 0;
+
+	ksft_print_msg("%s: driver_override is still set (%s)\n", bdf, buf);
+	return 1;
+}
+
 static bool is_selected(const char *bdf)
 {
 	int i;
@@ -764,8 +796,8 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 	for (i = 0; i < snap->nr_devices; i++) {
 		const char *bdf = snap->devices[i];
 
-		ksft_print_msg("[STAGE 2] Binding %s to " DRIVER "\n", bdf);
-		bind_device(bdf);
+		/* VFs show up when their PF adopts them, below. */
+		errors += check_bound(bdf);
 
 		node = find_node(snap, bdf);
 		if (node->numvfs > 0) {
@@ -803,6 +835,13 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 	if (luo_session_finish(state_session_fd) < 0)
 		fail_exit("luo_session_finish for state session");
 	close(state_session_fd);
+
+	/* The driver_override set for Live Update is gone once finished. */
+	for (i = 0; i < snap->nr_devices; i++)
+		errors += check_no_override(snap->devices[i]);
+
+	if (errors)
+		fail_exit("driver_override not cleared after finishing");
 
 	ksft_print_msg("\n--- PCI LIVE UPDATE TEST PASSED ---\n");
 }
