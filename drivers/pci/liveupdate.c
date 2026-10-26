@@ -351,7 +351,8 @@ struct pci_flb_incoming {
  */
 #define PCI_SER_OPTIONAL_FLAGS_SUPPORTED \
 	(PCI_SER_OPTIONAL_BAR_MASKS | PCI_SER_OPTIONAL_PROBED | \
-	 (IS_ENABLED(CONFIG_PCI_IOV) ? PCI_SER_OPTIONAL_SRIOV : 0))
+	 (IS_ENABLED(CONFIG_PCI_IOV) ? PCI_SER_OPTIONAL_SRIOV : 0) | \
+	 PCI_SER_OPTIONAL_DRIVER_NAME)
 
 #define PCI_DEV_SER_PROBED_WINDOWS		\
 	(PCI_DEV_SER_PROBED_IO_WINDOW |		\
@@ -374,6 +375,9 @@ static u32 pci_dev_ser_min_size(u64 optional_flags)
 
 	if (optional_flags & PCI_SER_OPTIONAL_SRIOV)
 		size = max(size, offsetofend(struct pci_dev_ser, vf_bar_sizes));
+
+	if (optional_flags & PCI_SER_OPTIONAL_DRIVER_NAME)
+		size = max(size, offsetofend(struct pci_dev_ser, driver_name));
 
 	return size;
 }
@@ -750,6 +754,25 @@ static void pci_liveupdate_save_sriov(struct pci_dev *dev,
 #endif
 }
 
+/*
+ * Save the name of the driver @dev is bound to, so that the next kernel binds
+ * @dev to the same driver.
+ */
+static void pci_liveupdate_save_driver_name(struct pci_dev *dev,
+					    struct pci_dev_ser *dev_ser)
+{
+	struct pci_driver *drv = READ_ONCE(dev->driver);
+
+	memset(dev_ser->driver_name, 0, sizeof(dev_ser->driver_name));
+	if (!drv)
+		return;
+
+	if (strscpy(dev_ser->driver_name, drv->name) < 0) {
+		pci_warn(dev, "Driver name %s is too long to preserve\n", drv->name);
+		memset(dev_ser->driver_name, 0, sizeof(dev_ser->driver_name));
+	}
+}
+
 static void pci_liveupdate_preserve_probed(struct pci_dev *dev,
 					   struct pci_dev_ser *dev_ser)
 {
@@ -1065,6 +1088,76 @@ void pci_liveupdate_setup_device(struct pci_dev *dev)
 	pci_liveupdate_flb_put_incoming();
 }
 
+/*
+ * Return the name of the driver that the incoming device @dev was bound to in
+ * the previous kernel, or NULL if it was not bound to a driver or the previous
+ * kernel did not pass it.
+ */
+static const char *pci_liveupdate_driver_name(struct pci_dev *dev)
+{
+	struct pci_dev_ser *dev_ser = dev->liveupdate.incoming;
+
+	lockdep_assert_held(&pci_liveupdate.rwsem);
+
+	if (!dev_ser ||
+	    !(pci_liveupdate.incoming_optional_flags & PCI_SER_OPTIONAL_DRIVER_NAME))
+		return NULL;
+
+	if (!dev_ser->driver_name[0] ||
+	    strnlen(dev_ser->driver_name, sizeof(dev_ser->driver_name)) ==
+	    sizeof(dev_ser->driver_name))
+		return NULL;
+
+	return dev_ser->driver_name;
+}
+
+/**
+ * pci_liveupdate_device_add() - Bind an incoming device to its driver
+ * @dev: The PCI device, after device_initialize() and before device_add()
+ *
+ * Make sure an incoming device is only bound to the driver it was bound to in
+ * the previous kernel, by setting its driver_override. Binding the device to
+ * any other driver would disrupt it. If that driver is not registered yet,
+ * e.g. because its module has not been loaded, the device simply stays unbound
+ * until it is. The override is cleared when the device finishes participating
+ * in the Live Update, unless userspace has changed it.
+ */
+void pci_liveupdate_device_add(struct pci_dev *dev)
+{
+	const char *name;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	name = pci_liveupdate_driver_name(dev);
+	if (!name)
+		return;
+
+	if (device_set_driver_override(&dev->dev, name)) {
+		pci_warn(dev, "Failed to set driver_override to %s\n", name);
+		return;
+	}
+
+	pci_info(dev, "Binding only to driver %s until Live Update finishes\n",
+		 name);
+}
+
+/* Clear the driver_override set by pci_liveupdate_device_add(). */
+static void pci_liveupdate_clear_driver_override(struct pci_dev *dev)
+{
+	const char *name = pci_liveupdate_driver_name(dev);
+	bool match;
+
+	if (!name)
+		return;
+
+	scoped_guard(spinlock, &dev->dev.driver_override.lock)
+		match = dev->dev.driver_override.name &&
+			!strcmp(dev->dev.driver_override.name, name);
+
+	if (match)
+		device_set_driver_override(&dev->dev, "");
+}
+
 void pci_liveupdate_cleanup_device(struct pci_dev *dev)
 {
 	/*
@@ -1095,6 +1188,7 @@ static void __pci_liveupdate_freeze(struct pci_dev *dev)
 	if (dev->liveupdate.outgoing) {
 		pci_liveupdate_save_bar_masks(dev, dev->liveupdate.outgoing);
 		pci_liveupdate_save_sriov(dev, dev->liveupdate.outgoing);
+		pci_liveupdate_save_driver_name(dev, dev->liveupdate.outgoing);
 	}
 }
 
@@ -1254,6 +1348,7 @@ static int pci_liveupdate_finish_device(struct pci_ser *ser, struct pci_dev *dev
 		return 0;
 
 	pci_info(dev, "Device is finished participating in Live Update\n");
+	pci_liveupdate_clear_driver_override(dev);
 	dev->liveupdate.incoming = NULL;
 	ser->nr_devices--;
 	return 0;

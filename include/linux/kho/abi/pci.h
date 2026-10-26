@@ -48,6 +48,9 @@
 
 #define PCI_LUO_FLB_COMPATIBLE "pci"
 
+/* The size of struct pci_dev_ser::driver_name, including the NUL. */
+#define PCI_DEV_SER_DRIVER_NAME_LEN 64
+
 /**
  * struct pci_dev_ser - Serialized state about a single PCI device.
  *
@@ -88,6 +91,11 @@
  *                unimplemented VF BARs, and for other devices. Used by the next
  *                kernel to reserve the same address ranges, which cannot be
  *                derived from the VF BAR masks if the VF BARs were resized.
+ * @driver_name: The name of the driver the device was bound to when its
+ *               preservation status was frozen, NUL-terminated, or an empty
+ *               string if it was not bound to a driver. Used by the next kernel
+ *               to bind the device to the same driver, since binding it to
+ *               another driver would disrupt it.
  *
  * Each field after @refcount is only present if the ``PCI_SER_OPTIONAL_*``
  * flag that covers it is set in ``pci_ser.optional_flags``.
@@ -103,6 +111,7 @@ struct pci_dev_ser {
 	u32 vf_bar_masks[PCI_SRIOV_NUM_BARS];
 	u8 max_vf_bus;
 	u64 vf_bar_sizes[PCI_SRIOV_NUM_BARS];
+	char driver_name[PCI_DEV_SER_DRIVER_NAME_LEN];
 } __packed;
 
 /*
@@ -158,9 +167,11 @@ struct pci_ser {
  *  * PCI_SER_OPTIONAL_BAR_MASKS: @bar_masks and @rom_mask
  *  * PCI_SER_OPTIONAL_PROBED: @probed_supported and @probed
  *  * PCI_SER_OPTIONAL_SRIOV: @vf_bar_masks, @max_vf_bus, and @vf_bar_sizes
+ *  * PCI_SER_OPTIONAL_DRIVER_NAME: @driver_name
  */
 #define PCI_SER_OPTIONAL_BAR_MASKS	BIT_ULL(0)
 #define PCI_SER_OPTIONAL_PROBED		BIT_ULL(1)
 #define PCI_SER_OPTIONAL_SRIOV		BIT_ULL(2)
+#define PCI_SER_OPTIONAL_DRIVER_NAME	BIT_ULL(3)
 
 #endif /* _LINUX_KHO_ABI_PCI_H */

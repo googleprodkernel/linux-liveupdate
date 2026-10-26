@@ -12,6 +12,7 @@
 
 #ifdef CONFIG_PCI_LIVEUPDATE
 void pci_liveupdate_setup_device(struct pci_dev *dev);
+void pci_liveupdate_device_add(struct pci_dev *dev);
 void pci_liveupdate_cleanup_device(struct pci_dev *dev);
 void pci_liveupdate_shutdown(struct pci_dev *dev);
 bool pci_liveupdate_preserve_bus_numbers(void);
@@ -29,6 +30,10 @@ int pci_liveupdate_read_sriov(struct pci_dev *dev, u32 *vf_bar_masks,
 			      u8 *max_vf_bus, u64 *vf_bar_sizes);
 #else
 static inline void pci_liveupdate_setup_device(struct pci_dev *dev)
+{
+}
+
+static inline void pci_liveupdate_device_add(struct pci_dev *dev)
 {
 }
 
