@@ -2506,6 +2506,20 @@ static void pci_configure_rcb(struct pci_dev *dev)
 
 static void pci_configure_device(struct pci_dev *dev)
 {
+	/*
+	 * Devices preserved across Live Update were configured by the previous
+	 * kernel and may be in use, e.g. performing DMA. Reconfiguring them
+	 * (e.g. their Max Payload Size or Relaxed Ordering) while in use can
+	 * corrupt or drop in-flight transactions, so keep their configuration
+	 * and only derive software state from it.
+	 */
+	if (pci_liveupdate_is_incoming(dev)) {
+		pci_configure_ltr(dev);
+		pci_configure_aspm_l1ss(dev);
+		pci_configure_eetlp_prefix(dev);
+		return;
+	}
+
 	pci_configure_mps(dev);
 	pci_configure_extended_tags(dev, NULL);
 	pci_configure_relaxed_ordering(dev);
@@ -3069,6 +3083,10 @@ static int pcie_bus_configure_set(struct pci_dev *dev, void *data)
 
 	if (pcie_bus_config == PCIE_BUS_TUNE_OFF ||
 	    pcie_bus_config == PCIE_BUS_DEFAULT)
+		return 0;
+
+	/* See pci_configure_device() */
+	if (pci_liveupdate_is_incoming(dev))
 		return 0;
 
 	mps = 128 << *(u8 *)data;

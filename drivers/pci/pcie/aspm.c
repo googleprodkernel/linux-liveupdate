@@ -1280,6 +1280,10 @@ void pci_configure_ltr(struct pci_dev *pdev)
 		return;
 	}
 
+	/* Leave LTR alone on devices preserved across Live Update. */
+	if (pci_liveupdate_is_incoming(pdev))
+		return;
+
 	if (!host->native_ltr)
 		return;
 
