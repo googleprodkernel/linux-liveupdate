@@ -4936,6 +4936,13 @@ void pci_reset_secondary_bus(struct pci_dev *dev)
 {
 	u16 ctrl;
 
+	/*
+	 * Bus and slot resets refuse preserved devices, but some callers
+	 * (e.g. error recovery) reset a bus regardless.
+	 */
+	if (pci_liveupdate_is_preserved(dev))
+		pci_warn(dev, "Secondary Bus Reset of bridge preserved across Live Update\n");
+
 	pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &ctrl);
 	ctrl |= PCI_BRIDGE_CTL_BUS_RESET;
 	pci_write_config_word(dev, PCI_BRIDGE_CONTROL, ctrl);
@@ -5317,6 +5324,21 @@ void pci_init_reset_methods(struct pci_dev *dev)
 	dev->reset_methods[i] = 0;
 }
 
+/*
+ * Resetting a device preserved across Live Update (or a bridge above one) would
+ * disrupt it, so the reset interfaces refuse. pci_liveupdate_is_preserved()
+ * covers outgoing and incoming devices. Low-level primitives like
+ * __pci_reset_function_locked() leave this to their callers.
+ */
+static bool pci_liveupdate_reset_refused(struct pci_dev *dev)
+{
+	if (!pci_liveupdate_is_preserved(dev))
+		return false;
+
+	pci_info(dev, "Refusing to reset device preserved across Live Update\n");
+	return true;
+}
+
 /**
  * pci_reset_function - quiesce and reset a PCI device function
  * @dev: PCI device to reset
@@ -5357,6 +5379,11 @@ int pci_reset_function(struct pci_dev *dev)
 	 */
 	if (pci_num_vf(dev) > 0) {
 		rc = -ENOTTY;
+		goto unlock;
+	}
+
+	if (pci_liveupdate_reset_refused(dev)) {
+		rc = -EBUSY;
 		goto unlock;
 	}
 
@@ -5406,6 +5433,9 @@ int pci_reset_function_locked(struct pci_dev *dev)
 	if (pci_num_vf(dev) > 0)
 		return -ENOTTY;
 
+	if (pci_liveupdate_reset_refused(dev))
+		return -EBUSY;
+
 	pci_dev_save_and_disable(dev);
 
 	rc = __pci_reset_function_locked(dev);
@@ -5437,6 +5467,11 @@ int pci_try_reset_function(struct pci_dev *dev)
 		return -ENOTTY;
 	}
 
+	if (pci_liveupdate_reset_refused(dev)) {
+		pci_dev_unlock(dev);
+		return -EBUSY;
+	}
+
 	pci_dev_save_and_disable(dev);
 	rc = __pci_reset_function_locked(dev);
 	pci_dev_restore(dev);
@@ -5457,6 +5492,7 @@ static bool pci_bus_resettable(struct pci_bus *bus)
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
 		if (dev->dev_flags & PCI_DEV_FLAGS_NO_BUS_RESET ||
+		    pci_liveupdate_reset_refused(dev) ||
 		    (dev->subordinate && !pci_bus_resettable(dev->subordinate)))
 			return false;
 	}
@@ -5568,6 +5604,7 @@ static bool pci_slot_resettable(struct pci_slot *slot)
 		if (!dev->slot || dev->slot != slot)
 			continue;
 		if (dev->dev_flags & PCI_DEV_FLAGS_NO_BUS_RESET ||
+		    pci_liveupdate_reset_refused(dev) ||
 		    (dev->subordinate && !pci_bus_resettable(dev->subordinate)))
 			return false;
 	}
