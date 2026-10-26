@@ -241,8 +241,12 @@ static ssize_t unbind_store(struct device_driver *drv, const char *buf,
 
 	dev = bus_find_device_by_name(bus, NULL, buf);
 	if (dev && dev->driver == drv) {
-		device_driver_detach(dev);
-		err = count;
+		if (bus->unbind_allowed && !bus->unbind_allowed(dev)) {
+			err = -EBUSY;
+		} else {
+			device_driver_detach(dev);
+			err = count;
+		}
 	}
 	put_device(dev);
 	bus_put(bus);

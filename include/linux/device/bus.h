@@ -49,6 +49,9 @@ struct fwnode_handle;
  *		consumers that are never bound to a driver, this function
  *		will never get called until they do.
  * @remove:	Called when a device removed from this bus.
+ * @unbind_allowed:	Called before unbinding a device from its driver via
+ *			the driver's "unbind" sysfs attribute. Return false to
+ *			refuse, e.g. because the device must keep running.
  * @shutdown:	Called at shut-down time to quiesce the device.
  * @irq_get_affinity:	Get IRQ affinity mask for the device on this bus.
  *
@@ -92,6 +95,7 @@ struct bus_type {
 	int (*probe)(struct device *dev);
 	void (*sync_state)(struct device *dev);
 	void (*remove)(struct device *dev);
+	bool (*unbind_allowed)(struct device *dev);
 	void (*shutdown)(struct device *dev);
 	const struct cpumask *(*irq_get_affinity)(struct device *dev,
 			unsigned int irq_vec);
