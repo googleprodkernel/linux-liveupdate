@@ -71,6 +71,7 @@ TARGETS += landlock
 TARGETS += lib
 TARGETS += livepatch
 TARGETS += liveupdate
+TARGETS += liveupdate/pci
 TARGETS += lkdtm
 TARGETS += lsm
 TARGETS += membarrier
