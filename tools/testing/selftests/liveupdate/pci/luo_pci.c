@@ -251,6 +251,60 @@ static int check_no_override(const char *bdf)
 	return 1;
 }
 
+/* Check that writing @val to @path fails with @expected_errno. */
+static int check_write_fails(const char *path, const char *val,
+			     int expected_errno)
+{
+	ssize_t ret;
+	int fd;
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		fail_exit("open(%s)", path);
+
+	ret = write(fd, val, strlen(val));
+	close(fd);
+
+	if (ret < 0 && errno == expected_errno)
+		return 0;
+
+	ksft_print_msg("Writing %s to %s returned %zd (errno %d), expected errno %d\n",
+		       val, path, ret, ret < 0 ? errno : 0, expected_errno);
+	return 1;
+}
+
+/*
+ * Check that the kernel refuses to unbind, remove or reset the preserved
+ * device @bdf via sysfs.
+ */
+static int check_guards(const char *bdf)
+{
+	char path[LU_PATH_MAX];
+	int errors = 0;
+
+	ksft_print_msg("Checking that %s can't be unbound, removed or reset\n", bdf);
+
+	dev_path(path, bdf, "driver/unbind");
+	errors += check_write_fails(path, bdf, EBUSY);
+
+	/* VFs can't be removed on their own, so have no remove attribute. */
+	dev_path(path, bdf, "remove");
+	if (!access(path, F_OK))
+		errors += check_write_fails(path, "1", EBUSY);
+
+	/*
+	 * Only devices that support reset have a reset attribute. PFs with
+	 * VFs enabled refuse function resets regardless (-ENOTTY).
+	 */
+	dev_path(path, bdf, "reset");
+	if (!access(path, F_OK))
+		errors += check_write_fails(path, "1",
+					    read_dev_int(bdf, "sriov_numvfs") > 0 ?
+					    ENOTTY : EBUSY);
+
+	return errors;
+}
+
 static bool is_selected(const char *bdf)
 {
 	int i;
@@ -743,6 +797,11 @@ static void run_stage_1(int luo_fd)
 			       devices[i], name);
 	}
 
+	for (i = 0; i < nr_devices; i++) {
+		if (check_guards(devices[i]))
+			fail_exit("Preserved device %s is not protected", devices[i]);
+	}
+
 	close(luo_fd);
 	daemonize_and_wait();
 }
@@ -814,6 +873,10 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 
 		ksft_print_msg("[STAGE 2] Retrieved %s\n", bdf);
 	}
+
+	/* VFs first, so that removing a PF doesn't take its VFs with it. */
+	for (i = snap->nr_devices - 1; i >= 0; i--)
+		errors += check_guards(snap->devices[i]);
 
 	/* And again after binding and retrieving. */
 	for (i = 0; i < snap->nr_nodes; i++) {
