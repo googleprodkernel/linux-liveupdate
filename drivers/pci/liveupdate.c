@@ -142,9 +142,19 @@
  * The VFs of a PF are controlled by the PF's SR-IOV capability, so a VF can
  * only be preserved if its PF is also preserved, and the PF's SR-IOV
  * configuration (e.g. NumVFs, VF Enable, and the VF BARs) must not change
- * across the Live Update. The PCI core does not preserve PFs automatically, and
- * leaves it up to drivers to manage the dependencies between the preserved
- * PF and its preserved VFs, with the following help from the PCI core:
+ * across the Live Update.
+ *
+ * If the PF's driver supports Live Update (it sets struct
+ * pci_driver::liveupdate, see struct pci_liveupdate_pf_ops), the PCI core
+ * preserves the PF automatically when the first of its VFs is preserved,
+ * freezes it when the first of its VFs is frozen, and unpreserves it when the
+ * last of its VFs is unpreserved. In the next kernel, it finishes the PF when
+ * the last of its VFs finishes. This is meant for in-kernel PF drivers, which
+ * have no file for userspace to preserve the PF through.
+ *
+ * Otherwise, the PF must be preserved explicitly, and drivers manage the
+ * dependencies between the preserved PF and its preserved VFs, with the
+ * following help from the PCI core:
  *
  *  * pci_liveupdate_preserve() refuses to preserve a VF unless its PF is
  *    preserved.
@@ -857,6 +867,102 @@ static int pci_liveupdate_preserve_device(struct pci_flb_outgoing *outgoing,
 	return 0;
 }
 
+static bool pci_liveupdate_is_auto_pf(struct pci_dev_ser *dev_ser)
+{
+	return dev_ser && (dev_ser->flags & PCI_DEV_SER_FLAG_AUTO_PF);
+}
+
+static void pci_liveupdate_unpreserve_pf(struct pci_flb_outgoing *outgoing,
+					 struct pci_dev *pf)
+{
+	pci_info(pf, "PF will no longer be preserved automatically\n");
+	pf->liveupdate.outgoing->flags &= ~PCI_DEV_SER_FLAG_AUTO_PF;
+	pf->liveupdate.outgoing->driver_data = 0;
+	pci_liveupdate_unpreserve_path(outgoing, pf, /*end=*/NULL);
+}
+
+/*
+ * Make sure the PF of the VF @vf stays preserved while @vf is preserved:
+ * either the PF was preserved explicitly (e.g. by userspace), or preserve it
+ * automatically if its driver supports Live Update (see struct
+ * pci_liveupdate_pf_ops). Automatically preserved PFs are reference counted by
+ * the number of their VFs that are preserved.
+ */
+static int pci_liveupdate_get_pf(struct pci_flb_outgoing *outgoing,
+				 struct pci_dev *vf)
+{
+	struct pci_dev *pf = vf->physfn;
+	const struct pci_liveupdate_pf_ops *ops;
+	struct pci_driver *drv;
+	struct pci_dev *dev;
+	u64 data = 0;
+	int ret = 0;
+
+	if (pf->liveupdate.outgoing) {
+		if (pci_liveupdate_is_auto_pf(pf->liveupdate.outgoing))
+			pf->liveupdate.nr_auto_vfs++;
+		return 0;
+	}
+
+	drv = READ_ONCE(pf->driver);
+	if (!drv || !drv->liveupdate) {
+		pci_warn(vf, "Cannot preserve VF unless its PF is preserved\n");
+		return -EINVAL;
+	}
+
+	if (pf->liveupdate.frozen) {
+		pci_warn(pf, "Cannot preserve PF after it is frozen!\n");
+		return -EINVAL;
+	}
+
+	dev = pf;
+	for_each_pci_dev_in_path(dev) {
+		ret = pci_liveupdate_preserve_device(outgoing, dev);
+		if (ret) {
+			pci_liveupdate_unpreserve_path(outgoing, pf, dev);
+			return ret;
+		}
+	}
+
+	ops = drv->liveupdate;
+	if (ops->preserve) {
+		ret = ops->preserve(pf, &data);
+		if (ret) {
+			pci_err(pf, "%s failed to preserve PF (%d)\n", drv->name, ret);
+			pci_liveupdate_unpreserve_path(outgoing, pf, /*end=*/NULL);
+			return ret;
+		}
+	}
+
+	pci_info(pf, "PF will be preserved automatically for its VFs\n");
+	pf->liveupdate.outgoing->driver_data = data;
+	pf->liveupdate.outgoing->flags |= PCI_DEV_SER_FLAG_AUTO_PF;
+	pf->liveupdate.nr_auto_vfs = 1;
+	return 0;
+}
+
+/* Undo pci_liveupdate_get_pf(). */
+static void pci_liveupdate_put_pf(struct pci_flb_outgoing *outgoing,
+				  struct pci_dev *vf)
+{
+	struct pci_dev *pf = vf->physfn;
+	struct pci_driver *drv;
+	u64 data;
+
+	if (!pci_liveupdate_is_auto_pf(pf->liveupdate.outgoing))
+		return;
+
+	if (--pf->liveupdate.nr_auto_vfs)
+		return;
+
+	data = pf->liveupdate.outgoing->driver_data;
+	drv = READ_ONCE(pf->driver);
+	if (drv && drv->liveupdate && drv->liveupdate->unpreserve)
+		drv->liveupdate->unpreserve(pf, data);
+
+	pci_liveupdate_unpreserve_pf(outgoing, pf);
+}
+
 /**
  * pci_liveupdate_preserve() - Preserve a PCI device across Live Update
  * @dev: The PCI device to preserve.
@@ -869,8 +975,11 @@ static int pci_liveupdate_preserve_device(struct pci_flb_outgoing *outgoing,
  * pci_liveupdate_preserve() automatically preserves all bridges upstream of
  * @dev.
  *
- * A VF can only be preserved if its PF is already preserved, since the PF's
- * SR-IOV configuration must not change across the Live Update.
+ * A VF can only be preserved if its PF is preserved too, since the PF's SR-IOV
+ * configuration must not change across the Live Update. If the PF is not
+ * preserved yet but its driver supports Live Update (see struct
+ * pci_liveupdate_pf_ops), the PF is preserved automatically, until the last of
+ * its VFs is unpreserved.
  *
  * Returns: 0 on success, <0 on failure.
  */
@@ -882,23 +991,27 @@ int pci_liveupdate_preserve(struct pci_dev *dev)
 
 	guard(rwsem_write)(&pci_liveupdate.rwsem);
 
-	if (dev->is_virtfn && !dev->physfn->liveupdate.outgoing) {
-		pci_warn(dev, "Cannot preserve VF unless its PF is preserved\n");
-		return -EINVAL;
-	}
-
 	outgoing = pci_liveupdate_flb_get_outgoing();
 	if (IS_ERR(outgoing))
 		return PTR_ERR(outgoing);
+
+	if (start->is_virtfn) {
+		ret = pci_liveupdate_get_pf(outgoing, start);
+		if (ret)
+			goto out;
+	}
 
 	for_each_pci_dev_in_path(dev) {
 		ret = pci_liveupdate_preserve_device(outgoing, dev);
 		if (ret) {
 			pci_liveupdate_unpreserve_path(outgoing, start, dev);
+			if (start->is_virtfn)
+				pci_liveupdate_put_pf(outgoing, start);
 			break;
 		}
 	}
 
+out:
 	pci_liveupdate_flb_put_outgoing();
 	return ret;
 }
@@ -930,6 +1043,8 @@ void pci_liveupdate_unpreserve(struct pci_dev *dev)
 	}
 
 	pci_liveupdate_unpreserve_path(outgoing, dev, /*end=*/NULL);
+	if (dev->is_virtfn)
+		pci_liveupdate_put_pf(outgoing, dev);
 	pci_liveupdate_flb_put_outgoing();
 }
 EXPORT_SYMBOL_GPL(pci_liveupdate_unpreserve);
@@ -1227,6 +1342,11 @@ int pci_liveupdate_freeze(struct pci_dev *dev)
 			return -EBUSY;
 		}
 
+		/* Nothing else freezes automatically preserved PFs. */
+		if (pci_liveupdate_is_auto_pf(pf->liveupdate.outgoing) &&
+		    !pf->liveupdate.frozen)
+			__pci_liveupdate_freeze(pf);
+
 		if (!pf->liveupdate.frozen) {
 			pci_err(dev, "Cannot freeze VF before its PF is frozen\n");
 			return -EBUSY;
@@ -1246,8 +1366,14 @@ EXPORT_SYMBOL_GPL(pci_liveupdate_freeze);
  */
 void pci_liveupdate_unfreeze(struct pci_dev *dev)
 {
+	struct pci_dev *pf = dev->is_virtfn ? dev->physfn : NULL;
+
 	guard(rwsem_write)(&pci_liveupdate.rwsem);
 	dev->liveupdate.frozen = false;
+
+	/* See pci_liveupdate_freeze(). */
+	if (pf && pci_liveupdate_is_auto_pf(pf->liveupdate.outgoing))
+		pf->liveupdate.frozen = false;
 }
 EXPORT_SYMBOL_GPL(pci_liveupdate_unfreeze);
 
@@ -1357,6 +1483,40 @@ static int pci_liveupdate_finish_device(struct pci_ser *ser, struct pci_dev *dev
 	return 0;
 }
 
+/*
+ * Finish an incoming PF that was preserved automatically (see
+ * pci_liveupdate_get_pf()) once the last of its VFs finishes.
+ */
+static void pci_liveupdate_finish_pf(struct pci_flb_incoming *incoming,
+				     struct pci_dev *pf)
+{
+	struct pci_dev_ser *dev_ser = pf->liveupdate.incoming;
+	struct pci_driver *drv;
+	struct pci_dev *dev;
+
+	if (!(pci_liveupdate.incoming_optional_flags & PCI_SER_OPTIONAL_PF) ||
+	    !pci_liveupdate_is_auto_pf(dev_ser))
+		return;
+
+	if (pci_liveupdate_has_incoming_vfs(incoming, pf))
+		return;
+
+	drv = READ_ONCE(pf->driver);
+	if (drv && drv->liveupdate) {
+		if (drv->liveupdate->finish)
+			drv->liveupdate->finish(pf, dev_ser->driver_data);
+	} else {
+		pci_warn(pf, "PF driver %s did not take over the preserved PF\n",
+			 drv ? drv->name : "(none)");
+	}
+
+	dev = pf;
+	for_each_pci_dev_in_path(dev) {
+		if (pci_liveupdate_finish_device(incoming->ser, dev))
+			break;
+	}
+}
+
 /**
  * pci_liveupdate_finish() - Finish the preservation of a PCI device
  * @dev: The PCI device
@@ -1367,10 +1527,13 @@ static int pci_liveupdate_finish_device(struct pci_ser *ser, struct pci_dev *dev
  * liveupdate_file_handler finish() callback to ensure the incoming struct
  * pci_ser is allocated.
  *
- * pci_liveupdate_finish() automatically finishes all bridges upstream of @dev.
+ * pci_liveupdate_finish() automatically finishes all bridges upstream of @dev,
+ * and, once the last of the VFs of a PF that was preserved automatically
+ * finishes, the PF.
  */
 void pci_liveupdate_finish(struct pci_dev *dev)
 {
+	struct pci_dev *vf_finished = dev;
 	struct pci_flb_incoming *incoming;
 
 	guard(rwsem_write)(&pci_liveupdate.rwsem);
@@ -1385,6 +1548,9 @@ void pci_liveupdate_finish(struct pci_dev *dev)
 		if (pci_liveupdate_finish_device(incoming->ser, dev))
 			break;
 	}
+
+	if (vf_finished->is_virtfn)
+		pci_liveupdate_finish_pf(incoming, vf_finished->physfn);
 
 	pci_liveupdate_flb_put_incoming();
 }
