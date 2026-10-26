@@ -20,15 +20,53 @@
 void pci_ats_init(struct pci_dev *dev)
 {
 	int pos;
-
-	if (pci_ats_disabled())
-		return;
+	u16 ctrl;
 
 	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ATS);
 	if (!pos)
 		return;
 
+	if (pci_ats_disabled()) {
+		/*
+		 * A device preserved across Live Update with ATS enabled may
+		 * hold translations in its ATC, which this kernel would never
+		 * invalidate if it doesn't use ATS.
+		 */
+		if (pci_liveupdate_is_incoming(dev)) {
+			pci_read_config_word(dev, pos + PCI_ATS_CTRL, &ctrl);
+			if (ctrl & PCI_ATS_CTRL_ENABLE)
+				panic("%s: ATS is disabled but the preserved device has ATS enabled\n",
+				      pci_name(dev));
+		}
+		return;
+	}
+
 	dev->ats_cap = pos;
+}
+
+/*
+ * Adopt the Smallest Translation Unit (STU) of a device preserved across Live
+ * Update instead of programming it, since changing the STU of a device in use
+ * would corrupt its ATC. VFs use their PF's STU.
+ */
+static void pci_liveupdate_adopt_ats_stu(struct pci_dev *dev, int ps, u16 ctrl)
+{
+	int stu;
+
+	if (dev->is_virtfn) {
+		stu = pci_physfn(dev)->ats_stu;
+	} else {
+		stu = PCI_ATS_CTRL_STU(ctrl) + PCI_ATS_MIN_STU;
+		dev->ats_stu = stu;
+	}
+
+	/*
+	 * A mismatch between the STU the device uses and the IOMMU page shift
+	 * could lead to memory corruption.
+	 */
+	if (stu != ps)
+		panic("%s: ATS STU of preserved device (%d) does not match IOMMU page shift (%d)\n",
+		      pci_name(dev), stu, ps);
 }
 
 /**
@@ -80,6 +118,12 @@ int pci_prepare_ats(struct pci_dev *dev, int ps)
 		return 0;
 	}
 
+	if (pci_liveupdate_is_incoming(dev)) {
+		pci_read_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, &ctrl);
+		pci_liveupdate_adopt_ats_stu(dev, ps, ctrl);
+		return 0;
+	}
+
 	dev->ats_stu = ps;
 	ctrl = PCI_ATS_CTRL_STU(dev->ats_stu - PCI_ATS_MIN_STU);
 	pci_write_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, ctrl);
@@ -107,6 +151,26 @@ int pci_enable_ats(struct pci_dev *dev, int ps)
 
 	if (ps < PCI_ATS_MIN_STU)
 		return -EINVAL;
+
+	/*
+	 * Toggling ATS on a device in use is not safe: the endpoint and the
+	 * IOMMU must agree on whether ATS is in use, and disabling ATS
+	 * without first quiescing DMA can leave stale translations in the
+	 * ATC. So adopt the ATS Enable state of devices preserved across Live
+	 * Update instead of writing it, and refuse to enable ATS on them if
+	 * the previous kernel didn't.
+	 */
+	if (pci_liveupdate_is_incoming(dev)) {
+		pci_read_config_word(dev, dev->ats_cap + PCI_ATS_CTRL, &ctrl);
+		if (!(ctrl & PCI_ATS_CTRL_ENABLE)) {
+			pci_warn(dev, "Refusing to enable ATS on preserved device\n");
+			return -EBUSY;
+		}
+
+		pci_liveupdate_adopt_ats_stu(dev, ps, ctrl);
+		dev->ats_enabled = 1;
+		return 0;
+	}
 
 	/*
 	 * Note that enabling ATS on a VF fails unless it's already enabled
