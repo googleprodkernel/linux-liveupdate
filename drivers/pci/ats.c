@@ -501,6 +501,37 @@ void pci_pasid_init(struct pci_dev *pdev)
 	pdev->pasid_cap = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PASID);
 }
 
+/*
+ * Adopt the PASID configuration of a device preserved across Live Update
+ * instead of programming it, since changing it while the device is in use can
+ * change the permissions of in-flight transactions. This includes PFs that
+ * aren't in use themselves, since their VFs share the PF's PASID
+ * configuration.
+ */
+static int pci_liveupdate_enable_pasid(struct pci_dev *pdev, int features)
+{
+	u16 control;
+
+	pci_read_config_word(pdev, pdev->pasid_cap + PCI_PASID_CTRL, &control);
+	if (!(control & PCI_PASID_CTRL_ENABLE)) {
+		pci_warn(pdev, "Refusing to enable PASID on preserved device\n");
+		return -EBUSY;
+	}
+
+	pdev->pasid_features = control & (PCI_PASID_CTRL_EXEC | PCI_PASID_CTRL_PRIV);
+
+	/*
+	 * A mismatch between the features the device uses and the features
+	 * the IOMMU driver expects could lead to memory corruption.
+	 */
+	if (pdev->pasid_features != features)
+		panic("%s: PASID features of preserved device (%#x) do not match requested features (%#x)\n",
+		      pci_name(pdev), pdev->pasid_features, features);
+
+	pdev->pasid_enabled = 1;
+	return 0;
+}
+
 /**
  * pci_enable_pasid - Enable the PASID capability
  * @pdev: PCI device structure
@@ -543,6 +574,9 @@ int pci_enable_pasid(struct pci_dev *pdev, int features)
 	/* User wants to enable anything unsupported? */
 	if ((supported & features) != features)
 		return -EINVAL;
+
+	if (pci_liveupdate_is_incoming(pdev))
+		return pci_liveupdate_enable_pasid(pdev, features);
 
 	control = PCI_PASID_CTRL_ENABLE | features;
 	pdev->pasid_features = features;
