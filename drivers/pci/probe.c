@@ -1476,11 +1476,15 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 
 	/*
 	 * Disable Master-Abort Mode during probing to avoid reporting of
-	 * bus errors in some architectures.
+	 * bus errors in some architectures. Leave it alone on bridges
+	 * preserved across Live Update, since devices below them may be in
+	 * use and changing how the bridge handles errors under them is not
+	 * safe.
 	 */
 	pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &bctl);
-	pci_write_config_word(dev, PCI_BRIDGE_CONTROL,
-			      bctl & ~PCI_BRIDGE_CTL_MASTER_ABORT);
+	if (!pci_liveupdate_is_incoming(dev))
+		pci_write_config_word(dev, PCI_BRIDGE_CONTROL,
+				      bctl & ~PCI_BRIDGE_CTL_MASTER_ABORT);
 
 	if (pci_is_cardbus_bridge(dev)) {
 		max = pci_cardbus_scan_bridge_extend(bus, dev, buses, max,
