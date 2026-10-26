@@ -106,4 +106,15 @@ static inline int pci_liveupdate_read_sriov(struct pci_dev *dev,
 }
 #endif
 
+#ifdef CONFIG_PCI_LIVEUPDATE_DEBUG
+void pci_liveupdate_check_config_write(const struct pci_dev *dev, int where,
+				       int size, u32 val, bool locked);
+#else
+static inline void pci_liveupdate_check_config_write(const struct pci_dev *dev,
+						     int where, int size,
+						     u32 val, bool locked)
+{
+}
+#endif
+
 #endif /* DRIVERS_PCI_LIVEUPDATE_H */

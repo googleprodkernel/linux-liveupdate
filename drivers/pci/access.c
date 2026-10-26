@@ -5,6 +5,7 @@
 #include <linux/ioport.h>
 #include <linux/wait.h>
 
+#include "liveupdate.h"
 #include "pci.h"
 
 /*
@@ -262,6 +263,8 @@ int pci_user_write_config_##size					\
 	raw_spin_lock_irq(&pci_lock);					\
 	if (unlikely(dev->block_cfg_access))				\
 		pci_wait_cfg(dev);					\
+	pci_liveupdate_check_config_write(dev, pos, sizeof(type), val,	\
+					  true);			\
 	ret = dev->bus->ops->write(dev->bus, dev->devfn,		\
 				   pos, sizeof(type), val);		\
 	raw_spin_unlock_irq(&pci_lock);					\
@@ -592,6 +595,7 @@ int pci_write_config_byte(const struct pci_dev *dev, int where, u8 val)
 {
 	if (pci_dev_is_disconnected(dev))
 		return PCIBIOS_DEVICE_NOT_FOUND;
+	pci_liveupdate_check_config_write(dev, where, 1, val, false);
 	return pci_bus_write_config_byte(dev->bus, dev->devfn, where, val);
 }
 EXPORT_SYMBOL(pci_write_config_byte);
@@ -600,6 +604,7 @@ int pci_write_config_word(const struct pci_dev *dev, int where, u16 val)
 {
 	if (pci_dev_is_disconnected(dev))
 		return PCIBIOS_DEVICE_NOT_FOUND;
+	pci_liveupdate_check_config_write(dev, where, 2, val, false);
 	return pci_bus_write_config_word(dev->bus, dev->devfn, where, val);
 }
 EXPORT_SYMBOL(pci_write_config_word);
@@ -609,6 +614,7 @@ int pci_write_config_dword(const struct pci_dev *dev, int where,
 {
 	if (pci_dev_is_disconnected(dev))
 		return PCIBIOS_DEVICE_NOT_FOUND;
+	pci_liveupdate_check_config_write(dev, where, 4, val, false);
 	return pci_bus_write_config_dword(dev->bus, dev->devfn, where, val);
 }
 EXPORT_SYMBOL(pci_write_config_dword);

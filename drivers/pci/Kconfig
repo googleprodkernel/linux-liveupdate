@@ -284,6 +284,18 @@ config PCI_LIVEUPDATE
 	  Update for kernel upgrades and require preserving PCI devices during
 	  those upgrades.
 
+config PCI_LIVEUPDATE_DEBUG
+	bool "PCI Live Update debug checks"
+	depends on PCI_LIVEUPDATE && DEBUG_KERNEL
+	help
+	  Warn about configuration space writes that disrupt devices
+	  preserved across Live Update, such as disabling Bus Mastering,
+	  resetting the device or moving its BARs, whether they are issued
+	  by the kernel or by userspace.
+
+	  This checks every configuration space write, so it is only meant
+	  for debugging. If unsure, say N.
+
 	  If unsure, say N.
 
 source "drivers/pci/hotplug/Kconfig"

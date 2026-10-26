@@ -18,6 +18,7 @@ obj-$(CONFIG_SYSFS)		+= pci-sysfs.o slot.o
 obj-$(CONFIG_ACPI)		+= pci-acpi.o
 obj-$(CONFIG_GENERIC_PCI_IOMAP) += iomap.o
 obj-$(CONFIG_PCI_LIVEUPDATE)	+= liveupdate.o
+obj-$(CONFIG_PCI_LIVEUPDATE_DEBUG) += liveupdate-debug.o
 endif
 
 obj-$(CONFIG_OF)		+= of.o
