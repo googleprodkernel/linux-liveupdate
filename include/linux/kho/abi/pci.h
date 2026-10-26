@@ -96,6 +96,11 @@
  *               string if it was not bound to a driver. Used by the next kernel
  *               to bind the device to the same driver, since binding it to
  *               another driver would disrupt it.
+ * @driver_data: For a PF preserved automatically because its driver supports
+ *               Live Update (see struct pci_liveupdate_pf_ops), an opaque
+ *               value owned by that driver, e.g. the physical address of state
+ *               the driver preserved with KHO. 0 for other devices.
+ * @flags: ``PCI_DEV_SER_FLAG_*`` bits.
  *
  * Each field after @refcount is only present if the ``PCI_SER_OPTIONAL_*``
  * flag that covers it is set in ``pci_ser.optional_flags``.
@@ -112,7 +117,18 @@ struct pci_dev_ser {
 	u8 max_vf_bus;
 	u64 vf_bar_sizes[PCI_SRIOV_NUM_BARS];
 	char driver_name[PCI_DEV_SER_DRIVER_NAME_LEN];
+	u64 driver_data;
+	u32 flags;
 } __packed;
+
+/*
+ * Bits in struct pci_dev_ser::flags:
+ *  * PCI_DEV_SER_FLAG_AUTO_PF: The device is a PF that was preserved
+ *    automatically because some of its VFs were preserved and its driver
+ *    supports Live Update. The next kernel finishes it once all of its VFs are
+ *    finished.
+ */
+#define PCI_DEV_SER_FLAG_AUTO_PF	BIT(0)
 
 /*
  * Bits in struct pci_dev_ser::probed_supported and probed:
@@ -168,10 +184,12 @@ struct pci_ser {
  *  * PCI_SER_OPTIONAL_PROBED: @probed_supported and @probed
  *  * PCI_SER_OPTIONAL_SRIOV: @vf_bar_masks, @max_vf_bus, and @vf_bar_sizes
  *  * PCI_SER_OPTIONAL_DRIVER_NAME: @driver_name
+ *  * PCI_SER_OPTIONAL_PF: @driver_data and @flags
  */
 #define PCI_SER_OPTIONAL_BAR_MASKS	BIT_ULL(0)
 #define PCI_SER_OPTIONAL_PROBED		BIT_ULL(1)
 #define PCI_SER_OPTIONAL_SRIOV		BIT_ULL(2)
 #define PCI_SER_OPTIONAL_DRIVER_NAME	BIT_ULL(3)
+#define PCI_SER_OPTIONAL_PF		BIT_ULL(4)
 
 #endif /* _LINUX_KHO_ABI_PCI_H */

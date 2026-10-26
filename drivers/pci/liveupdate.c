@@ -352,7 +352,7 @@ struct pci_flb_incoming {
 #define PCI_SER_OPTIONAL_FLAGS_SUPPORTED \
 	(PCI_SER_OPTIONAL_BAR_MASKS | PCI_SER_OPTIONAL_PROBED | \
 	 (IS_ENABLED(CONFIG_PCI_IOV) ? PCI_SER_OPTIONAL_SRIOV : 0) | \
-	 PCI_SER_OPTIONAL_DRIVER_NAME)
+	 PCI_SER_OPTIONAL_DRIVER_NAME | PCI_SER_OPTIONAL_PF)
 
 #define PCI_DEV_SER_PROBED_WINDOWS		\
 	(PCI_DEV_SER_PROBED_IO_WINDOW |		\
@@ -378,6 +378,9 @@ static u32 pci_dev_ser_min_size(u64 optional_flags)
 
 	if (optional_flags & PCI_SER_OPTIONAL_DRIVER_NAME)
 		size = max(size, offsetofend(struct pci_dev_ser, driver_name));
+
+	if (optional_flags & PCI_SER_OPTIONAL_PF)
+		size = max(size, offsetofend(struct pci_dev_ser, flags));
 
 	return size;
 }
@@ -1761,6 +1764,36 @@ void pci_liveupdate_claim_bus_resources(struct pci_bus *bus)
  *
  * Return: True if @dev is outgoing-preserved or incoming-preserved.
  */
+/**
+ * pci_liveupdate_get_driver_data() - Get the data a PF driver preserved
+ * @dev: The incoming PF
+ * @data: Where to store the data
+ *
+ * Get the value the PF's driver returned from its struct pci_liveupdate_pf_ops
+ * preserve() callback in the previous kernel, e.g. from the driver's probe().
+ *
+ * Return: 0 on success, -EINVAL if @dev is not an incoming PF that was
+ * preserved automatically, or -EOPNOTSUPP if the previous kernel did not pass
+ * driver data.
+ */
+int pci_liveupdate_get_driver_data(struct pci_dev *dev, u64 *data)
+{
+	struct pci_dev_ser *dev_ser;
+
+	guard(rwsem_read)(&pci_liveupdate.rwsem);
+
+	if (!(pci_liveupdate.incoming_optional_flags & PCI_SER_OPTIONAL_PF))
+		return -EOPNOTSUPP;
+
+	dev_ser = dev->liveupdate.incoming;
+	if (!dev_ser || !(dev_ser->flags & PCI_DEV_SER_FLAG_AUTO_PF))
+		return -EINVAL;
+
+	*data = dev_ser->driver_data;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pci_liveupdate_get_driver_data);
+
 bool pci_liveupdate_is_preserved(struct pci_dev *dev)
 {
 	guard(rwsem_read)(&pci_liveupdate.rwsem);
