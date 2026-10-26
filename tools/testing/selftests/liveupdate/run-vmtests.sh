@@ -20,6 +20,7 @@ TEST_NAMES=(
 	"luo_multi_session"
 	"luo_stress_files"
 	"luo_stress_sessions"
+	"pci/luo_pci"
 )
 
 function usage() {
@@ -70,7 +71,7 @@ function main() {
 
 	for arch in "${TARGETS[@]}"; do
 		for test_name in "${TEST_NAMES[@]}"; do
-			log="$output_dir/${arch}_${test_name}.log"
+			log="$output_dir/${arch}_${test_name//\//_}.log"
 
 			printf "  -> %-8s %-24s ... " "$arch" "$test_name"
 

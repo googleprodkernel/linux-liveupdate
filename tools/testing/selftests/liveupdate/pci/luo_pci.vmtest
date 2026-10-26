@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# vmtest.sh settings for pci/luo_pci, sourced by vmtest.sh.
+#
+# Topology (luo_pci preserves the endpoints, see default_ids[] in luo_pci.c):
+#   pci-testdev on the root bus
+#   root port -> igb (SR-IOV PF, luo_pci enables and preserves 2 VFs)
+#   root port -> switch upstream port -> switch downstream port -> e1000e
+
+VMTEST_CONFIG="pci/config"
+VMTEST_MODULES="pci/test_modules"
+VMTEST_TIMEOUT="60s"
+
+VMTEST_QEMU_ARGS=""
+if [[ "$arch" == "x86" ]]; then
+	# PCIe (root ports, switches, SR-IOV) needs Q35 rather than i440FX.
+	VMTEST_QEMU_ARGS="-M q35"
+fi
+
+VMTEST_QEMU_ARGS+=" -device pci-testdev"
+VMTEST_QEMU_ARGS+=" -device pcie-root-port,id=rp0,chassis=1,slot=1"
+VMTEST_QEMU_ARGS+=" -device igb,bus=rp0"
+VMTEST_QEMU_ARGS+=" -device pcie-root-port,id=rp1,chassis=2,slot=2"
+VMTEST_QEMU_ARGS+=" -device x3130-upstream,id=sw0,bus=rp1"
+VMTEST_QEMU_ARGS+=" -device xio3130-downstream,id=sw0p0,bus=sw0,chassis=3,slot=3"
+VMTEST_QEMU_ARGS+=" -device e1000e,bus=sw0p0"

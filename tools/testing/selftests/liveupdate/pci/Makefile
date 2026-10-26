@@ -3,6 +3,8 @@
 TEST_GEN_PROGS_EXTENDED += luo_pci
 TEST_GEN_MODS_DIR := test_modules
 
+TEST_FILES += luo_pci.vmtest
+
 include ../../lib.mk
 include ../lib/libliveupdate.mk
 

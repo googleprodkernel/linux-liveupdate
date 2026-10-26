@@ -4,6 +4,7 @@
  * Copyright (c) 2025, Google LLC.
  * Pasha Tatashin <pasha.tatashin@soleen.com>
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/kexec.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 #define KERNEL_IMAGE "/kernel"
 #define INITRD_IMAGE "/initrd.img"
 #define TEST_BINARY "/test_binary"
+#define MODULES_DIR "/modules"
 
 static int mount_filesystems(void)
 {
@@ -37,7 +39,49 @@ static int mount_filesystems(void)
 		return -1;
 	}
 
+	if (mount("sysfs", "/sys", "sysfs", 0, NULL) < 0) {
+		fprintf(stderr, "INIT: Failed to mount sysfs\n");
+		return -1;
+	}
+
 	return 0;
+}
+
+/* Load the test modules, if any, in MODULES_DIR. */
+static int load_modules(void)
+{
+	struct dirent entry, *result;
+	char path[256];
+	int fd, err = 0;
+	DIR *dir;
+
+	dir = opendir(MODULES_DIR);
+	if (!dir)
+		return 0;
+
+	while (!err && !readdir_r(dir, &entry, &result) && result) {
+		if (entry.d_name[0] == '.')
+			continue;
+
+		snprintf(path, sizeof(path), MODULES_DIR "/%s", entry.d_name);
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			fprintf(stderr, "INIT: Failed to open %s\n", path);
+			err = -1;
+			break;
+		}
+
+		err = syscall(__NR_finit_module, fd, "", 0);
+		if (err)
+			fprintf(stderr, "INIT: Failed to load %s\n", path);
+		else
+			printf("INIT: Loaded %s\n", path);
+
+		close(fd);
+	}
+
+	closedir(dir);
+	return err;
 }
 
 static long kexec_file_load(int kernel_fd, int initrd_fd,
@@ -156,6 +200,9 @@ int main(int argc, char *argv[])
 	}
 
 	printf("INIT: Starting Stage %d\n", current_stage);
+
+	if (load_modules())
+		goto err_reboot;
 
 	if (current_stage == 1 && kexec_load()) {
 		fprintf(stderr, "INIT: Failed to load kexec kernel\n");

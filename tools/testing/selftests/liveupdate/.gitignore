@@ -5,6 +5,7 @@
 !*.h
 !*.mk
 !*.sh
+!*.vmtest
 !.gitignore
 !config
 !config.*

@@ -13,6 +13,17 @@ headers_dir=""
 initrd=""
 KEEP_WORKSPACE=0
 
+# Optional per-test settings, set by $test_dir/<test_name>.vmtest if present:
+#   VMTEST_CONFIG:    extra kernel config fragment (relative to $test_dir)
+#   VMTEST_MODULES:   directories of test modules (relative to $test_dir) to
+#                     build against the test kernel and load before the test
+#   VMTEST_QEMU_ARGS: extra QEMU arguments, may depend on $arch
+#   VMTEST_TIMEOUT:   QEMU timeout (default: 30s)
+VMTEST_CONFIG=""
+VMTEST_MODULES=""
+VMTEST_QEMU_ARGS=""
+VMTEST_TIMEOUT="30s"
+
 source "$test_dir/../kselftest/ktap_helpers.sh"
 
 function get_arch_conf() {
@@ -38,7 +49,7 @@ Options:
 	-d)	path to the kernel build directory (default: .luo_test_build.<arch>)
 	-j)	number of jobs for compilation
 	-t)	run test for target_arch (aarch64, x86_64)
-	-T)	test name to run (default: luo_kexec_simple)
+	-T)	test name to run, relative to this directory (default: luo_kexec_simple)
 	-w)	custom workspace directory (default: creates temp dir)
 	-k)	keep workspace directory after successful test
 	-h)	display this help
@@ -110,7 +121,8 @@ function build_kernel() {
 
 	echo "# Building kernel in: $build_dir"
 
-	cat "$arch_conf" "$common_conf" | tee "$kconfig" > "$luo_config"
+	cat "$arch_conf" "$common_conf" ${VMTEST_CONFIG:+"$test_dir/$VMTEST_CONFIG"} |
+		tee "$kconfig" > "$luo_config"
 	$make_cmd olddefconfig
 
 	# verify that kernel confiration has all necessary options
@@ -120,6 +132,34 @@ function build_kernel() {
 
 	$make_cmd "$kimage"
 	$make_cmd headers_install INSTALL_HDR_PATH="$headers_dir"
+}
+
+# Build the test modules out of tree against the test kernel, into
+# $workspace_dir/modules.
+function build_modules() {
+	local make_cmd=$1
+	local dir
+
+	[ -n "$VMTEST_MODULES" ] || return 0
+
+	# External modules need Module.symvers.
+	$make_cmd modules
+
+	mkdir -p "$workspace_dir/modules"
+	for dir in $VMTEST_MODULES; do
+		$make_cmd M="$test_dir/$dir" MO="$workspace_dir/modules/$dir" modules
+	done
+}
+
+# Print cpio entries for the test modules, which init loads from /modules.
+function cpio_modules() {
+	local ko
+
+	echo "dir /modules 0755 0 0"
+	[ -d "$workspace_dir/modules" ] || return 0
+	find "$workspace_dir/modules" -name '*.ko' | sort | while read -r ko; do
+		echo "file /modules/$(basename "$ko") $ko 0644 0 0"
+	done
 }
 
 function mkinitrd() {
@@ -145,11 +185,13 @@ function mkinitrd() {
 	cat > "$workspace_dir/cpio_list_inner" <<EOF
 dir /dev 0755 0 0
 dir /proc 0755 0 0
+dir /sys 0755 0 0
 dir /debugfs 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
 file /test_binary $workspace_dir/test_binary 0755 0 0
 EOF
+	cpio_modules >> "$workspace_dir/cpio_list_inner"
 
 	# Generate inner_initrd.cpio
 	"$build_dir/usr/gen_init_cpio" "$workspace_dir/cpio_list_inner" > "$workspace_dir/inner_initrd.cpio"
@@ -157,6 +199,7 @@ EOF
 	cat > "$workspace_dir/cpio_list" <<EOF
 dir /dev 0755 0 0
 dir /proc 0755 0 0
+dir /sys 0755 0 0
 dir /debugfs 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
@@ -164,6 +207,7 @@ file /kernel $kernel_path 0644 0 0
 file /test_binary $workspace_dir/test_binary 0755 0 0
 file /initrd.img $workspace_dir/inner_initrd.cpio 0644 0 0
 EOF
+	cpio_modules >> "$workspace_dir/cpio_list"
 
 	# Generate the final initrd
 	"$build_dir/usr/gen_init_cpio" "$workspace_dir/cpio_list" > "$initrd"
@@ -178,13 +222,14 @@ function run_qemu() {
 	cmdline="$cmdline liveupdate=on panic=-1"
 
 	echo "# Serial Log: $serial"
-	timeout 30s \
+	timeout "$VMTEST_TIMEOUT" \
 	$qemu_cmd -m 1G -smp 2 -no-reboot -nographic -nodefaults \
 		  -accel tcg -accel hvf -accel kvm \
 		  -serial file:"$serial" \
 		  -append "$cmdline" \
 		  -kernel "$kernel_path" \
-		  -initrd "$initrd"
+		  -initrd "$initrd" \
+		  $VMTEST_QEMU_ARGS
 
 	grep "TEST PASSED" "$serial" &> /dev/null || fail "Liveupdate failed"
 }
@@ -240,8 +285,16 @@ function main() {
 
 	local arch=$(target_to_arch "$target")
 
+	if [ -f "$test_dir/$test_name.vmtest" ]; then
+		source "$test_dir/$test_name.vmtest"
+	fi
+
 	if [ -z "$build_dir" ]; then
 		build_dir="$kernel_dir/.luo_test_build.$arch"
+		# Tests with extra config get their own build directory.
+		if [ -n "$VMTEST_CONFIG" ]; then
+			build_dir="$build_dir.$(dirname "$VMTEST_CONFIG" | tr / _)"
+		fi
 	fi
 
 	mkdir -p "$build_dir"
@@ -252,6 +305,7 @@ function main() {
 	local make_cmd_build="$make_cmd -C $kernel_dir O=$build_dir"
 
 	build_kernel "$build_dir" "$make_cmd_build" "$KERNEL_IMAGE" "$target"
+	build_modules "$make_cmd_build"
 
 	local final_kernel="$build_dir/arch/$arch/boot/$KERNEL_IMAGE"
 	mkinitrd "$build_dir" "$final_kernel" "$test_name"
