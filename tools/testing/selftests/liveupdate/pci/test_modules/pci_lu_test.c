@@ -19,7 +19,10 @@
  *
  * pci-lu-test also implements sriov_configure, so that it can be bound to an
  * SR-IOV PF and enable VFs, which can then be bound to pci-lu-test and
- * preserved too.
+ * preserved too. It supports Live Update as a PF driver (struct
+ * pci_liveupdate_pf_ops), so the PF does not need to be preserved explicitly:
+ * the PCI core preserves it automatically along with its VFs, and the driver
+ * checks the data it passes to the next kernel for the PF.
  *
  * The device's state (configuration space, BARs, etc.) is checked by
  * userspace through sysfs, see luo_pci.c.
@@ -42,6 +45,7 @@
 #include "../pci_lu_test_uapi.h"
 
 #define PCI_LU_TEST_FH_COMPATIBLE	"pci-lu-test-v1"
+#define PCI_LU_TEST_PF_MAGIC		0x5043504600000000ULL
 
 /* Serialized state of a preserved file, preserved with kho_alloc_preserve(). */
 struct pci_lu_test_ser {
@@ -419,10 +423,71 @@ static const struct pci_device_id pci_lu_test_ids[] = {
 };
 MODULE_DEVICE_TABLE(pci, pci_lu_test_ids);
 
+/* PF driver Live Update support */
+
+static u64 pci_lu_test_pf_data(struct pci_dev *pf)
+{
+	return PCI_LU_TEST_PF_MAGIC | (pci_domain_nr(pf->bus) << 16) |
+	       pci_dev_id(pf);
+}
+
+static int pci_lu_test_pf_preserve(struct pci_dev *pf, u64 *data)
+{
+	*data = pci_lu_test_pf_data(pf);
+	pci_info(pf, "Preserved PF (data %#llx)\n", *data);
+	return 0;
+}
+
+static void pci_lu_test_pf_unpreserve(struct pci_dev *pf, u64 data)
+{
+	WARN_ON(data != pci_lu_test_pf_data(pf));
+	pci_info(pf, "Unpreserved PF\n");
+}
+
+static void pci_lu_test_pf_finish(struct pci_dev *pf, u64 data)
+{
+	WARN_ON(data != pci_lu_test_pf_data(pf));
+	pci_info(pf, "Finished PF\n");
+}
+
+static const struct pci_liveupdate_pf_ops pci_lu_test_pf_ops = {
+	.preserve = pci_lu_test_pf_preserve,
+	.unpreserve = pci_lu_test_pf_unpreserve,
+	.finish = pci_lu_test_pf_finish,
+};
+
+/* Check the data passed by the previous kernel for an automatically preserved PF. */
+static int pci_lu_test_probe_pf(struct pci_dev *dev)
+{
+	u64 data;
+	int ret;
+
+	if (!dev->is_physfn || !pci_liveupdate_is_incoming(dev))
+		return 0;
+
+	ret = pci_liveupdate_get_driver_data(dev, &data);
+	if (ret == -EINVAL)
+		return 0;	/* PF was preserved explicitly */
+	if (ret)
+		return ret;
+
+	if (data != pci_lu_test_pf_data(dev)) {
+		pci_err(dev, "Unexpected PF data %#llx\n", data);
+		return -EINVAL;
+	}
+
+	pci_info(dev, "Taking over PF preserved automatically (data %#llx)\n", data);
+	return 0;
+}
+
 static int pci_lu_test_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct pci_lu_test_priv *priv;
 	int ret;
+
+	ret = pci_lu_test_probe_pf(dev);
+	if (ret)
+		return ret;
 
 	priv = devm_kzalloc(&dev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -473,6 +538,7 @@ static struct pci_driver pci_lu_test_driver = {
 	.probe = pci_lu_test_probe,
 	.remove = pci_lu_test_remove,
 	.sriov_configure = pci_sriov_configure_simple,
+	.liveupdate = &pci_lu_test_pf_ops,
 };
 
 static int __init pci_lu_test_init(void)
