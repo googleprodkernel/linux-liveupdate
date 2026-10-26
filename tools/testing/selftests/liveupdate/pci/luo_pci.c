@@ -24,6 +24,10 @@
  * devices, and checks again. Stage 2 takes the list of devices from the
  * snapshot, so DEVICE arguments are ignored.
  *
+ * With LUO_PCI_AUTO_PF (luo_pci_auto_pf), PFs with VFs are not preserved
+ * explicitly, only their VFs, and the PCI core preserves the PFs automatically
+ * since pci-lu-test supports Live Update as a PF driver.
+ *
  * This test must build with nolibc (see vmtest.sh).
  */
 
@@ -46,6 +50,7 @@
 
 #define STATE_SESSION_NAME	"luo_pci_state"
 #define STATE_MEMFD_TOKEN	999
+#define SNAPSHOT_SESSION_NAME	"luo_pci_snapshot"
 #define SNAPSHOT_MEMFD_TOKEN	1000
 #define DEVICE_TOKEN		0x5043
 
@@ -79,6 +84,8 @@ struct snapshot {
 	int nr_devices;
 	int nr_nodes;
 	char devices[MAX_DEVICES][BDF_LEN];
+	/* PFs that are not preserved explicitly (LUO_PCI_AUTO_PF). */
+	bool auto_pf[MAX_DEVICES];
 	struct node nodes[MAX_NODES];
 };
 
@@ -778,16 +785,29 @@ static void run_stage_1(int luo_fd)
 
 	create_state_file(luo_fd, STATE_SESSION_NAME, STATE_MEMFD_TOKEN, 2);
 
+#ifdef LUO_PCI_AUTO_PF
+	for (i = 0; i < nr_devices; i++)
+		snap->auto_pf[i] = find_node(snap, devices[i])->numvfs > 0;
+#endif
+
+	session_fd = luo_create_session(luo_fd, SNAPSHOT_SESSION_NAME);
+	if (session_fd < 0 ||
+	    memfd_preserve_buf(session_fd, SNAPSHOT_MEMFD_TOKEN, snap,
+			       sizeof(*snap)) < 0)
+		fail_exit("Failed to preserve snapshot");
+
 	/* One session per device, in order, so that PFs are frozen before VFs. */
 	for (i = 0; i < nr_devices; i++) {
+		if (snap->auto_pf[i]) {
+			ksft_print_msg("[STAGE 1] Not preserving PF %s explicitly\n",
+				       devices[i]);
+			continue;
+		}
+
 		session_name(name, sizeof(name), i);
 		session_fd = luo_create_session(luo_fd, name);
 		if (session_fd < 0)
 			fail_exit("luo_create_session(%s)", name);
-
-		if (i == 0 && memfd_preserve_buf(session_fd, SNAPSHOT_MEMFD_TOKEN,
-						 snap, sizeof(*snap)) < 0)
-			fail_exit("Failed to preserve snapshot");
 
 		fd = open_device(devices[i]);
 		if (luo_session_preserve_fd(session_fd, fd, DEVICE_TOKEN) < 0)
@@ -812,7 +832,7 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 	int session_fds[MAX_DEVICES];
 	struct snapshot *snap;
 	struct node *node;
-	int i, fd, stage, errors = 0;
+	int i, fd, stage, snapshot_fd, errors = 0;
 
 	restore_and_read_stage(state_session_fd, STATE_MEMFD_TOKEN, &stage);
 	if (stage != 2)
@@ -822,14 +842,17 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 	if (!snap)
 		fail_exit("calloc");
 
-	session_name(name, sizeof(name), 0);
-	session_fds[0] = luo_retrieve_session(luo_fd, name);
-	if (session_fds[0] < 0)
-		fail_exit("luo_retrieve_session(%s)", name);
+	snapshot_fd = luo_retrieve_session(luo_fd, SNAPSHOT_SESSION_NAME);
+	if (snapshot_fd < 0)
+		fail_exit("luo_retrieve_session(" SNAPSHOT_SESSION_NAME ")");
 
-	memfd_retrieve_buf(session_fds[0], SNAPSHOT_MEMFD_TOKEN, snap, sizeof(*snap));
+	memfd_retrieve_buf(snapshot_fd, SNAPSHOT_MEMFD_TOKEN, snap, sizeof(*snap));
 
-	for (i = 1; i < snap->nr_devices; i++) {
+	for (i = 0; i < snap->nr_devices; i++) {
+		session_fds[i] = -1;
+		if (snap->auto_pf[i])
+			continue;
+
 		session_name(name, sizeof(name), i);
 		session_fds[i] = luo_retrieve_session(luo_fd, name);
 		if (session_fds[i] < 0)
@@ -867,6 +890,9 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 			write_file(path, val);
 		}
 
+		if (snap->auto_pf[i])
+			continue;
+
 		fd = luo_session_retrieve_fd(session_fds[i], DEVICE_TOKEN);
 		if (fd < 0)
 			fail_exit("Failed to retrieve %s", bdf);
@@ -888,12 +914,22 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 	if (errors)
 		fail_exit("%d unexpected changes across Live Update", errors);
 
-	/* Finish VFs before their PFs. */
+	/*
+	 * Finish VFs before their PFs. PFs that were preserved automatically
+	 * finish along with their last VF.
+	 */
 	for (i = snap->nr_devices - 1; i >= 0; i--) {
+		if (session_fds[i] < 0)
+			continue;
+
 		if (luo_session_finish(session_fds[i]) < 0)
 			fail_exit("luo_session_finish for %s", snap->devices[i]);
 		close(session_fds[i]);
 	}
+
+	if (luo_session_finish(snapshot_fd) < 0)
+		fail_exit("luo_session_finish for snapshot session");
+	close(snapshot_fd);
 
 	if (luo_session_finish(state_session_fd) < 0)
 		fail_exit("luo_session_finish for state session");

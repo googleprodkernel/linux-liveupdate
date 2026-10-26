@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# vmtest.sh settings for pci/luo_pci_auto_pf: same as pci/luo_pci.
+source "$test_dir/pci/luo_pci.vmtest"

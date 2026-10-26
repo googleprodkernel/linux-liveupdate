@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 TEST_GEN_PROGS_EXTENDED += luo_pci
+TEST_GEN_PROGS_EXTENDED += luo_pci_auto_pf
 TEST_GEN_MODS_DIR := test_modules
 
 TEST_FILES += luo_pci.vmtest
+TEST_FILES += luo_pci_auto_pf.vmtest
 
 include ../../lib.mk
 include ../lib/libliveupdate.mk

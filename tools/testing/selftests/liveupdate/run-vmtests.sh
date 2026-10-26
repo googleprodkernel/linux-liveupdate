@@ -21,6 +21,7 @@ TEST_NAMES=(
 	"luo_stress_files"
 	"luo_stress_sessions"
 	"pci/luo_pci"
+	"pci/luo_pci_auto_pf"
 )
 
 function usage() {
