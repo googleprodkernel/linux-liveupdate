@@ -271,24 +271,24 @@ static int luo_copy_user_arg(u64 user_arg, const void **argp,
 int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd,
 		      u64 arg)
 {
+	struct luo_session *session =
+		container_of(file_set, struct luo_session, file_set);
 	struct liveupdate_file_op_args args = {0};
 	struct liveupdate_file_handler *fh;
 	struct luo_file *luo_file;
 	struct file *file;
 	int err;
 
-	if (luo_token_is_used(file_set, token))
-		return -EEXIST;
-
-	err = kho_block_set_grow(&file_set->block_set, file_set->count + 1);
-	if (err)
-		return err;
+	scoped_guard(mutex, &session->mutex) {
+		if (session->user_frozen)
+			return -EBUSY;
+		if (luo_token_is_used(file_set, token))
+			return -EEXIST;
+	}
 
 	file = fget(fd);
-	if (!file) {
-		err = -EBADF;
-		goto err_shrink;
-	}
+	if (!file)
+		return -EBADF;
 
 	err = -ENOENT;
 	down_read(&luo_register_rwlock);
@@ -336,14 +336,34 @@ int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd,
 		goto err_kfree;
 
 	kfree(args.arg);
+	args.arg = NULL;
 	luo_file->serialized_data = args.serialized_data;
 	luo_file->private_data = args.private_data;
-	list_add_tail(&luo_file->list, &file_set->files_list);
-	file_set->count++;
+
+	scoped_guard(mutex, &session->mutex) {
+		if (session->user_frozen) {
+			err = -EBUSY;
+			goto err_unpreserve;
+		}
+		if (luo_token_is_used(file_set, token)) {
+			err = -EEXIST;
+			goto err_unpreserve;
+		}
+		err = kho_block_set_grow(&file_set->block_set,
+					 file_set->count + 1);
+		if (err)
+			goto err_unpreserve;
+
+		list_add_tail(&luo_file->list, &file_set->files_list);
+		file_set->count++;
+	}
 
 	return 0;
 
+err_unpreserve:
+	fh->ops->unpreserve(&args);
 err_kfree:
+	mutex_destroy(&luo_file->mutex);
 	kfree(luo_file);
 err_flb_unpreserve:
 	luo_flb_file_unpreserve(fh);
@@ -355,8 +375,6 @@ err_module_put:
 	module_put(fh->ops->owner);
 err_fput:
 	fput(file);
-err_shrink:
-	kho_block_set_shrink(&file_set->block_set, file_set->count);
 
 	return err;
 }
@@ -597,18 +615,22 @@ void luo_file_unfreeze(struct luo_file_set *file_set)
 int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 		      struct file **filep)
 {
+	struct luo_session *session =
+		container_of(file_set, struct luo_session, file_set);
 	struct liveupdate_file_op_args args = {0};
 	struct luo_file *luo_file;
 	bool found = false;
 	int err;
 
-	if (list_empty(&file_set->files_list))
-		return -ENOENT;
+	scoped_guard(mutex, &session->mutex) {
+		if (list_empty(&file_set->files_list))
+			return -ENOENT;
 
-	list_for_each_entry(luo_file, &file_set->files_list, list) {
-		if (luo_file->token == token) {
-			found = true;
-			break;
+		list_for_each_entry(luo_file, &file_set->files_list, list) {
+			if (luo_file->token == token) {
+				found = true;
+				break;
+			}
 		}
 	}
 

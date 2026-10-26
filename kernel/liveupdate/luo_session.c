@@ -290,10 +290,6 @@ static int luo_session_preserve_fd(struct luo_session *session,
 	struct liveupdate_session_preserve_fd *argp = ucmd->cmd;
 	int err;
 
-	guard(mutex)(&session->mutex);
-	if (session->user_frozen)
-		return -EBUSY;
-
 	err = luo_preserve_file(&session->file_set, argp->token, argp->fd,
 				argp->arg);
 	if (err)
@@ -317,10 +313,8 @@ static int luo_session_retrieve_fd(struct luo_session *session,
 	if (argp->fd < 0)
 		return argp->fd;
 
-	mutex_lock(&session->mutex);
 	err = luo_retrieve_file(&session->file_set, argp->token, argp->arg,
 				&file);
-	mutex_unlock(&session->mutex);
 	if (err < 0)
 		goto err_put_fd;
 
