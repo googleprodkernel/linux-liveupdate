@@ -26,6 +26,21 @@
  * Documentation/PCI/liveupdate.rst), which takes care of the device's PCI
  * state (e.g. its BARs and bus numbers) and binds the device to vfio-pci again
  * in the next kernel.
+ *
+ * Preserved State
+ * ===============
+ *
+ * vfio-pci preserves as little about a device as possible, and re-derives
+ * everything else from the device in the next kernel.
+ *
+ * When userspace first opens a device, vfio-pci resets it and saves its state
+ * (pci_store_saved_state()), and when userspace closes the device, vfio-pci
+ * restores that state and resets the device, so that the device is handed
+ * back in the state it was in before userspace used it. A preserved device is
+ * not reset, so that saved state can't be re-derived in the next kernel: it is
+ * passed to the next kernel in the format defined by the PCI core (struct
+ * pci_saved_state_ser), so that closing the device after the Live Update
+ * behaves exactly as it would have without one.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -64,11 +79,22 @@ static bool vfio_pci_liveupdate_can_preserve(struct liveupdate_file_handler *han
 	       vfio_device_cdev_file_is_bound(file);
 }
 
+/* Free the state preserved by vfio_pci_liveupdate_preserve(). */
+static void vfio_pci_liveupdate_unpreserve_ser(struct vfio_pci_core_device_ser *ser)
+{
+	if (ser->saved_state)
+		kho_unpreserve_free(phys_to_virt(ser->saved_state));
+
+	kho_unpreserve_free(ser);
+}
+
 static int vfio_pci_liveupdate_preserve(struct liveupdate_file_op_args *args)
 {
 	struct vfio_pci_core_device *vdev = vfio_pci_liveupdate_vdev(args->file);
 	struct pci_dev *pdev = vdev->pdev;
 	struct vfio_pci_core_device_ser *ser;
+	size_t saved_state_size;
+	void *saved_state;
 	int ret;
 
 	/*
@@ -78,6 +104,7 @@ static int vfio_pci_liveupdate_preserve(struct liveupdate_file_op_args *args)
 	if (vfio_pci_is_intel_display(pdev))
 		return -EOPNOTSUPP;
 
+	/* Serializes against open and close, which set pci_saved_state. */
 	guard(mutex)(&vdev->vdev.dev_set->lock);
 
 	/*
@@ -95,15 +122,33 @@ static int vfio_pci_liveupdate_preserve(struct liveupdate_file_op_args *args)
 	ser->domain = pci_domain_nr(pdev->bus);
 	ser->bdf = pci_dev_id(pdev);
 
+	saved_state_size = pci_saved_state_ser_size(vdev->pci_saved_state);
+	if (saved_state_size) {
+		saved_state = kho_alloc_preserve(saved_state_size);
+		if (IS_ERR(saved_state)) {
+			ret = PTR_ERR(saved_state);
+			goto err_free;
+		}
+
+		ser->saved_state = virt_to_phys(saved_state);
+		ret = pci_saved_state_serialize(vdev->pci_saved_state,
+						saved_state, saved_state_size);
+		if (ret)
+			goto err_free;
+	}
+
 	ret = pci_liveupdate_preserve(pdev);
 	if (ret) {
 		pci_err(pdev, "Failed to preserve device (%d)\n", ret);
-		kho_unpreserve_free(ser);
-		return ret;
+		goto err_free;
 	}
 
 	args->serialized_data = virt_to_phys(ser);
 	return 0;
+
+err_free:
+	vfio_pci_liveupdate_unpreserve_ser(ser);
+	return ret;
 }
 
 static void vfio_pci_liveupdate_unpreserve(struct liveupdate_file_op_args *args)
@@ -113,7 +158,7 @@ static void vfio_pci_liveupdate_unpreserve(struct liveupdate_file_op_args *args)
 	guard(mutex)(&vdev->vdev.dev_set->lock);
 
 	pci_liveupdate_unpreserve(vdev->pdev);
-	kho_unpreserve_free(phys_to_virt(args->serialized_data));
+	vfio_pci_liveupdate_unpreserve_ser(phys_to_virt(args->serialized_data));
 }
 
 static int vfio_pci_liveupdate_freeze(struct liveupdate_file_op_args *args)

@@ -44,6 +44,13 @@
  * @domain: The device's PCI domain number (segment).
  * @bdf: The device's PCI bus, device, and function number.
  * @reserved: Must be 0.
+ * @saved_state: The physical address of the device's saved state, preserved
+ *               with KHO (e.g. kho_alloc_preserve()), or 0 if the device has
+ *               no saved state. The saved state is the state that vfio-pci
+ *               restores when userspace closes the device, i.e. the state the
+ *               device was in when it was first opened (right after it was
+ *               reset), serialized as a struct pci_saved_state_ser (see
+ *               include/linux/kho/abi/pci.h), which records its own size.
  */
 struct vfio_pci_core_device_ser {
 	u32 size;
@@ -51,6 +58,7 @@ struct vfio_pci_core_device_ser {
 	u32 domain;
 	u16 bdf;
 	u16 reserved;
+	u64 saved_state;
 } __packed;
 
 #endif /* _LINUX_KHO_ABI_VFIO_PCI_H */
