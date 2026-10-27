@@ -20,6 +20,8 @@
 #define KERNEL_IMAGE "/kernel"
 #define INITRD_IMAGE "/initrd.img"
 #define TEST_BINARY "/test_binary"
+#define TEST_ARGS "/test_args"
+#define MAX_TEST_ARGS 16
 #define MODULES_DIR "/modules"
 
 static int mount_filesystems(void)
@@ -139,21 +141,69 @@ static int kexec_load(void)
 	return err;
 }
 
+static bool is_space(char c)
+{
+	return c == ' ' || c == '\t' || c == '\n';
+}
+
+/*
+ * Store the whitespace-separated arguments in TEST_ARGS, if any, in @argv,
+ * which has room for MAX_TEST_ARGS arguments plus the terminating NULL.
+ */
+static int read_test_args(char **argv)
+{
+	static char buf[512];
+	int fd, len, i = 0;
+	char *p;
+
+	fd = open(TEST_ARGS, O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	len = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (len < 0)
+		return -1;
+
+	buf[len] = 0;
+	for (p = buf; *p; ) {
+		if (is_space(*p)) {
+			*p++ = 0;
+			continue;
+		}
+
+		if (i == MAX_TEST_ARGS)
+			return -1;
+
+		argv[i++] = p;
+		while (*p && !is_space(*p))
+			p++;
+	}
+
+	argv[i] = NULL;
+	return 0;
+}
+
 static int run_test(int stage)
 {
+	char *argv[3 + MAX_TEST_ARGS + 1] = {TEST_BINARY, "-s"};
 	char stage_arg[32];
 	int status;
 	pid_t pid;
 
 	snprintf(stage_arg, sizeof(stage_arg), "%d", stage);
+	argv[2] = stage_arg;
+
+	if (read_test_args(&argv[3])) {
+		fprintf(stderr, "INIT: Failed to read " TEST_ARGS "\n");
+		return -1;
+	}
 
 	pid = fork();
 	if (pid < 0)
 		return -1;
 
 	if (!pid) {
-		char *const argv[] = {TEST_BINARY, "-s", stage_arg, NULL};
-
 		execve(TEST_BINARY, argv, NULL);
 		fprintf(stderr, "INIT: execve failed\n");
 		_exit(1);

@@ -18,10 +18,18 @@ KEEP_WORKSPACE=0
 #   VMTEST_MODULES:   directories of test modules (relative to $test_dir) to
 #                     build against the test kernel and load before the test
 #   VMTEST_QEMU_ARGS: extra QEMU arguments, may depend on $arch
+#   VMTEST_CMDLINE:   extra kernel command line arguments, for both kernels
+#   VMTEST_ARGS:      extra arguments for the test binary, in both stages
 #   VMTEST_TIMEOUT:   QEMU timeout (default: 30s)
+#
+# The .vmtest file can also define a vmtest_build_test_binary function that
+# builds $workspace_dir/test_binary (statically linked), for tests that are
+# not built from $test_dir/<test_name>.c with nolibc.
 VMTEST_CONFIG=""
 VMTEST_MODULES=""
 VMTEST_QEMU_ARGS=""
+VMTEST_CMDLINE=""
+VMTEST_ARGS=""
 VMTEST_TIMEOUT="30s"
 
 source "$test_dir/../kselftest/ktap_helpers.sh"
@@ -168,12 +176,19 @@ function mkinitrd() {
 	local test_name=$3
 
 	# Compile the test binary and the init process
-	"$CROSS_COMPILE"gcc -static -O2 -nostdinc -nostdlib \
-		-I "$headers_dir/include" \
-		-I "$kernel_dir/tools/include/nolibc" \
-		-I "$test_dir/lib/include" \
-		-o "$workspace_dir/test_binary" \
-		"$test_dir/$test_name.c" "$test_dir/lib/lu_utils.c"
+	if declare -F vmtest_build_test_binary > /dev/null; then
+		vmtest_build_test_binary
+	else
+		"$CROSS_COMPILE"gcc -static -O2 -nostdinc -nostdlib \
+			-I "$headers_dir/include" \
+			-I "$kernel_dir/tools/include/nolibc" \
+			-I "$test_dir/lib/include" \
+			-o "$workspace_dir/test_binary" \
+			"$test_dir/$test_name.c" "$test_dir/lib/lu_utils.c"
+	fi
+
+	# init passes these to the test binary.
+	echo "$VMTEST_ARGS" > "$workspace_dir/test_args"
 
 	"$CROSS_COMPILE"gcc -s -static -Os -nostdinc -nostdlib		\
 			-fno-asynchronous-unwind-tables -fno-ident	\
@@ -190,6 +205,7 @@ dir /debugfs 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
 file /test_binary $workspace_dir/test_binary 0755 0 0
+file /test_args $workspace_dir/test_args 0644 0 0
 EOF
 	cpio_modules >> "$workspace_dir/cpio_list_inner"
 
@@ -205,6 +221,7 @@ nod /dev/console 0600 0 0 c 5 1
 file /init $workspace_dir/init 0755 0 0
 file /kernel $kernel_path 0644 0 0
 file /test_binary $workspace_dir/test_binary 0755 0 0
+file /test_args $workspace_dir/test_args 0644 0 0
 file /initrd.img $workspace_dir/inner_initrd.cpio 0644 0 0
 EOF
 	cpio_modules >> "$workspace_dir/cpio_list"
@@ -219,7 +236,7 @@ function run_qemu() {
 	local kernel_path=$3
 	local serial="$workspace_dir/qemu.serial"
 
-	cmdline="$cmdline liveupdate=on panic=-1"
+	cmdline="$cmdline liveupdate=on panic=-1 $VMTEST_CMDLINE"
 
 	echo "# Serial Log: $serial"
 	timeout "$VMTEST_TIMEOUT" \
