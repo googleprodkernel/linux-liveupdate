@@ -36,6 +36,15 @@ vfio_allocate_device_file(struct vfio_device *device);
 
 extern const struct file_operations vfio_device_fops;
 
+/*
+ * A device preserved across Live Update by the previous kernel can only be
+ * opened through the file userspace retrieves from its Live Update session.
+ */
+static inline bool vfio_device_liveupdate_incoming(struct vfio_device *device)
+{
+	return READ_ONCE(device->liveupdate_incoming);
+}
+
 #ifdef CONFIG_VFIO_NOIOMMU
 extern bool vfio_noiommu __read_mostly;
 #else

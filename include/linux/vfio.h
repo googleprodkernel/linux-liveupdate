@@ -55,6 +55,15 @@ struct vfio_device {
 	unsigned int migration_flags;
 	u8 precopy_info_v2;
 	struct kvm *kvm;
+	/*
+	 * Set by the driver while the device is preserved across Live Update
+	 * by the previous kernel and has not finished participating in it.
+	 * Userspace must then retrieve the device's file from its Live Update
+	 * session (see vfio_device_cdev_open_file()), and opening the device
+	 * through its cdev or VFIO_GROUP_GET_DEVICE_FD fails with -EBUSY.
+	 * Accessed with READ_ONCE()/WRITE_ONCE().
+	 */
+	bool liveupdate_incoming;
 
 	/* Members below here are private, not for driver use */
 	unsigned int index;

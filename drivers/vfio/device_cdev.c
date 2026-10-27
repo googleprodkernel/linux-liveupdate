@@ -67,6 +67,12 @@ int vfio_device_fops_cdev_open(struct inode *inode, struct file *filep)
 	if (IS_ERR(df))
 		return PTR_ERR(df);
 
+	if (vfio_device_liveupdate_incoming(device)) {
+		kfree(df);
+		vfio_device_put_registration(device);
+		return -EBUSY;
+	}
+
 	filep->private_data = df;
 
 	/*
