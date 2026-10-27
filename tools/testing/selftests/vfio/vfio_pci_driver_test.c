@@ -2,6 +2,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
+#include <linux/mman.h>
 #include <linux/sizes.h>
 #include <linux/vfio.h>
 
@@ -29,12 +30,22 @@ static void region_setup(struct iommu *iommu,
 			 struct iova_allocator *iova_allocator,
 			 struct dma_region *region, u64 size)
 {
-	const int flags = MAP_SHARED | MAP_ANONYMOUS;
 	const int prot = PROT_READ | PROT_WRITE;
+	int flags = MAP_SHARED | MAP_ANONYMOUS;
 	void *vaddr;
 
+	/*
+	 * Without an IOMMU, buffers the device accesses with DMA must be
+	 * physically contiguous. Use a 2MiB HugeTLB page for each region.
+	 */
+	if (iommu->mode->noiommu) {
+		VFIO_ASSERT_EQ(size, SZ_2M);
+		flags |= MAP_HUGETLB | MAP_HUGE_2MB;
+	}
+
 	vaddr = mmap(NULL, size, prot, flags, -1, 0);
-	VFIO_ASSERT_NE(vaddr, MAP_FAILED);
+	VFIO_ASSERT_NE(vaddr, MAP_FAILED, "Failed to mmap() 0x%lx bytes%s\n", size,
+		       iommu->mode->noiommu ? " of 2MiB HugeTLB pages" : "");
 
 	region->vaddr = vaddr;
 	region->iova = iova_allocator_alloc(iova_allocator, size);
@@ -75,10 +86,17 @@ FIXTURE_VARIANT_ADD(vfio_pci_driver_test, _iommu_mode) {	\
 }
 
 FIXTURE_VARIANT_ADD_ALL_IOMMU_MODES();
+FIXTURE_VARIANT_ADD_IOMMU_MODE(iommufd_noiommu);
 
 FIXTURE_SETUP(vfio_pci_driver_test)
 {
 	struct vfio_pci_driver *driver;
+	u64 memcpy_region_size = SZ_1G;
+
+	if (vfio_pci_cdev_is_noiommu(device_bdf) !=
+	    iommu_mode_is_noiommu(variant->iommu_mode))
+		SKIP(return, "IOMMU mode %s does not match device\n",
+		     variant->iommu_mode);
 
 	self->iommu = iommu_init(variant->iommu_mode);
 	self->device = vfio_pci_device_init(device_bdf, self->iommu);
@@ -86,7 +104,11 @@ FIXTURE_SETUP(vfio_pci_driver_test)
 
 	driver = &self->device->driver;
 
-	region_setup(self->iommu, self->iova_allocator, &self->memcpy_region, SZ_1G);
+	if (self->iommu->mode->noiommu)
+		memcpy_region_size = SZ_2M;
+
+	region_setup(self->iommu, self->iova_allocator, &self->memcpy_region,
+		     memcpy_region_size);
 	region_setup(self->iommu, self->iova_allocator, &driver->region, SZ_2M);
 
 	/* Any IOVA that doesn't overlap memcpy_region and driver->region. */
@@ -152,6 +174,13 @@ TEST_F(vfio_pci_driver_test, memcpy_success)
 
 TEST_F(vfio_pci_driver_test, memcpy_from_unmapped_iova)
 {
+	/*
+	 * Without an IOMMU nothing stops the device from accessing an unmapped
+	 * IOVA, which is just some physical address.
+	 */
+	if (self->iommu->mode->noiommu)
+		SKIP(return, "Unmapped IOVAs are not blocked in noiommu mode\n");
+
 	fcntl_set_msi_nonblock(self);
 
 	/*
@@ -166,6 +195,13 @@ TEST_F(vfio_pci_driver_test, memcpy_from_unmapped_iova)
 
 TEST_F(vfio_pci_driver_test, memcpy_to_unmapped_iova)
 {
+	/*
+	 * Without an IOMMU nothing stops the device from accessing an unmapped
+	 * IOVA, which is just some physical address.
+	 */
+	if (self->iommu->mode->noiommu)
+		SKIP(return, "Unmapped IOVAs are not blocked in noiommu mode\n");
+
 	fcntl_set_msi_nonblock(self);
 
 	/*
@@ -206,10 +242,12 @@ TEST_F(vfio_pci_driver_test, mix_and_match)
 
 		ASSERT_EQ(0, memcmp(self->src, self->dst, self->size));
 
-		vfio_pci_driver_memcpy(self->device,
-				       self->unmapped_iova,
-				       self->dst_iova,
-				       self->size);
+		/* See memcpy_from_unmapped_iova. */
+		if (!self->iommu->mode->noiommu)
+			vfio_pci_driver_memcpy(self->device,
+					       self->unmapped_iova,
+					       self->dst_iova,
+					       self->size);
 
 		if (!self->device->driver.ops->send_msi)
 			continue;
@@ -254,7 +292,7 @@ static bool device_has_selftests_driver(const char *bdf)
 	struct iommu *iommu;
 	bool has_driver;
 
-	iommu = iommu_init(default_iommu_mode);
+	iommu = iommu_init(vfio_pci_default_iommu_mode(bdf));
 	device = vfio_pci_device_init(device_bdf, iommu);
 
 	has_driver = !!device->driver.ops;
