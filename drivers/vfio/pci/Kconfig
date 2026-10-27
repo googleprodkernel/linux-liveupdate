@@ -42,6 +42,25 @@ config VFIO_PCI_IGD
 	  and LPC bridge config space.
 
 	  To enable Intel IGD assignment through vfio-pci, say Y.
+
+config VFIO_PCI_LIVEUPDATE
+	bool "Live Update support for VFIO PCI devices (EXPERIMENTAL)"
+	depends on PCI_LIVEUPDATE && VFIO_DEVICE_CDEV
+	help
+	  Support preserving devices bound to vfio-pci across a kexec Live
+	  Update, so that they keep running while the kernel is replaced.
+	  Userspace preserves a device by preserving its VFIO device cdev file
+	  (/dev/vfio/devices/vfioX, bound to an iommufd) in a Live Update
+	  session, and retrieves a new file for the device from the session
+	  after kexec.
+
+	  This is experimental: IOMMU state is not preserved, so this is only
+	  useful with no-IOMMU devices (VFIO_NOIOMMU), and the user-visible
+	  behavior may still change.
+
+	  See Documentation/driver-api/vfio_pci_liveupdate.rst.
+
+	  If you don't know what to do here, say N.
 endif
 
 config VFIO_PCI_ZDEV_KVM

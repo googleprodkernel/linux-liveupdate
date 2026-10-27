@@ -88,6 +88,21 @@ static inline int vfio_pci_igd_init(struct vfio_pci_core_device *vdev)
 }
 #endif
 
+#ifdef CONFIG_VFIO_PCI_LIVEUPDATE
+extern const struct vfio_device_ops vfio_pci_ops;
+
+void vfio_pci_liveupdate_init(void);
+void vfio_pci_liveupdate_cleanup(void);
+#else
+static inline void vfio_pci_liveupdate_init(void)
+{
+}
+
+static inline void vfio_pci_liveupdate_cleanup(void)
+{
+}
+#endif
+
 #ifdef CONFIG_VFIO_PCI_ZDEV_KVM
 int vfio_pci_info_zdev_add_caps(struct vfio_pci_core_device *vdev,
 				struct vfio_info_cap *caps);
