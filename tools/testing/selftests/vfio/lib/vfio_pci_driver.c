@@ -81,6 +81,28 @@ void vfio_pci_driver_init(struct vfio_pci_device *device)
 	driver->initialized = true;
 }
 
+/*
+ * Resume driving a device after a Live Update, see vfio_pci_driver_ops.resume.
+ * If @memcpy_in_progress, the device may still be working on a memcpy started
+ * before the Live Update, which must be waited for with
+ * vfio_pci_driver_memcpy_wait().
+ */
+void vfio_pci_driver_resume(struct vfio_pci_device *device, bool memcpy_in_progress)
+{
+	struct vfio_pci_driver *driver = &device->driver;
+
+	VFIO_ASSERT_NOT_NULL(driver->region.vaddr);
+	VFIO_ASSERT_NOT_NULL(driver->ops);
+	VFIO_ASSERT_NOT_NULL(driver->ops->resume, "Driver has no resume()\n");
+	VFIO_ASSERT_FALSE(driver->initialized);
+	vfio_pci_driver_check_region(device);
+
+	driver->ops->resume(device);
+
+	driver->initialized = true;
+	driver->memcpy_in_progress = memcpy_in_progress;
+}
+
 void vfio_pci_driver_remove(struct vfio_pci_device *device)
 {
 	struct vfio_pci_driver *driver = &device->driver;

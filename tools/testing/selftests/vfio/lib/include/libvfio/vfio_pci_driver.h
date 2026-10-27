@@ -24,6 +24,17 @@ struct vfio_pci_driver_ops {
 	void (*init)(struct vfio_pci_device *device);
 
 	/**
+	 * @resume() - Optional. Take over @device after a Live Update.
+	 *
+	 * @device was initialized with init() (and possibly used with the
+	 * other ops) by a previous kernel and kept running across the Live
+	 * Update. Must not reset or reprogram the device. driver.region
+	 * contains the state the driver left in it before the Live Update and
+	 * must be mapped at the same device address as before.
+	 */
+	void (*resume)(struct vfio_pci_device *device);
+
+	/**
 	 * remove() - Deinitialize the driver for @device.
 	 */
 	void (*remove)(struct vfio_pci_device *device);
@@ -85,6 +96,7 @@ struct vfio_pci_driver {
 
 void vfio_pci_driver_probe(struct vfio_pci_device *device);
 void vfio_pci_driver_init(struct vfio_pci_device *device);
+void vfio_pci_driver_resume(struct vfio_pci_device *device, bool memcpy_in_progress);
 void vfio_pci_driver_remove(struct vfio_pci_device *device);
 int vfio_pci_driver_memcpy(struct vfio_pci_device *device,
 			   iova_t src, iova_t dst, u64 size);
