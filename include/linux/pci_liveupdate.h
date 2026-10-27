@@ -8,6 +8,7 @@
 #ifndef LINUX_PCI_LIVEUPDATE_H
 #define LINUX_PCI_LIVEUPDATE_H
 
+#include <linux/err.h>
 #include <linux/kho/abi/pci.h>
 #include <linux/liveupdate.h>
 #include <linux/spinlock_types.h>
@@ -33,6 +34,7 @@ struct pci_liveupdate {
 };
 
 struct pci_dev;
+struct pci_saved_state;
 
 /**
  * struct pci_liveupdate_pf_ops - Live Update support of a PF driver
@@ -73,6 +75,12 @@ void pci_liveupdate_finish(struct pci_dev *dev);
 bool pci_liveupdate_is_incoming(struct pci_dev *dev);
 bool pci_liveupdate_is_preserved(struct pci_dev *dev);
 int pci_liveupdate_get_driver_data(struct pci_dev *dev, u64 *data);
+size_t pci_saved_state_ser_size(const struct pci_saved_state *state);
+int pci_saved_state_serialize(const struct pci_saved_state *state,
+			      struct pci_saved_state_ser *ser, size_t size);
+struct pci_saved_state *
+pci_saved_state_deserialize(struct pci_dev *dev,
+			    const struct pci_saved_state_ser *ser, size_t size);
 #else
 static inline int pci_liveupdate_register_flb(struct liveupdate_file_handler *fh)
 {
@@ -123,6 +131,25 @@ static inline bool pci_liveupdate_is_preserved(struct pci_dev *dev)
 static inline int pci_liveupdate_get_driver_data(struct pci_dev *dev, u64 *data)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline size_t pci_saved_state_ser_size(const struct pci_saved_state *state)
+{
+	return 0;
+}
+
+static inline int pci_saved_state_serialize(const struct pci_saved_state *state,
+					    struct pci_saved_state_ser *ser,
+					    size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline struct pci_saved_state *
+pci_saved_state_deserialize(struct pci_dev *dev,
+			    const struct pci_saved_state_ser *ser, size_t size)
+{
+	return ERR_PTR(-EOPNOTSUPP);
 }
 #endif
 

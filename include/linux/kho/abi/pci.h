@@ -192,4 +192,48 @@ struct pci_ser {
 #define PCI_SER_OPTIONAL_DRIVER_NAME	BIT_ULL(3)
 #define PCI_SER_OPTIONAL_PF		BIT_ULL(4)
 
+/*
+ * The number of u64 words in struct pci_saved_state_ser::dword_map, i.e. one
+ * bit per DWORD of PCI Express extended configuration space.
+ */
+#define PCI_SAVED_STATE_SER_MAP_WORDS	(PCI_CFG_SPACE_EXP_SIZE / 4 / 64)
+
+/**
+ * struct pci_saved_state_ser - Serialized saved state of a PCI device
+ *
+ * The serialized form of a struct pci_saved_state, i.e. the configuration
+ * space registers of a device saved with pci_store_saved_state(). Drivers that
+ * need a device's saved state in the next kernel (e.g. to restore the device
+ * to its state before it was handed to userspace) embed this struct in their
+ * own preserved state, see pci_saved_state_serialize(). The PCI core is not
+ * otherwise involved in its preservation.
+ *
+ * Every saved value is identified by the offset of its DWORD in the device's
+ * configuration space, so the format does not depend on which registers the
+ * kernel saves: the next kernel ignores registers it does not save. Values are
+ * stored as read with pci_read_config_dword(), in CPU byte order.
+ *
+ * This struct can be placed at any alignment.
+ *
+ * @size: The size of this struct in bytes, including @dword_val.
+ * @nr_dwords: The number of entries in @dword_val, i.e. the number of bits set
+ *             in @dword_map.
+ * @flags: Reserved for future extensions of this format, must be 0. The next
+ *         kernel refuses a serialized saved state with bits set that it does
+ *         not know about.
+ * @dword_map: Bit (N % 64) of ``dword_map[N / 64]`` is set if the
+ *             configuration space DWORD at offset 4 * N was saved. The DWORDs
+ *             of the configuration space header (offsets 0 through 0x3c) are
+ *             always saved.
+ * @dword_val: The values of the saved DWORDs, in ascending configuration space
+ *             offset order.
+ */
+struct pci_saved_state_ser {
+	u32 size;
+	u16 nr_dwords;
+	u16 flags;
+	u64 dword_map[PCI_SAVED_STATE_SER_MAP_WORDS];
+	u32 dword_val[];
+} __packed;
+
 #endif /* _LINUX_KHO_ABI_PCI_H */

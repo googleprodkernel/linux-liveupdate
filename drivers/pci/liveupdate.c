@@ -182,6 +182,23 @@
  * them. Incoming VFs are then matched to the state passed by the previous
  * kernel like any other device.
  *
+ * Saved State
+ * ===========
+ *
+ * Drivers that save a device's state with pci_store_saved_state() to restore
+ * it later (e.g. vfio-pci, which restores the state a device was in before it
+ * was handed to userspace) can carry that state across Live Update:
+ *
+ *  * ``pci_saved_state_ser_size(state)``
+ *  * ``pci_saved_state_serialize(state, ser, size)``
+ *  * ``pci_saved_state_deserialize(pci_dev, ser, size)``
+ *
+ * The serialized form, struct pci_saved_state_ser, is defined by the PCI core
+ * but preserved by the driver, typically embedded in its own preserved state,
+ * so struct pci_saved_state remains opaque to drivers. Each saved value is
+ * identified by its offset in the device's configuration space, so the format
+ * does not change when a kernel starts or stops saving a register.
+ *
  * Driver Binding
  * ==============
  *
@@ -2003,6 +2020,152 @@ bool pci_liveupdate_is_incoming(struct pci_dev *dev)
 	return dev->liveupdate.incoming;
 }
 EXPORT_SYMBOL_GPL(pci_liveupdate_is_incoming);
+
+/**
+ * pci_saved_state_ser_size() - Get the size of a serialized saved state
+ * @state: The saved state, from pci_store_saved_state()
+ *
+ * Return: The number of bytes pci_saved_state_serialize() needs to serialize
+ * @state, or 0 if @state is NULL.
+ */
+size_t pci_saved_state_ser_size(const struct pci_saved_state *state)
+{
+	if (!state)
+		return 0;
+
+	return struct_size_t(struct pci_saved_state_ser, dword_val,
+			     bitmap_weight(state->dword_map,
+					   PCI_CFG_SPACE_EXP_DWORDS));
+}
+EXPORT_SYMBOL_GPL(pci_saved_state_ser_size);
+
+/**
+ * pci_saved_state_serialize() - Serialize a saved state for the next kernel
+ * @state: The saved state, from pci_store_saved_state()
+ * @ser: Where to serialize @state
+ * @size: The size of the buffer at @ser
+ *
+ * Serialize @state into @ser, so that the next kernel can get it back with
+ * pci_saved_state_deserialize() after a Live Update. The caller owns @ser and
+ * is responsible for preserving it, e.g. as part of its own state preserved
+ * with KHO.
+ *
+ * Return: 0 on success, -EINVAL if @state is NULL, or -ENOSPC if @size is
+ * smaller than pci_saved_state_ser_size().
+ */
+int pci_saved_state_serialize(const struct pci_saved_state *state,
+			      struct pci_saved_state_ser *ser, size_t size)
+{
+	u64 map[PCI_SAVED_STATE_SER_MAP_WORDS];
+	unsigned int nr_dwords;
+
+	if (!state)
+		return -EINVAL;
+
+	nr_dwords = bitmap_weight(state->dword_map, PCI_CFG_SPACE_EXP_DWORDS);
+	if (size < struct_size(ser, dword_val, nr_dwords))
+		return -ENOSPC;
+
+	ser->size = struct_size(ser, dword_val, nr_dwords);
+	ser->nr_dwords = nr_dwords;
+	ser->flags = 0;
+
+	/* @ser can be unaligned, so go through a bounce buffer. */
+	bitmap_to_arr64(map, state->dword_map, PCI_CFG_SPACE_EXP_DWORDS);
+	memcpy(ser->dword_map, map, sizeof(map));
+	memcpy(ser->dword_val, state->dword_val, nr_dwords * sizeof(u32));
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pci_saved_state_serialize);
+
+/**
+ * pci_saved_state_deserialize() - Get a saved state from the previous kernel
+ * @dev: The device the state was saved from
+ * @ser: The saved state, serialized by pci_saved_state_serialize() in the
+ *       previous kernel
+ * @size: The size of the buffer at @ser
+ *
+ * Turn @ser back into a struct pci_saved_state that can be loaded into @dev
+ * with pci_load_saved_state(). @ser is not referenced after this returns.
+ *
+ * The previous kernel may not have saved the same registers as this kernel.
+ * Registers saved by the previous kernel that this kernel does not save for
+ * @dev are dropped with a warning. Registers that this kernel saves but the
+ * previous kernel did not are missing from the result, and keep whatever value
+ * was last saved for @dev when the result is loaded.
+ *
+ * Return: The saved state, which the caller must free with kfree(), or an
+ * ERR_PTR() on failure: -EINVAL if @ser is malformed, or -ENOMEM.
+ */
+struct pci_saved_state *
+pci_saved_state_deserialize(struct pci_dev *dev,
+			    const struct pci_saved_state_ser *ser, size_t size)
+{
+	unsigned int dword, nr_dwords, nr_kept, nr_dropped, i = 0, j = 0;
+	DECLARE_BITMAP(map, PCI_CFG_SPACE_EXP_DWORDS);
+	DECLARE_BITMAP(kept, PCI_CFG_SPACE_EXP_DWORDS);
+	u64 arr[PCI_SAVED_STATE_SER_MAP_WORDS];
+	struct pci_saved_state *state;
+	size_t ser_size;
+
+	if (size < sizeof(*ser))
+		goto invalid;
+
+	ser_size = ser->size;
+	nr_dwords = ser->nr_dwords;
+
+	if (ser->flags || ser_size > size ||
+	    ser_size < struct_size(ser, dword_val, nr_dwords))
+		goto invalid;
+
+	memcpy(arr, ser->dword_map, sizeof(arr));
+	bitmap_from_arr64(map, arr, PCI_CFG_SPACE_EXP_DWORDS);
+
+	if (bitmap_weight(map, PCI_CFG_SPACE_EXP_DWORDS) != nr_dwords ||
+	    find_first_zero_bit(map, PCI_STD_HEADER_DWORDS) < PCI_STD_HEADER_DWORDS)
+		goto invalid;
+
+	/* Keep the header and the registers that this kernel saves. */
+	bitmap_zero(kept, PCI_CFG_SPACE_EXP_DWORDS);
+	for_each_set_bit(dword, map, PCI_CFG_SPACE_EXP_DWORDS) {
+		if (dword < PCI_STD_HEADER_DWORDS ||
+		    pci_saved_cap_reserved(dev, dword * sizeof(u32)))
+			__set_bit(dword, kept);
+	}
+
+	nr_kept = bitmap_weight(kept, PCI_CFG_SPACE_EXP_DWORDS);
+	nr_dropped = nr_dwords - nr_kept;
+	if (nr_dropped) {
+		pci_warn(dev, "Dropping %u saved registers that are not saved by this kernel\n",
+			 nr_dropped);
+	}
+
+	state = kzalloc(struct_size(state, dword_val, nr_kept), GFP_KERNEL);
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+
+	bitmap_copy(state->dword_map, kept, PCI_CFG_SPACE_EXP_DWORDS);
+
+	for_each_set_bit(dword, map, PCI_CFG_SPACE_EXP_DWORDS) {
+		u32 val = ser->dword_val[i++];
+
+		if (!test_bit(dword, kept)) {
+			pci_dbg(dev, "Dropped saved register %#05x: %#010x\n",
+				dword * 4, val);
+			continue;
+		}
+
+		state->dword_val[j++] = val;
+	}
+
+	return state;
+
+invalid:
+	pci_err(dev, "Invalid serialized saved state\n");
+	return ERR_PTR(-EINVAL);
+}
+EXPORT_SYMBOL_GPL(pci_saved_state_deserialize);
 
 /**
  * pci_liveupdate_register_flb() - Register a file handler with the PCI core
