@@ -189,6 +189,42 @@ bool vfio_device_try_get_registration(struct vfio_device *device)
 }
 EXPORT_SYMBOL_GPL(vfio_device_try_get_registration);
 
+static int vfio_device_match_dev(struct device *device, const void *data)
+{
+	return container_of(device, struct vfio_device, device)->dev == data;
+}
+
+/**
+ * vfio_find_device - Look up the vfio_device of a device
+ * @dev: The device, e.g. the struct device of a PCI device
+ *
+ * Find the vfio_device registered for @dev, e.g. by the VFIO driver bound to
+ * @dev, and take a registration reference on it, which keeps it from being
+ * unregistered.
+ *
+ * Return: The vfio_device, which the caller must release with
+ * vfio_device_put_registration(), or NULL if no vfio_device is registered for
+ * @dev.
+ */
+struct vfio_device *vfio_find_device(struct device *dev)
+{
+	struct vfio_device *device;
+	struct device *found;
+
+	found = class_find_device(&vfio_device_class, NULL, dev,
+				  vfio_device_match_dev);
+	if (!found)
+		return NULL;
+
+	device = container_of(found, struct vfio_device, device);
+	if (!vfio_device_try_get_registration(device))
+		device = NULL;
+
+	put_device(found);
+	return device;
+}
+EXPORT_SYMBOL_GPL(vfio_find_device);
+
 /*
  * VFIO driver API
  */
