@@ -620,6 +620,33 @@ static void vfio_pci_core_liveupdate_enable(struct vfio_pci_core_device *vdev)
 	vdev->liveupdate_saved_state = NULL;
 }
 
+/*
+ * Restore what userspace wrote to the virtual configuration space in the
+ * previous kernel, which differs from the device's configuration space in the
+ * registers vfio-pci emulates. Everything else is taken from what
+ * vfio_config_init() built from the device and this kernel's emulation (e.g.
+ * the map of capabilities and the BAR values to restore after resets match
+ * the previous kernel's, since the device was not reset).
+ */
+static void vfio_pci_core_liveupdate_restore_config(struct vfio_pci_core_device *vdev)
+{
+	u16 cmd;
+
+	if (!vdev->liveupdate_vconfig)
+		return;
+
+	vfio_config_restore_virt(vdev, vdev->liveupdate_vconfig);
+	kfree(vdev->liveupdate_vconfig);
+	vdev->liveupdate_vconfig = NULL;
+
+	/* The virtual BARs may hold values written by userspace. */
+	vdev->bardirty = true;
+
+	/* virq_disabled tracks the emulated INTx Disable bit. */
+	cmd = le16_to_cpu(*(__le16 *)&vdev->vconfig[PCI_COMMAND]);
+	vdev->virq_disabled = !!(cmd & PCI_COMMAND_INTX_DISABLE);
+}
+
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -713,6 +740,9 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 	if (ret)
 		goto out_free_zdev;
 
+	if (incoming)
+		vfio_pci_core_liveupdate_restore_config(vdev);
+
 	msix_pos = pdev->msix_cap;
 	if (msix_pos) {
 		u16 flags;
@@ -766,10 +796,14 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_enable);
 /**
  * vfio_pci_core_liveupdate_freeze - Freeze a device preserved across Live Update
  * @vdev: The device
+ * @vconfig: Where to copy the device's virtual configuration space (of
+ *           pci_dev.cfg_size bytes) for the next kernel
  *
  * Called right before kexec to hand the device over to the next kernel. Check
- * that the device can keep running across the kexec, and refuse what would
- * break that (enabling interrupts) until the device is unfrozen.
+ * that the device can keep running across the kexec, copy its virtual
+ * configuration space to @vconfig, and refuse what would break that or change
+ * the copy (enabling interrupts, writing to configuration space) until the
+ * device is unfrozen.
  *
  * Unlike closing the device, freezing it does not stop, reset, or reconfigure
  * it, so that the device can keep doing DMA, and userspace can keep accessing
@@ -779,12 +813,17 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_enable);
  * Return: 0 on success, or -EBUSY if the device has interrupts enabled or is
  * not in D0.
  */
-int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev)
+int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev,
+				    void *vconfig)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	int ret = 0;
 
-	/* igate serializes with SET_IRQS, memory_lock with power management. */
+	/*
+	 * liveupdate_lock serializes with configuration space writes, igate
+	 * with SET_IRQS, memory_lock with power management.
+	 */
+	down_write(&vdev->liveupdate_lock);
 	mutex_lock(&vdev->igate);
 	down_write(&vdev->memory_lock);
 
@@ -809,6 +848,9 @@ int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev)
 		goto out;
 	}
 
+	/* The device is open, since only bound files can be preserved. */
+	memcpy(vconfig, vdev->vconfig, pdev->cfg_size);
+
 	/*
 	 * Disabling MSI or MSI-X clears INTx Disable (see pci_intx_for_msi()),
 	 * so the device can typically assert INTx at this point. Nothing
@@ -826,6 +868,7 @@ int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev)
 out:
 	up_write(&vdev->memory_lock);
 	mutex_unlock(&vdev->igate);
+	up_write(&vdev->liveupdate_lock);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_liveupdate_freeze);
@@ -839,9 +882,11 @@ EXPORT_SYMBOL_GPL(vfio_pci_core_liveupdate_freeze);
  */
 void vfio_pci_core_liveupdate_unfreeze(struct vfio_pci_core_device *vdev)
 {
+	down_write(&vdev->liveupdate_lock);
 	mutex_lock(&vdev->igate);
 	WRITE_ONCE(vdev->liveupdate_frozen, false);
 	mutex_unlock(&vdev->igate);
+	up_write(&vdev->liveupdate_lock);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_liveupdate_unfreeze);
 
@@ -946,6 +991,18 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	vdev->num_regions = 0;
 	kfree(vdev->region);
 	vdev->region = NULL; /* don't krealloc a freed pointer */
+
+	/*
+	 * Keep the virtual configuration space of an incoming device for the
+	 * next open, like its saved state below.
+	 */
+	if (incoming) {
+		kfree(vdev->liveupdate_vconfig);
+		vdev->liveupdate_vconfig = kmemdup(vdev->vconfig, pdev->cfg_size,
+						   GFP_KERNEL);
+		if (!vdev->liveupdate_vconfig)
+			pci_warn(pdev, "Failed to keep virtual config space, the next open rebuilds it\n");
+	}
 
 	vfio_config_free(vdev);
 
@@ -1899,7 +1956,24 @@ static ssize_t vfio_pci_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 
 	switch (index) {
 	case VFIO_PCI_CONFIG_REGION_INDEX:
-		ret = vfio_pci_config_rw(vdev, buf, count, ppos, iswrite);
+		if (iswrite && vdev->liveupdate) {
+			/*
+			 * Synchronize with vfio_pci_core_liveupdate_freeze(),
+			 * which hands the virtual configuration space over to
+			 * the next kernel. This is taken for any device that
+			 * can be preserved, rather than only once it is, so
+			 * that preserving it can't race with a write.
+			 */
+			down_read(&vdev->liveupdate_lock);
+			if (vfio_pci_liveupdate_frozen(vdev))
+				ret = -EBUSY;
+			else
+				ret = vfio_pci_config_rw(vdev, buf, count, ppos,
+							 iswrite);
+			up_read(&vdev->liveupdate_lock);
+		} else {
+			ret = vfio_pci_config_rw(vdev, buf, count, ppos, iswrite);
+		}
 		break;
 
 	case VFIO_PCI_ROM_REGION_INDEX:
@@ -2445,6 +2519,7 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 		return ret;
 	INIT_LIST_HEAD(&vdev->dmabufs);
 	init_rwsem(&vdev->memory_lock);
+	init_rwsem(&vdev->liveupdate_lock);
 	xa_init(&vdev->ctx);
 
 	return 0;
@@ -2461,6 +2536,7 @@ void vfio_pci_core_release_dev(struct vfio_device *core_vdev)
 	kfree(vdev->region);
 	kfree(vdev->pm_save);
 	kfree(vdev->liveupdate_saved_state);
+	kfree(vdev->liveupdate_vconfig);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_release_dev);
 

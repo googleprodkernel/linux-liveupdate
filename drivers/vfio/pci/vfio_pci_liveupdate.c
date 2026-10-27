@@ -42,6 +42,21 @@
  * pci_saved_state_ser), so that closing the device after the Live Update
  * behaves exactly as it would have without one.
  *
+ * vfio-pci also passes the virtual configuration space it presents to
+ * userspace for the device (as of when the device file is frozen) to the next
+ * kernel. It differs from the device's configuration space in the registers
+ * vfio-pci emulates, e.g. the BARs and Expansion ROM BAR (as written by
+ * userspace, e.g. to size them), Interrupt Line, INTx Disable, PME Enable and
+ * Status, some Device Control fields, and the MSI and MSI-X capabilities, so
+ * it can't be rebuilt from the device. When userspace first opens the device,
+ * the next kernel builds the virtual configuration space as usual and then
+ * restores the bits of it that userspace can write and that vfio-pci emulates
+ * (according to the next kernel's emulation) from the previous kernel's.
+ * Everything else, e.g. the virtualized capability list, comes from the next
+ * kernel's emulation, which can differ from the previous kernel's. If the size
+ * of the previous kernel's virtual configuration space doesn't match the
+ * device's configuration space, it is ignored.
+ *
  * Everything else is re-derived when userspace first opens the device in the
  * next kernel, without resetting the device or writing to it:
  *
@@ -53,14 +68,10 @@
  *    which can therefore change across a Live Update if resetting the device
  *    failed in the previous kernel even though it supports a reset method.
  *
- *  * The virtual configuration space that vfio-pci presents to userspace,
- *    its map of capabilities, and the BAR values vfio-pci restores after a
- *    reset are rebuilt from the device, like for any first open. The device
- *    is not reset and the PCI core keeps its BARs, so these match the
- *    previous kernel's, except for values userspace wrote to registers that
- *    vfio-pci only emulates and does not write to the device, e.g. the BARs
- *    (as written to size them), Interrupt Line, and the emulated INTx Disable
- *    bit. Userspace must not rely on those across Live Update.
+ *  * The map of capabilities in the device's configuration space and the BAR
+ *    values vfio-pci restores after a reset are rebuilt from the device, like
+ *    for any first open. The device is not reset and the PCI core keeps its
+ *    BARs, so these match the previous kernel's.
  *
  *  * Interrupts must be disabled before kexec (see Freezing below), and
  *    userspace sets them up again after retrieving the device's file, along
@@ -86,8 +97,10 @@
  * Freezing does not stop the device: unlike closing the device, it does not
  * reset the device or clear its Bus Master Enable, so that the device can
  * keep doing DMA. Userspace can keep accessing the device (e.g. its BARs)
- * while it is frozen, but enabling interrupts fails with -EBUSY. If the Live
- * Update is aborted, the device file is unfrozen.
+ * while it is frozen, but enabling interrupts and writing to the device's
+ * configuration space, which would change the virtual configuration space
+ * passed to the next kernel, fail with -EBUSY. If the Live Update is aborted,
+ * the device file is unfrozen.
  *
  * The only thing freezing changes is INTx Disable, which it sets: disabling
  * MSI or MSI-X clears INTx Disable (see pci_intx_for_msi()), and nothing in
@@ -209,6 +222,9 @@ static void vfio_pci_liveupdate_unpreserve_ser(struct vfio_pci_core_device_ser *
 	if (ser->saved_state)
 		kho_unpreserve_free(phys_to_virt(ser->saved_state));
 
+	if (ser->vconfig)
+		kho_unpreserve_free(phys_to_virt(ser->vconfig));
+
 	kho_unpreserve_free(ser);
 }
 
@@ -218,7 +234,7 @@ static int vfio_pci_liveupdate_preserve(struct liveupdate_file_op_args *args)
 	struct pci_dev *pdev = vdev->pdev;
 	struct vfio_pci_core_device_ser *ser;
 	size_t saved_state_size;
-	void *saved_state;
+	void *saved_state, *vconfig;
 	int ret;
 
 	/*
@@ -261,6 +277,16 @@ static int vfio_pci_liveupdate_preserve(struct liveupdate_file_op_args *args)
 			goto err_free;
 	}
 
+	/* Filled in when the file is frozen, see vfio_pci_liveupdate_freeze(). */
+	vconfig = kho_alloc_preserve(pdev->cfg_size);
+	if (IS_ERR(vconfig)) {
+		ret = PTR_ERR(vconfig);
+		goto err_free;
+	}
+
+	ser->vconfig = virt_to_phys(vconfig);
+	ser->vconfig_size = pdev->cfg_size;
+
 	ret = pci_liveupdate_preserve(pdev);
 	if (ret) {
 		pci_err(pdev, "Failed to preserve device (%d)\n", ret);
@@ -288,13 +314,14 @@ static void vfio_pci_liveupdate_unpreserve(struct liveupdate_file_op_args *args)
 static int vfio_pci_liveupdate_freeze(struct liveupdate_file_op_args *args)
 {
 	struct vfio_pci_core_device *vdev = vfio_pci_liveupdate_vdev(args->file);
+	struct vfio_pci_core_device_ser *ser = phys_to_virt(args->serialized_data);
 	int ret;
 
 	ret = pci_liveupdate_freeze(vdev->pdev);
 	if (ret)
 		return ret;
 
-	ret = vfio_pci_core_liveupdate_freeze(vdev);
+	ret = vfio_pci_core_liveupdate_freeze(vdev, phys_to_virt(ser->vconfig));
 	if (ret)
 		pci_liveupdate_unfreeze(vdev->pdev);
 
@@ -311,8 +338,9 @@ static void vfio_pci_liveupdate_unfreeze(struct liveupdate_file_op_args *args)
 
 static int vfio_pci_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 {
-	struct folio *folio, *saved_state_folio = NULL;
+	struct folio *folio, *saved_state_folio = NULL, *vconfig_folio = NULL;
 	struct pci_saved_state *saved_state = NULL;
+	u8 *vconfig = NULL;
 	struct vfio_pci_core_device_ser *ser;
 	struct vfio_pci_core_device *vdev;
 	struct vfio_device *device = NULL;
@@ -335,9 +363,11 @@ static int vfio_pci_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 	ser = folio_address(folio);
 	if (ser->saved_state)
 		saved_state_folio = kho_restore_folio(ser->saved_state);
+	if (ser->vconfig)
+		vconfig_folio = kho_restore_folio(ser->vconfig);
 
-	if (ser->size < sizeof(*ser) || ser->size > folio_size(folio) ||
-	    ser->flags || ser->reserved) {
+	if (ser->size < VFIO_PCI_CORE_DEVICE_SER_MIN_SIZE ||
+	    ser->size > folio_size(folio) || ser->flags || ser->reserved) {
 		pr_err("Invalid preserved state for %04x:%02x:%02x.%d\n",
 		       ser->domain, PCI_BUS_NUM(ser->bdf),
 		       PCI_SLOT(ser->bdf & 0xff), PCI_FUNC(ser->bdf & 0xff));
@@ -347,6 +377,12 @@ static int vfio_pci_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 
 	if (ser->saved_state && !saved_state_folio) {
 		pr_err("Failed to restore saved state\n");
+		ret = -ENOENT;
+		goto out_free;
+	}
+
+	if (ser->vconfig && !vconfig_folio) {
+		pr_err("Failed to restore virtual config space\n");
 		ret = -ENOENT;
 		goto out_free;
 	}
@@ -374,25 +410,48 @@ static int vfio_pci_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 							  folio_size(saved_state_folio));
 		if (IS_ERR(saved_state)) {
 			ret = PTR_ERR(saved_state);
+			saved_state = NULL;
 			goto out_put;
 		}
 	}
 
 	/*
-	 * Hand the saved state to the first open of the device, which can only
-	 * happen through the retrieved file.
+	 * Without the virtual config space passed by the previous kernel, the
+	 * first open rebuilds it from the device, like for any first open.
+	 */
+	if (vconfig_folio) {
+		if (ser->vconfig_size != pdev->cfg_size ||
+		    ser->vconfig_size > folio_size(vconfig_folio)) {
+			pci_warn(pdev, "Ignoring preserved virtual config space of %u bytes\n",
+				 ser->vconfig_size);
+		} else {
+			vconfig = kmemdup(folio_address(vconfig_folio),
+					  ser->vconfig_size, GFP_KERNEL);
+			if (!vconfig) {
+				ret = -ENOMEM;
+				goto out_put;
+			}
+		}
+	}
+
+	/*
+	 * Hand the saved state and virtual config space to the first open of
+	 * the device, which can only happen through the retrieved file.
 	 */
 	vdev = container_of(device, struct vfio_pci_core_device, vdev);
 	scoped_guard(mutex, &device->dev_set->lock) {
 		if (!device->liveupdate_incoming || device->open_count) {
 			pci_err(pdev, "Device is not preserved by the previous kernel\n");
-			kfree(saved_state);
 			ret = -EINVAL;
 			goto out_put;
 		}
 
 		kfree(vdev->liveupdate_saved_state);
 		vdev->liveupdate_saved_state = saved_state;
+		saved_state = NULL;
+		kfree(vdev->liveupdate_vconfig);
+		vdev->liveupdate_vconfig = vconfig;
+		vconfig = NULL;
 	}
 
 	file = vfio_device_cdev_open_file(device);
@@ -404,10 +463,14 @@ static int vfio_pci_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 	args->file = file;
 	ret = 0;
 out_put:
+	kfree(vconfig);
+	kfree(saved_state);
 	if (device)
 		vfio_device_put_registration(device);
 	pci_dev_put(pdev);
 out_free:
+	if (vconfig_folio)
+		folio_put(vconfig_folio);
 	if (saved_state_folio)
 		folio_put(saved_state_folio);
 	folio_put(folio);

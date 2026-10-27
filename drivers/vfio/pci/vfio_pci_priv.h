@@ -112,6 +112,9 @@ static inline bool vfio_pci_liveupdate_preserved(struct vfio_pci_core_device *vd
 #ifdef CONFIG_VFIO_PCI_LIVEUPDATE
 extern const struct vfio_device_ops vfio_pci_ops;
 
+void vfio_config_restore_virt(struct vfio_pci_core_device *vdev,
+			      const u8 *vconfig);
+
 void vfio_pci_liveupdate_init(void);
 void vfio_pci_liveupdate_cleanup(void);
 #else

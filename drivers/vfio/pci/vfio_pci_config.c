@@ -1883,6 +1883,66 @@ out:
 	return pcibios_err_to_errno(ret);
 }
 
+#if IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE)
+/**
+ * vfio_config_restore_virt - Restore user-written virtual config space bits
+ * @vdev: The device, after vfio_config_init()
+ * @vconfig: A virtual configuration space of the device saved earlier (e.g.
+ *           by the previous kernel), of pci_dev.cfg_size bytes
+ *
+ * Restore the bits of @vconfig that userspace can write and that vfio-pci
+ * only emulates (i.e. virtualized and writable according to this kernel's
+ * permissions, like the BARs or Interrupt Line), and keep everything else as
+ * vfio_config_init() built it. In particular, the read-only virtualized bits
+ * (e.g. capability list pointers rewritten to hide capabilities) come from
+ * this kernel's emulation, which may differ from the one @vconfig was saved
+ * with.
+ */
+void vfio_config_restore_virt(struct vfio_pci_core_device *vdev,
+			      const u8 *vconfig)
+{
+	int pos;
+
+	for (pos = 0; pos < vdev->pdev->cfg_size; pos++) {
+		u8 cap_id = vdev->pci_config_map[pos];
+		struct perm_bits *perm;
+		int cap_start;
+		u8 mask;
+
+		/* Unassigned bytes are passed through to the device. */
+		if (cap_id == PCI_CAP_ID_INVALID)
+			continue;
+
+		if (cap_id == PCI_CAP_ID_INVALID_VIRT) {
+			/* Fully virtualized and writable, see virt_perms */
+			mask = 0xff;
+		} else {
+			if (pos >= PCI_CFG_SPACE_SIZE) {
+				/* direct_ro_perms, see vfio_pci_config_rw_single() */
+				if (cap_id > PCI_EXT_CAP_ID_MAX)
+					continue;
+				perm = &ecap_perms[cap_id];
+			} else if (cap_id == PCI_CAP_ID_MSI) {
+				perm = vdev->msi_perm;
+			} else {
+				perm = &cap_perms[cap_id];
+			}
+
+			if (!perm || !perm->virt || !perm->write)
+				continue;
+
+			cap_start = cap_id == PCI_CAP_ID_BASIC && pos < PCI_CFG_SPACE_SIZE ?
+				    0 : vfio_find_cap_start(vdev, pos);
+			mask = perm->virt[pos - cap_start] &
+			       perm->write[pos - cap_start];
+		}
+
+		vdev->vconfig[pos] &= ~mask;
+		vdev->vconfig[pos] |= vconfig[pos] & mask;
+	}
+}
+#endif
+
 void vfio_config_free(struct vfio_pci_core_device *vdev)
 {
 	kfree(vdev->vconfig);

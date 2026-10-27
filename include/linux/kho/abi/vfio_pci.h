@@ -9,6 +9,7 @@
 #define _LINUX_KHO_ABI_VFIO_PCI_H
 
 #include <linux/compiler.h>
+#include <linux/stddef.h>
 #include <linux/types.h>
 
 /**
@@ -51,6 +52,12 @@
  *               device was in when it was first opened (right after it was
  *               reset), serialized as a struct pci_saved_state_ser (see
  *               include/linux/kho/abi/pci.h), which records its own size.
+ * @vconfig: The physical address of the virtual configuration space that
+ *           vfio-pci presented to userspace for the device when it was
+ *           frozen (vfio_pci_core_device.vconfig), preserved with KHO, or 0
+ *           if none was preserved.
+ * @vconfig_size: The size of @vconfig in bytes, i.e. the size of the device's
+ *                configuration space.
  */
 struct vfio_pci_core_device_ser {
 	u32 size;
@@ -59,6 +66,16 @@ struct vfio_pci_core_device_ser {
 	u16 bdf;
 	u16 reserved;
 	u64 saved_state;
+	u64 vconfig;
+	u32 vconfig_size;
 } __packed;
+
+/*
+ * The size of struct vfio_pci_core_device_ser when this ABI was introduced.
+ * Since fields can only be appended, every struct vfio_pci_core_device_ser is
+ * at least this large.
+ */
+#define VFIO_PCI_CORE_DEVICE_SER_MIN_SIZE \
+	offsetofend(struct vfio_pci_core_device_ser, vconfig_size)
 
 #endif /* _LINUX_KHO_ABI_VFIO_PCI_H */

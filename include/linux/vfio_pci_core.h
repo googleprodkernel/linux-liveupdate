@@ -144,6 +144,10 @@ struct vfio_pci_core_device {
 	struct pci_saved_state	*pci_saved_state;
 	/* pci_saved_state passed by the previous kernel, until first open */
 	struct pci_saved_state	*liveupdate_saved_state;
+	/* vconfig passed by the previous kernel, until first open */
+	u8			*liveupdate_vconfig;
+	/* Serializes config space writes with Live Update freezing */
+	struct rw_semaphore	liveupdate_lock;
 	struct pci_saved_state	*pm_save;
 	int			ioeventfds_nr;
 	struct vfio_pci_eventfd __rcu *err_trigger;
@@ -201,7 +205,8 @@ int vfio_pci_core_match_token_uuid(struct vfio_device *core_vdev,
 				   const uuid_t *uuid);
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev);
 #if IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE)
-int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev);
+int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev,
+				    void *vconfig);
 void vfio_pci_core_liveupdate_unfreeze(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_liveupdate_finish(struct vfio_pci_core_device *vdev);
 #endif
