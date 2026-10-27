@@ -243,6 +243,59 @@ static void dsa_init(struct vfio_pci_device *device)
 	device->driver.msi = MSIX_VECTOR;
 }
 
+/*
+ * Take over a device that dsa_init() set up in a previous kernel, before a
+ * Live Update, without resetting or reprogramming it. struct dsa_state is in
+ * driver->region, which must be mapped at the same device address as before,
+ * so descriptors and completion records of a memcpy started before the Live
+ * Update are still where the device expects them.
+ *
+ * Check that the device is still enabled and configured the way dsa_init()
+ * left it, which would not be the case if it was reset across the Live
+ * Update.
+ *
+ * Interrupts are expected to be disabled (VFIO does not preserve them), so
+ * MSI-X must be re-enabled through VFIO before using send_msi().
+ */
+static void dsa_resume(struct vfio_pci_device *device)
+{
+	struct dsa_state *dsa = to_dsa_state(device);
+	void *bar0 = device->bars[0].vaddr;
+	union gensts_reg gensts;
+	union wqcfg wqcfg;
+	int i;
+
+	VFIO_ASSERT_GE(device->driver.region.size, sizeof(*dsa));
+
+	/* Only reads registers, and updates the pointers into BAR 0. */
+	dsa_register_cache_init(device);
+	dsa_check_sw_err(device);
+
+	gensts.bits = readl(bar0 + IDXD_GENSTATS_OFFSET);
+	VFIO_ASSERT_EQ((u32)gensts.state, (u32)IDXD_DEVICE_STATE_ENABLED,
+		       "Device is not enabled (GENSTS 0x%x)\n", gensts.bits);
+
+	for (i = 0; i < ARRAY_SIZE(wqcfg.bits); i++)
+		wqcfg.bits[i] = readl(dsa->wqcfg_table + offsetof(union wqcfg, bits[i]));
+
+	VFIO_ASSERT_EQ((u32)wqcfg.wq_state, 1U, "WQ 0 is not enabled\n");
+	VFIO_ASSERT_EQ((u32)wqcfg.wq_size, (u32)dsa->wq_cap.total_wq_size);
+	VFIO_ASSERT_EQ((u32)wqcfg.mode, 1U);
+	VFIO_ASSERT_EQ((u32)wqcfg.priority, 1U);
+	VFIO_ASSERT_EQ((u32)wqcfg.max_xfer_shift, (u32)dsa->gen_cap.max_xfer_shift);
+	VFIO_ASSERT_EQ((u32)wqcfg.max_batch_shift, (u32)dsa->gen_cap.max_batch_shift);
+	VFIO_ASSERT_EQ(wqcfg.op_config[0] & (BIT(DSA_OPCODE_MEMMOVE) | BIT(DSA_OPCODE_BATCH)),
+		       BIT(DSA_OPCODE_MEMMOVE) | BIT(DSA_OPCODE_BATCH));
+
+	VFIO_ASSERT_EQ(readq(dsa->grpcfg_table + offsetof(struct grpcfg, wqs[0])), 1);
+	VFIO_ASSERT_EQ(readq(dsa->grpcfg_table + offsetof(struct grpcfg, engines)), 1);
+
+	device->driver.max_memcpy_count =
+		dsa->max_batches * dsa->max_copies_per_batch;
+	device->driver.max_memcpy_size = 1UL << dsa->gen_cap.max_xfer_shift;
+	device->driver.msi = MSIX_VECTOR;
+}
+
 static void dsa_remove(struct vfio_pci_device *device)
 {
 	dsa_command(device, IDXD_CMD_RESET_DEVICE);
@@ -420,6 +473,7 @@ const struct vfio_pci_driver_ops dsa_ops = {
 	.name = "dsa",
 	.probe = dsa_probe,
 	.init = dsa_init,
+	.resume = dsa_resume,
 	.remove = dsa_remove,
 	.memcpy_start = dsa_memcpy_start,
 	.memcpy_wait = dsa_memcpy_wait,
