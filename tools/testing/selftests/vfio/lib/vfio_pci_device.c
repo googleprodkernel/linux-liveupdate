@@ -245,18 +245,29 @@ static void vfio_pci_bar_unmap_all(struct vfio_pci_device *device)
 	}
 }
 
-void vfio_pci_config_access(struct vfio_pci_device *device, bool write,
-			    size_t config, size_t size, void *data)
+int __vfio_pci_config_access(struct vfio_pci_device *device, bool write,
+			     size_t config, size_t size, void *data)
 {
 	struct vfio_region_info *config_space = &device->config_space;
-	int ret;
+	ssize_t ret;
 
 	if (write)
 		ret = pwrite(device->fd, data, size, config_space->offset + config);
 	else
 		ret = pread(device->fd, data, size, config_space->offset + config);
 
-	VFIO_ASSERT_EQ(ret, size, "Failed to %s PCI config space: 0x%lx\n",
+	if (ret < 0)
+		return -errno;
+
+	return ret == size ? 0 : -EIO;
+}
+
+void vfio_pci_config_access(struct vfio_pci_device *device, bool write,
+			    size_t config, size_t size, void *data)
+{
+	int ret = __vfio_pci_config_access(device, write, config, size, data);
+
+	VFIO_ASSERT_EQ(ret, 0, "Failed to %s PCI config space: 0x%lx\n",
 		       write ? "write to" : "read from", config);
 }
 
