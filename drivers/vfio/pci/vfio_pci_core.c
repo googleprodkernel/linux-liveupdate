@@ -2388,9 +2388,15 @@ int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)
 		return -EBUSY;
 	}
 
+	/*
+	 * Device sets are static, so ignore that the PCI core refuses to reset
+	 * devices preserved across Live Update until they finish participating
+	 * in it, so that a preserved device ends up in the same set after Live
+	 * Update as before.
+	 */
 	if (pci_is_root_bus(pdev->bus) || pdev->is_virtfn) {
 		ret = vfio_assign_device_set(&vdev->vdev, vdev);
-	} else if (!pci_probe_reset_slot(pdev->slot)) {
+	} else if (pci_slot_reset_supported(pdev->slot)) {
 		ret = vfio_assign_device_set(&vdev->vdev, pdev->slot);
 	} else {
 		/*
