@@ -478,8 +478,13 @@ void vfio_pci_cdev_open(struct vfio_pci_device *device, const char *bdf)
 	free((void *)cdev_path);
 }
 
+/*
+ * Bind the device to the iommufd and attach it to the IOAS. Use @cdev_fd if it
+ * is >= 0, otherwise open the device's cdev.
+ */
 static void vfio_pci_iommufd_setup(struct vfio_pci_device *device,
-				   const char *bdf, const char *vf_token)
+				   const char *bdf, const char *vf_token,
+				   int cdev_fd)
 {
 	bool noiommu = vfio_pci_cdev_is_noiommu(bdf);
 
@@ -492,7 +497,11 @@ static void vfio_pci_iommufd_setup(struct vfio_pci_device *device,
 		       "%s is %sa noiommu device, but IOMMU mode is %s\n", bdf,
 		       noiommu ? "" : "not ", device->iommu->mode->name);
 
-	vfio_pci_cdev_open(device, bdf);
+	if (cdev_fd >= 0)
+		device->fd = cdev_fd;
+	else
+		vfio_pci_cdev_open(device, bdf);
+
 	vfio_device_bind_iommufd(device->fd, device->iommu->iommufd, vf_token);
 	vfio_device_attach_iommufd_pt(device->fd, device->iommu->ioas_id);
 }
@@ -524,8 +533,26 @@ struct vfio_pci_device *vfio_pci_device_init(const char *bdf, struct iommu *iomm
 	if (iommu->mode->container_path)
 		vfio_pci_container_setup(device, bdf, NULL);
 	else
-		vfio_pci_iommufd_setup(device, bdf, NULL);
+		vfio_pci_iommufd_setup(device, bdf, NULL, -1);
 
+	vfio_pci_device_setup(device);
+	vfio_pci_driver_probe(device);
+
+	return device;
+}
+
+struct vfio_pci_device *vfio_pci_device_init_cdev(const char *bdf,
+						  struct iommu *iommu,
+						  int cdev_fd)
+{
+	struct vfio_pci_device *device;
+
+	VFIO_ASSERT_NULL(iommu->mode->container_path,
+			 "A VFIO cdev requires an iommufd IOMMU mode\n");
+	VFIO_ASSERT_GE(cdev_fd, 0);
+
+	device = vfio_pci_device_alloc(bdf, iommu);
+	vfio_pci_iommufd_setup(device, bdf, NULL, cdev_fd);
 	vfio_pci_device_setup(device);
 	vfio_pci_driver_probe(device);
 
