@@ -22,6 +22,8 @@ TEST_NAMES=(
 	"luo_stress_sessions"
 	"pci/luo_pci"
 	"pci/luo_pci_auto_pf"
+	"vfio/vfio_pci_liveupdate_kexec_test"
+	"vfio/vfio_pci_liveupdate_kexec_test_vf"
 )
 
 function usage() {

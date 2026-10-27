@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# vmtest.sh settings for vfio/vfio_pci_liveupdate_kexec_test_vf: Same as
+# vfio/vfio_pci_liveupdate_kexec_test, but preserve a VF of the igb (bound to
+# pci-pf-stub by the test), which the PCI core preserves automatically.
+
+source "$test_dir/vfio/vfio_pci_liveupdate_kexec_test.vmtest"
+
+VMTEST_ARGS="-v $VMTEST_DEVICE"

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# vmtest.sh settings for vfio/vfio_pci_liveupdate_kexec_test, sourced by
+# vmtest.sh.
+#
+# Runs vfio_pci_liveupdate_kexec_test from the VFIO selftests on an igb behind
+# a root port, bound to vfio-pci in noiommu mode (there is no vIOMMU). The test
+# uses the VFIO selftests igb driver to do DMA before and after kexec.
+
+if [[ "$arch" != "x86" ]]; then
+	skip "vfio_pci_liveupdate_kexec_test is only set up for x86"
+fi
+
+VMTEST_CONFIG="vfio/config"
+VMTEST_TIMEOUT="120s"
+
+# PCIe (root ports, SR-IOV) needs Q35 rather than i440FX.
+VMTEST_QEMU_ARGS="-M q35"
+VMTEST_QEMU_ARGS+=" -device pcie-root-port,id=rp0,chassis=1,slot=1"
+VMTEST_QEMU_ARGS+=" -device igb,bus=rp0,addr=0.0"
+
+# The igb behind the root port.
+VMTEST_DEVICE="0000:01:00.0"
+VMTEST_ARGS="$VMTEST_DEVICE"
+
+# vfio-pci must be able to bind to the device in noiommu mode in both kernels,
+# and the memfd with the DMA buffers must be backed by THPs so that the buffers
+# are physically contiguous.
+VMTEST_CMDLINE="vfio.enable_unsafe_noiommu_mode=1 vfio_pci.ids=8086:10c9"
+VMTEST_CMDLINE+=" transparent_hugepage_shmem=always"
+
+# The VFIO selftests use libc, so build the test statically instead of with
+# nolibc.
+function vmtest_build_test_binary() {
+	local test=vfio_pci_liveupdate_kexec_test
+	local out="$workspace_dir/vfio"
+
+	mkdir -p "$out"
+	make -s -C "$kernel_dir/tools/testing/selftests/vfio" \
+		ARCH="$arch" CC="${CROSS_COMPILE}gcc" OUTPUT="$out" \
+		KHDR_INCLUDES="-isystem $headers_dir/include" \
+		EXTRA_CFLAGS=-static "$out/$test"
+	cp "$out/$test" "$workspace_dir/test_binary"
+}
