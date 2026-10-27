@@ -26,6 +26,11 @@
  *
  * The device's state (configuration space, BARs, etc.) is checked by
  * userspace through sysfs, see luo_pci.c.
+ *
+ * pci-lu-test also passes the device's saved state (pci_store_saved_state())
+ * to the next kernel, serialized with pci_saved_state_serialize(), the way a
+ * driver like vfio-pci would, and lets userspace check what the next kernel
+ * gets back from pci_saved_state_deserialize().
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -44,19 +49,35 @@
 
 #include "../pci_lu_test_uapi.h"
 
-#define PCI_LU_TEST_FH_COMPATIBLE	"pci-lu-test-v1"
+#define PCI_LU_TEST_FH_COMPATIBLE	"pci-lu-test-v2"
 #define PCI_LU_TEST_PF_MAGIC		0x5043504600000000ULL
 
-/* Serialized state of a preserved file, preserved with kho_alloc_preserve(). */
+/*
+ * Serialized state of a preserved file, preserved with kho_alloc_preserve().
+ * @saved_state is a struct pci_saved_state_ser of @saved_state_size bytes.
+ */
 struct pci_lu_test_ser {
 	u32 domain;
 	u16 dev_id;
+	u16 reserved;
+	u32 saved_state_size;
+	u8 saved_state[];
 } __packed;
 
-/* A file that represents (at most) one PCI device. */
+/*
+ * A file that represents (at most) one PCI device.
+ * @saved_ser: The device's saved state, serialized, of @saved_ser_size bytes.
+ *             For a preserved file, the state passed to the next kernel. For
+ *             a retrieved file, @saved_state serialized again.
+ * @saved_state: For a retrieved file, the saved state passed by the previous
+ *               kernel.
+ */
 struct pci_lu_test_file {
 	struct pci_dev *dev;
 	bool preserved;
+	void *saved_ser;
+	size_t saved_ser_size;
+	struct pci_saved_state *saved_state;
 };
 
 /* Driver data of a device bound to pci-lu-test. */
@@ -155,6 +176,59 @@ err_put:
 	return ret;
 }
 
+static long pci_lu_test_get_saved_state(struct pci_lu_test_file *file,
+					void __user *uarg)
+{
+	struct pci_lu_test_saved_state arg;
+	size_t size;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	if (arg.argsz < sizeof(arg))
+		return -EINVAL;
+
+	guard(mutex)(&pci_lu_test_lock);
+
+	if (!file->saved_ser)
+		return -ENODATA;
+
+	size = arg.size;
+	arg.size = file->saved_ser_size;
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+
+	if (size < file->saved_ser_size)
+		return -ENOSPC;
+
+	if (copy_to_user(u64_to_user_ptr(arg.buf), file->saved_ser,
+			 file->saved_ser_size))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long pci_lu_test_restore_saved_state(struct pci_lu_test_file *file)
+{
+	int ret;
+
+	guard(mutex)(&pci_lu_test_lock);
+
+	if (!file->dev || !file->saved_state)
+		return -ENODATA;
+
+	if (pci_liveupdate_is_preserved(file->dev))
+		return -EBUSY;
+
+	ret = pci_load_saved_state(file->dev, file->saved_state);
+	if (ret)
+		return ret;
+
+	pci_restore_state(file->dev);
+	pci_info(file->dev, "Restored saved state from the previous kernel\n");
+	return 0;
+}
+
 static long pci_lu_test_ioctl(struct file *filp, unsigned int cmd,
 			      unsigned long arg)
 {
@@ -163,6 +237,10 @@ static long pci_lu_test_ioctl(struct file *filp, unsigned int cmd,
 	switch (cmd) {
 	case PCI_LU_TEST_IOCTL_SET_DEVICE:
 		return pci_lu_test_set_device(file, (void __user *)arg);
+	case PCI_LU_TEST_IOCTL_GET_SAVED_STATE:
+		return pci_lu_test_get_saved_state(file, (void __user *)arg);
+	case PCI_LU_TEST_IOCTL_RESTORE_SAVED_STATE:
+		return pci_lu_test_restore_saved_state(file);
 	default:
 		return -ENOTTY;
 	}
@@ -171,6 +249,13 @@ static long pci_lu_test_ioctl(struct file *filp, unsigned int cmd,
 static struct pci_lu_test_file *pci_lu_test_file_alloc(void)
 {
 	return kzalloc(sizeof(struct pci_lu_test_file), GFP_KERNEL);
+}
+
+static void pci_lu_test_file_free(struct pci_lu_test_file *file)
+{
+	kfree(file->saved_state);
+	kfree(file->saved_ser);
+	kfree(file);
 }
 
 static int pci_lu_test_open(struct inode *inode, struct file *filp)
@@ -195,7 +280,7 @@ static int pci_lu_test_release(struct inode *inode, struct file *filp)
 		pci_lu_test_detach(file);
 	}
 
-	kfree(file);
+	pci_lu_test_file_free(file);
 	return 0;
 }
 
@@ -224,8 +309,11 @@ static bool pci_lu_test_can_preserve(struct liveupdate_file_handler *handler,
 static int pci_lu_test_preserve(struct liveupdate_file_op_args *args)
 {
 	struct pci_lu_test_file *file = args->file->private_data;
+	struct pci_saved_state *state;
 	struct pci_lu_test_ser *ser;
 	struct pci_dev *dev;
+	void *saved_ser;
+	size_t size;
 	int ret;
 
 	guard(mutex)(&pci_lu_test_lock);
@@ -237,24 +325,52 @@ static int pci_lu_test_preserve(struct liveupdate_file_op_args *args)
 	if (!pci_lu_test_bound(dev))
 		return -EINVAL;
 
-	ser = kho_alloc_preserve(sizeof(*ser));
-	if (IS_ERR(ser))
-		return PTR_ERR(ser);
+	/* Pass the device's current state, like vfio-pci passes its initial state. */
+	pci_save_state(dev);
+	state = pci_store_saved_state(dev);
+	if (!state)
+		return -ENOMEM;
+
+	size = pci_saved_state_ser_size(state);
+	ser = kho_alloc_preserve(struct_size(ser, saved_state, size));
+	if (IS_ERR(ser)) {
+		ret = PTR_ERR(ser);
+		goto out_free_state;
+	}
 
 	ser->domain = pci_domain_nr(dev->bus);
 	ser->dev_id = pci_dev_id(dev);
+	ser->saved_state_size = size;
+
+	ret = pci_saved_state_serialize(state, (void *)ser->saved_state, size);
+	if (ret)
+		goto err_free_ser;
+
+	saved_ser = kmemdup(ser->saved_state, size, GFP_KERNEL);
+	if (!saved_ser) {
+		ret = -ENOMEM;
+		goto err_free_ser;
+	}
 
 	ret = pci_liveupdate_preserve(dev);
 	if (ret) {
 		pci_err(dev, "Failed to preserve device (%d)\n", ret);
-		kho_unpreserve_free(ser);
-		return ret;
+		kfree(saved_ser);
+		goto err_free_ser;
 	}
 
-	pci_info(dev, "Preserved device\n");
+	pci_info(dev, "Preserved device (%zu bytes of saved state)\n", size);
 	file->preserved = true;
+	file->saved_ser = saved_ser;
+	file->saved_ser_size = size;
 	args->serialized_data = virt_to_phys(ser);
-	return 0;
+	goto out_free_state;
+
+err_free_ser:
+	kho_unpreserve_free(ser);
+out_free_state:
+	kfree(state);
+	return ret;
 }
 
 static void pci_lu_test_unpreserve(struct liveupdate_file_op_args *args)
@@ -267,6 +383,9 @@ static void pci_lu_test_unpreserve(struct liveupdate_file_op_args *args)
 	pci_liveupdate_unpreserve(file->dev);
 	kho_unpreserve_free(phys_to_virt(args->serialized_data));
 	file->preserved = false;
+	kfree(file->saved_ser);
+	file->saved_ser = NULL;
+	file->saved_ser_size = 0;
 }
 
 static int pci_lu_test_freeze(struct liveupdate_file_op_args *args)
@@ -304,8 +423,122 @@ static struct pci_dev *pci_lu_test_args_dev(struct liveupdate_file_op_args *args
 	return pci_dev_get(file->dev);
 }
 
+/*
+ * Check that pci_saved_state_deserialize() refuses a malformed @ser, and drops
+ * a register that is not saved for @dev rather than refusing @ser.
+ */
+static int pci_lu_test_check_deserialize(struct pci_dev *dev,
+					 const struct pci_saved_state_ser *ser,
+					 size_t size)
+{
+	unsigned int dword, extra, i = 0, j = 0;
+	struct pci_saved_state_ser *bad;
+	struct pci_saved_state *state;
+	size_t bad_size;
+	int ret = 0;
+
+	bad_size = size + sizeof(u32);
+	bad = kzalloc(bad_size, GFP_KERNEL);
+	if (!bad)
+		return -ENOMEM;
+
+	memcpy(bad, ser, size);
+	bad->flags = 1;
+	state = pci_saved_state_deserialize(dev, bad, size);
+	if (!IS_ERR(state) || PTR_ERR(state) != -EINVAL) {
+		pci_err(dev, "Saved state with unknown flags not refused\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* Add the first register after the header that is not saved. */
+	for (extra = PCI_STD_HEADER_SIZEOF / 4; extra < PCI_CFG_SPACE_EXP_SIZE / 4; extra++) {
+		if (!(ser->dword_map[extra / 64] & BIT_ULL(extra % 64)))
+			break;
+	}
+
+	/* Every register is saved, so there is none to add. */
+	if (extra == PCI_CFG_SPACE_EXP_SIZE / 4)
+		goto out;
+
+	memcpy(bad, ser, offsetof(struct pci_saved_state_ser, dword_val));
+	bad->size = bad_size;
+	bad->nr_dwords++;
+	bad->dword_map[extra / 64] |= BIT_ULL(extra % 64);
+	for (dword = 0; dword < PCI_CFG_SPACE_EXP_SIZE / 4; dword++) {
+		if (dword == extra)
+			bad->dword_val[j++] = 0xdeadbeef;
+		else if (ser->dword_map[dword / 64] & BIT_ULL(dword % 64))
+			bad->dword_val[j++] = ser->dword_val[i++];
+	}
+
+	state = pci_saved_state_deserialize(dev, bad, bad_size);
+	if (IS_ERR(state)) {
+		pci_err(dev, "Saved state with an extra register refused (%ld)\n",
+			PTR_ERR(state));
+		ret = PTR_ERR(state);
+		goto out;
+	}
+
+	memset(bad, 0, bad_size);
+	ret = pci_saved_state_serialize(state, bad, size);
+	if (!ret && memcmp(bad, ser, size)) {
+		pci_err(dev, "Extra register at %#x not dropped\n", extra * 4);
+		ret = -EINVAL;
+	}
+
+	kfree(state);
+out:
+	kfree(bad);
+	return ret;
+}
+
+/*
+ * Get the saved state passed by the previous kernel for @dev, and serialize it
+ * again for PCI_LU_TEST_IOCTL_GET_SAVED_STATE.
+ */
+static int pci_lu_test_retrieve_saved_state(struct pci_lu_test_file *file,
+					    struct pci_dev *dev,
+					    const struct pci_lu_test_ser *ser)
+{
+	struct pci_saved_state *state;
+	void *saved_ser;
+	size_t size;
+	int ret;
+
+	ret = pci_lu_test_check_deserialize(dev, (const void *)ser->saved_state,
+					    ser->saved_state_size);
+	if (ret)
+		return ret;
+
+	state = pci_saved_state_deserialize(dev, (const void *)ser->saved_state,
+					    ser->saved_state_size);
+	if (IS_ERR(state))
+		return PTR_ERR(state);
+
+	size = pci_saved_state_ser_size(state);
+	saved_ser = kmalloc(size, GFP_KERNEL);
+	if (!saved_ser) {
+		kfree(state);
+		return -ENOMEM;
+	}
+
+	ret = pci_saved_state_serialize(state, saved_ser, size);
+	if (ret) {
+		kfree(saved_ser);
+		kfree(state);
+		return ret;
+	}
+
+	file->saved_state = state;
+	file->saved_ser = saved_ser;
+	file->saved_ser_size = size;
+	return 0;
+}
+
 static int pci_lu_test_retrieve(struct liveupdate_file_op_args *args)
 {
+	const struct pci_lu_test_ser *ser = phys_to_virt(args->serialized_data);
 	struct pci_lu_test_file *file;
 	struct file *filp;
 	struct pci_dev *dev;
@@ -325,6 +558,12 @@ static int pci_lu_test_retrieve(struct liveupdate_file_op_args *args)
 	if (!file) {
 		ret = -ENOMEM;
 		goto err_put;
+	}
+
+	ret = pci_lu_test_retrieve_saved_state(file, dev, ser);
+	if (ret) {
+		pci_err(dev, "Failed to get saved state (%d)\n", ret);
+		goto err_free;
 	}
 
 	scoped_guard(mutex, &pci_lu_test_lock) {
@@ -349,17 +588,18 @@ static int pci_lu_test_retrieve(struct liveupdate_file_op_args *args)
 	 */
 	kho_restore_free(phys_to_virt(args->serialized_data));
 
-	pci_info(dev, "Retrieved device\n");
+	pci_info(dev, "Retrieved device (%zu bytes of saved state)\n",
+		 file->saved_ser_size);
 	args->file = filp;
 	return 0;
 
 err_detach:
 	scoped_guard(mutex, &pci_lu_test_lock)
 		pci_lu_test_detach(file);
-	kfree(file);
+	pci_lu_test_file_free(file);
 	return ret;
 err_free:
-	kfree(file);
+	pci_lu_test_file_free(file);
 err_put:
 	pci_dev_put(dev);
 	return ret;

@@ -35,4 +35,36 @@ struct pci_lu_test_set_device {
 #define PCI_LU_TEST_IOCTL_SET_DEVICE \
 	_IOW('P', 0x70, struct pci_lu_test_set_device)
 
+/**
+ * struct pci_lu_test_saved_state - Argument of PCI_LU_TEST_IOCTL_GET_SAVED_STATE
+ * @argsz: sizeof(struct pci_lu_test_saved_state)
+ * @size: In: size of the buffer at @buf. Out: size of the saved state.
+ * @buf: Pointer to a buffer receiving the saved state
+ *
+ * Get the saved state of the device associated with the file, serialized as a
+ * struct pci_saved_state_ser (include/linux/kho/abi/pci.h). Before kexec, this
+ * is the state saved when the file was preserved, as passed to the next
+ * kernel. After kexec, this is the state passed by the previous kernel, as
+ * deserialized when the file was retrieved, serialized again.
+ *
+ * Fails with ENODATA if the file has no saved state (i.e. it was neither
+ * preserved nor retrieved), or ENOSPC (with @size set) if @buf is too small.
+ */
+struct pci_lu_test_saved_state {
+	__u32 argsz;
+	__u32 size;
+	__u64 buf;
+};
+
+#define PCI_LU_TEST_IOCTL_GET_SAVED_STATE \
+	_IOWR('P', 0x71, struct pci_lu_test_saved_state)
+
+/*
+ * Load the saved state passed by the previous kernel into the device
+ * associated with a retrieved file, with pci_load_saved_state(), and restore
+ * it with pci_restore_state(). Fails with EBUSY while the device is still
+ * preserved, and ENODATA if the file has no such saved state.
+ */
+#define PCI_LU_TEST_IOCTL_RESTORE_SAVED_STATE	_IO('P', 0x72)
+
 #endif /* _PCI_LU_TEST_UAPI_H */

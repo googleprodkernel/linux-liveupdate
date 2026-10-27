@@ -24,6 +24,12 @@
  * devices, and checks again. Stage 2 takes the list of devices from the
  * snapshot, so DEVICE arguments are ignored.
  *
+ * pci-lu-test also passes the saved state of each preserved device
+ * (pci_store_saved_state()) to the next kernel. Stage 1 checks that it matches
+ * the device's configuration space, and stage 2 checks that the next kernel
+ * gets back exactly the same state, and that it can be restored once the
+ * device is no longer preserved.
+ *
  * With LUO_PCI_AUTO_PF (luo_pci_auto_pf), PFs with VFs are not preserved
  * explicitly, only their VFs, and the PCI core preserves the PFs automatically
  * since pci-lu-test supports Live Update as a PF driver.
@@ -63,6 +69,19 @@
 #define CFG_SIZE		PCI_CFG_SPACE_EXP_SIZE
 #define RESOURCE_SIZE		2048
 #define DEFAULT_NUMVFS		2
+#define SAVED_STATE_SIZE	(sizeof(struct saved_state_ser) + CFG_SIZE)
+
+/*
+ * Serialized saved state of a device, struct pci_saved_state_ser in
+ * include/linux/kho/abi/pci.h, which is not exported to userspace.
+ */
+struct saved_state_ser {
+	__u32 size;
+	__u16 nr_dwords;
+	__u16 flags;
+	__u64 dword_map[CFG_SIZE / 4 / 64];
+	__u32 dword_val[];
+} __attribute__((packed));
 
 /* QEMU devices selected when no DEVICE is given. */
 static const char * const default_ids[] = {
@@ -87,6 +106,9 @@ struct snapshot {
 	/* PFs that are not preserved explicitly (LUO_PCI_AUTO_PF). */
 	bool auto_pf[MAX_DEVICES];
 	struct node nodes[MAX_NODES];
+	/* Saved state passed to the next kernel for each preserved device. */
+	unsigned int saved_size[MAX_DEVICES];
+	unsigned char saved[MAX_DEVICES][SAVED_STATE_SIZE];
 };
 
 static char devices[MAX_DEVICES][BDF_LEN];
@@ -749,6 +771,88 @@ static int open_device(const char *bdf)
 	return fd;
 }
 
+/* Get the saved state of the device of @fd into @buf, return its size. */
+static unsigned int get_saved_state(int fd, const char *bdf, void *buf)
+{
+	struct pci_lu_test_saved_state arg = {
+		.argsz = sizeof(arg),
+		.size = SAVED_STATE_SIZE,
+		.buf = (unsigned long)buf,
+	};
+
+	if (ioctl(fd, PCI_LU_TEST_IOCTL_GET_SAVED_STATE, &arg))
+		fail_exit("PCI_LU_TEST_IOCTL_GET_SAVED_STATE(%s)", bdf);
+
+	if (arg.size < sizeof(struct saved_state_ser))
+		fail_exit("%s: saved state too small (%u bytes)", bdf, arg.size);
+
+	return arg.size;
+}
+
+/*
+ * Check that the saved state @buf of @size bytes is well formed and matches
+ * the configuration space of the device in @node (at the bits that must not
+ * change, see build_mask()).
+ */
+static int check_saved_state(const struct node *node, const void *buf,
+			     unsigned int size)
+{
+	const struct saved_state_ser *ser = buf;
+	unsigned int dword, i = 0, nr_dwords = 0;
+	unsigned char mask[CFG_SIZE];
+	int errors = 0;
+
+	if (ser->size != size || ser->flags ||
+	    size != sizeof(*ser) + ser->nr_dwords * sizeof(__u32)) {
+		ksft_print_msg("%s: malformed saved state (size %u, nr_dwords %u, flags %#x, %u bytes)\n",
+			       node->bdf, ser->size, ser->nr_dwords, ser->flags,
+			       size);
+		return 1;
+	}
+
+	build_mask(node, mask);
+
+	for (dword = 0; dword < CFG_SIZE / 4; dword++) {
+		unsigned int off = dword * 4, val, cfg, m;
+
+		if (!(ser->dword_map[dword / 64] & (1ULL << (dword % 64)))) {
+			if (dword < PCI_STD_HEADER_SIZEOF / 4) {
+				ksft_print_msg("%s: header DWORD %#x not saved\n",
+					       node->bdf, off);
+				errors++;
+			}
+			continue;
+		}
+
+		if (++nr_dwords > ser->nr_dwords)
+			break;
+
+		val = ser->dword_val[i++];
+		if (off + 4 > node->cfg_len) {
+			ksft_print_msg("%s: saved DWORD %#x is beyond config space\n",
+				       node->bdf, off);
+			errors++;
+			continue;
+		}
+
+		cfg = cfg_dword(node->cfg, off);
+		m = cfg_dword(mask, off);
+		if ((val ^ cfg) & m) {
+			ksft_print_msg("%s: saved DWORD %#x is %#010x, config space has %#010x\n",
+				       node->bdf, off, val, cfg);
+			errors++;
+		}
+	}
+
+	if (nr_dwords != ser->nr_dwords) {
+		ksft_print_msg("%s: saved state has %u DWORDs, expected %u\n",
+			       node->bdf, nr_dwords, ser->nr_dwords);
+		errors++;
+	}
+
+	return errors;
+}
+
 static void session_name(char *buf, size_t len, int i)
 {
 	snprintf(buf, len, "luo_pci_%d", i);
@@ -790,12 +894,6 @@ static void run_stage_1(int luo_fd)
 		snap->auto_pf[i] = find_node(snap, devices[i])->numvfs > 0;
 #endif
 
-	session_fd = luo_create_session(luo_fd, SNAPSHOT_SESSION_NAME);
-	if (session_fd < 0 ||
-	    memfd_preserve_buf(session_fd, SNAPSHOT_MEMFD_TOKEN, snap,
-			       sizeof(*snap)) < 0)
-		fail_exit("Failed to preserve snapshot");
-
 	/* One session per device, in order, so that PFs are frozen before VFs. */
 	for (i = 0; i < nr_devices; i++) {
 		if (snap->auto_pf[i]) {
@@ -815,7 +913,23 @@ static void run_stage_1(int luo_fd)
 
 		ksft_print_msg("[STAGE 1] Preserved %s in session %s\n",
 			       devices[i], name);
+
+		snap->saved_size[i] = get_saved_state(fd, devices[i], snap->saved[i]);
+		if (check_saved_state(find_node(snap, devices[i]), snap->saved[i],
+				      snap->saved_size[i]))
+			fail_exit("Saved state of %s does not match its config space",
+				  devices[i]);
+
+		ksft_print_msg("[STAGE 1] Saved state of %s: %u bytes\n",
+			       devices[i], snap->saved_size[i]);
 	}
+
+	/* After preserving the devices, to include their saved state. */
+	session_fd = luo_create_session(luo_fd, SNAPSHOT_SESSION_NAME);
+	if (session_fd < 0 ||
+	    memfd_preserve_buf(session_fd, SNAPSHOT_MEMFD_TOKEN, snap,
+			       sizeof(*snap)) < 0)
+		fail_exit("Failed to preserve snapshot");
 
 	for (i = 0; i < nr_devices; i++) {
 		if (check_guards(devices[i]))
@@ -829,7 +943,9 @@ static void run_stage_1(int luo_fd)
 static void run_stage_2(int luo_fd, int state_session_fd)
 {
 	char path[LU_PATH_MAX], val[32], name[64];
-	int session_fds[MAX_DEVICES];
+	int session_fds[MAX_DEVICES], device_fds[MAX_DEVICES];
+	unsigned char *saved;
+	unsigned int size;
 	struct snapshot *snap;
 	struct node *node;
 	int i, fd, stage, snapshot_fd, errors = 0;
@@ -848,8 +964,13 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 
 	memfd_retrieve_buf(snapshot_fd, SNAPSHOT_MEMFD_TOKEN, snap, sizeof(*snap));
 
+	saved = malloc(SAVED_STATE_SIZE);
+	if (!saved)
+		fail_exit("malloc");
+
 	for (i = 0; i < snap->nr_devices; i++) {
 		session_fds[i] = -1;
+		device_fds[i] = -1;
 		if (snap->auto_pf[i])
 			continue;
 
@@ -898,6 +1019,23 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 			fail_exit("Failed to retrieve %s", bdf);
 
 		ksft_print_msg("[STAGE 2] Retrieved %s\n", bdf);
+		device_fds[i] = fd;
+
+		size = get_saved_state(fd, bdf, saved);
+		if (size != snap->saved_size[i] ||
+		    memcmp(saved, snap->saved[i], size)) {
+			ksft_print_msg("%s: saved state changed across Live Update (%u -> %u bytes)\n",
+				       bdf, snap->saved_size[i], size);
+			errors++;
+		}
+
+		/* The device must not be touched while it is preserved. */
+		if (!ioctl(fd, PCI_LU_TEST_IOCTL_RESTORE_SAVED_STATE, 0) ||
+		    errno != EBUSY) {
+			ksft_print_msg("%s: restoring saved state while preserved did not fail with EBUSY\n",
+				       bdf);
+			errors++;
+		}
 	}
 
 	/* VFs first, so that removing a PF doesn't take its VFs with it. */
@@ -941,6 +1079,27 @@ static void run_stage_2(int luo_fd, int state_session_fd)
 
 	if (errors)
 		fail_exit("driver_override not cleared after finishing");
+
+	/*
+	 * Once finished, the saved state from the previous kernel can be
+	 * loaded and restored like any other, which must not change anything
+	 * since the devices are still in that state.
+	 */
+	for (i = 0; i < snap->nr_devices; i++) {
+		if (device_fds[i] < 0)
+			continue;
+
+		ksft_print_msg("[STAGE 2] Restoring the saved state of %s\n",
+			       snap->devices[i]);
+		if (ioctl(device_fds[i], PCI_LU_TEST_IOCTL_RESTORE_SAVED_STATE, 0))
+			fail_exit("PCI_LU_TEST_IOCTL_RESTORE_SAVED_STATE(%s)",
+				  snap->devices[i]);
+
+		errors += compare_node(find_node(snap, snap->devices[i]), true);
+	}
+
+	if (errors)
+		fail_exit("%d unexpected changes after restoring saved state", errors);
 
 	ksft_print_msg("\n--- PCI LIVE UPDATE TEST PASSED ---\n");
 }
