@@ -2024,6 +2024,9 @@ EXPORT_SYMBOL_GPL(pci_store_saved_state);
  * pci_load_saved_state - Reload the provided save state into struct pci_dev.
  * @dev: PCI device that we're dealing with
  * @state: Saved state returned from pci_store_saved_state()
+ *
+ * Return: 0 on success, or -EINVAL if @state contains registers that @dev has
+ * nowhere to save, in which case the values saved for @dev are left unchanged.
  */
 int pci_load_saved_state(struct pci_dev *dev,
 			 struct pci_saved_state *state)
@@ -2035,23 +2038,25 @@ int pci_load_saved_state(struct pci_dev *dev,
 	if (!state)
 		return 0;
 
+	/*
+	 * Refuse state that the device has nowhere to put, e.g. because it was
+	 * saved from a different device, before loading anything so that a
+	 * refused state is not partially loaded.
+	 */
+	dword = PCI_STD_HEADER_DWORDS;
+	for_each_set_bit_from(dword, state->dword_map, PCI_CFG_SPACE_EXP_DWORDS) {
+		if (!pci_saved_cap_reserved(dev, dword * sizeof(u32)))
+			return -EINVAL;
+	}
+
 	for_each_set_bit(dword, state->dword_map, PCI_CFG_SPACE_EXP_DWORDS) {
 		unsigned int off = dword * sizeof(u32);
 		u32 val = state->dword_val[i++];
 
-		if (dword < PCI_STD_HEADER_DWORDS) {
+		if (dword < PCI_STD_HEADER_DWORDS)
 			dev->saved_config_space[dword] = val;
-			continue;
-		}
-
-		/*
-		 * Refuse state that the device has nowhere to put, e.g.
-		 * because it was saved from a different device.
-		 */
-		if (!pci_saved_cap_reserved(dev, off))
-			return -EINVAL;
-
-		pci_write_saved_cap_dword(dev, off, val);
+		else
+			pci_write_saved_cap_dword(dev, off, val);
 	}
 
 	dev->state_saved = true;
