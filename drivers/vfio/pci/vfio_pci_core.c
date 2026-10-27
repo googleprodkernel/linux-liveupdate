@@ -596,48 +596,111 @@ static const struct dev_pm_ops vfio_pci_core_pm_ops = {
 			   NULL)
 };
 
+/*
+ * Take over a device preserved across Live Update by the previous kernel when
+ * userspace first opens it, see vfio_pci_core_enable().
+ */
+static void vfio_pci_core_liveupdate_enable(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+
+	/*
+	 * Whether resetting the device works can't be found out without
+	 * resetting it. Assume it does if the device supports a reset method.
+	 */
+	vdev->reset_works = pci_reset_supported(pdev);
+
+	/*
+	 * Use the saved state passed by the previous kernel, i.e. the state
+	 * the device was in when userspace first opened it in the previous
+	 * kernel, so that closing the device restores that state as if there
+	 * was no Live Update.
+	 */
+	vdev->pci_saved_state = vdev->liveupdate_saved_state;
+	vdev->liveupdate_saved_state = NULL;
+}
+
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
+	bool incoming;
 	int ret;
 	u16 cmd;
 	u8 msix_pos;
 
+	lockdep_assert_held(&vdev->vdev.dev_set->lock);
+
+	/*
+	 * A device preserved across Live Update by the previous kernel is
+	 * still running (e.g. doing DMA) when userspace first opens it, and
+	 * must be left alone: it is not reset, and none of its configuration
+	 * is changed until userspace changes it.
+	 */
+	incoming = READ_ONCE(vdev->vdev.liveupdate_incoming);
+
+	/*
+	 * While an incoming device is not open, vfio-pci holds a runtime PM
+	 * reference on it, and an enable once it has been opened, so that it
+	 * keeps running (see vfio_pci_core_disable()). Hand them over to this
+	 * open, which would take its own.
+	 */
 	if (!vdev->disable_idle_d3) {
-		ret = pm_runtime_resume_and_get(&pdev->dev);
-		if (ret < 0)
-			return ret;
+		if (incoming && vdev->liveupdate_pm_held) {
+			vdev->liveupdate_pm_held = false;
+		} else {
+			ret = pm_runtime_resume_and_get(&pdev->dev);
+			if (ret < 0)
+				return ret;
+		}
 	}
 
 	/* Don't allow our initial saved state to include busmaster */
-	pci_clear_master(pdev);
+	if (!incoming)
+		pci_clear_master(pdev);
 
-	ret = pci_enable_device(pdev);
-	if (ret)
-		goto out_power;
+	if (incoming && vdev->liveupdate_enabled) {
+		vdev->liveupdate_enabled = false;
+	} else {
+		ret = pci_enable_device(pdev);
+		if (ret)
+			goto out_power;
+	}
 
-	/* If reset fails because of the device lock, fail this path entirely */
-	ret = pci_try_reset_function(pdev);
-	if (ret == -EAGAIN)
-		goto out_disable_device;
+	if (incoming) {
+		vfio_pci_core_liveupdate_enable(vdev);
+	} else {
+		/*
+		 * If reset fails because of the device lock, fail this path
+		 * entirely
+		 */
+		ret = pci_try_reset_function(pdev);
+		if (ret == -EAGAIN)
+			goto out_disable_device;
 
-	vdev->reset_works = !ret;
-	pci_save_state(pdev);
-	vdev->pci_saved_state = pci_store_saved_state(pdev);
-	if (!vdev->pci_saved_state)
-		pci_dbg(pdev, "%s: Couldn't store saved state\n", __func__);
+		vdev->reset_works = !ret;
+		pci_save_state(pdev);
+		vdev->pci_saved_state = pci_store_saved_state(pdev);
+		if (!vdev->pci_saved_state)
+			pci_dbg(pdev, "%s: Couldn't store saved state\n",
+				__func__);
+	}
 
 	if (likely(!vdev->nointxmask)) {
 		if (vfio_pci_nointx(pdev)) {
 			pci_info(pdev, "Masking broken INTx support\n");
 			vdev->nointx = true;
-			pci_intx(pdev, 0);
+			if (!incoming)
+				pci_intx(pdev, 0);
 		} else
 			vdev->pci_2_3 = pci_intx_mask_supported(pdev);
 	}
 
+	/*
+	 * Userspace enables INTx when it sets up INTx (vfio_intx_enable()),
+	 * which is enough for an incoming device.
+	 */
 	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
-	if (vdev->pci_2_3 && (cmd & PCI_COMMAND_INTX_DISABLE)) {
+	if (!incoming && vdev->pci_2_3 && (cmd & PCI_COMMAND_INTX_DISABLE)) {
 		cmd &= ~PCI_COMMAND_INTX_DISABLE;
 		pci_write_config_word(pdev, PCI_COMMAND, cmd);
 	}
@@ -677,13 +740,24 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 out_free_zdev:
 	vfio_pci_zdev_close_device(vdev);
 out_free_state:
-	kfree(vdev->pci_saved_state);
+	if (incoming)
+		vdev->liveupdate_saved_state = vdev->pci_saved_state;
+	else
+		kfree(vdev->pci_saved_state);
 	vdev->pci_saved_state = NULL;
 out_disable_device:
-	pci_disable_device(pdev);
+	/* Keep an incoming device enabled, disabling clears Bus Master Enable. */
+	if (incoming)
+		vdev->liveupdate_enabled = true;
+	else
+		pci_disable_device(pdev);
 out_power:
-	if (!vdev->disable_idle_d3)
-		pm_runtime_put(&pdev->dev);
+	if (!vdev->disable_idle_d3) {
+		if (incoming)
+			vdev->liveupdate_pm_held = true;
+		else
+			pm_runtime_put(&pdev->dev);
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_enable);
@@ -778,10 +852,18 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	struct pci_dev *pdev = vdev->pdev;
 	struct vfio_pci_dummy_resource *dummy_res, *tmp;
 	struct vfio_pci_ioeventfd *ioeventfd, *ioeventfd_tmp;
+	bool incoming;
 	int i, bar;
 
 	/* For needs_reset */
 	lockdep_assert_held(&vdev->vdev.dev_set->lock);
+
+	/*
+	 * A device preserved across Live Update by the previous kernel can
+	 * only be closed before it finishes participating in the Live Update
+	 * if setting up its file failed after opening it. Leave it running.
+	 */
+	incoming = READ_ONCE(vdev->vdev.liveupdate_incoming);
 
 	/*
 	 * This function can be invoked while the power state is non-D0.
@@ -807,7 +889,8 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	vfio_pci_set_power_state(vdev, PCI_D0);
 
 	/* Stop the device from further DMA */
-	pci_clear_master(pdev);
+	if (!incoming)
+		pci_clear_master(pdev);
 
 	vfio_pci_set_irqs_ioctl(vdev, VFIO_IRQ_SET_DATA_NONE |
 				VFIO_IRQ_SET_ACTION_TRIGGER,
@@ -849,9 +932,16 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 		kfree(dummy_res);
 	}
 
-	vdev->needs_reset = true;
-
 	vfio_pci_zdev_close_device(vdev);
+
+	/* Keep the saved state passed by the previous kernel for the next open */
+	if (incoming) {
+		vdev->liveupdate_saved_state = vdev->pci_saved_state;
+		vdev->pci_saved_state = NULL;
+		goto out;
+	}
+
+	vdev->needs_reset = true;
 
 	/*
 	 * If we have saved state, restore it.  If we can reset the device,
@@ -899,13 +989,26 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 out_restore_state:
 	pci_restore_state(pdev);
 out:
-	pci_disable_device(pdev);
+	/*
+	 * Keep an incoming device enabled and runtime active until it finishes
+	 * participating in the Live Update, by holding on to the enable and
+	 * runtime PM reference taken for opening it. Disabling it would clear
+	 * its Bus Master Enable, and runtime suspending it would stop it.
+	 */
+	if (incoming)
+		vdev->liveupdate_enabled = true;
+	else
+		pci_disable_device(pdev);
 
 	vfio_pci_dev_set_try_reset(vdev->vdev.dev_set);
 
 	/* Put the pm-runtime usage counter acquired during enable */
-	if (!vdev->disable_idle_d3)
-		pm_runtime_put(&pdev->dev);
+	if (!vdev->disable_idle_d3) {
+		if (incoming)
+			vdev->liveupdate_pm_held = true;
+		else
+			pm_runtime_put(&pdev->dev);
+	}
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_disable);
 
@@ -2324,6 +2427,7 @@ void vfio_pci_core_release_dev(struct vfio_device *core_vdev)
 	mutex_destroy(&vdev->ioeventfds_lock);
 	kfree(vdev->region);
 	kfree(vdev->pm_save);
+	kfree(vdev->liveupdate_saved_state);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_release_dev);
 
@@ -2343,6 +2447,14 @@ static void vfio_pci_core_pm_unregister(struct vfio_pci_core_device *vdev)
 		pm_runtime_get_noresume(dev);
 
 	pm_runtime_forbid(dev);
+
+	/*
+	 * Leave an incoming device that was opened and closed enabled, i.e.
+	 * keep the enable held for it: disabling it would clear its Bus Master
+	 * Enable, and a preserved device must not be released (see "Driver
+	 * Binding" in Documentation/PCI/liveupdate.rst).
+	 */
+	vdev->liveupdate_enabled = false;
 }
 
 int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)

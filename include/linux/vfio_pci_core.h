@@ -139,7 +139,11 @@ struct vfio_pci_core_device {
 	bool			liveupdate_frozen;
 	/* Runtime PM reference held while incoming and not open */
 	bool			liveupdate_pm_held;
+	/* Enable held while incoming, after being opened and closed */
+	bool			liveupdate_enabled;
 	struct pci_saved_state	*pci_saved_state;
+	/* pci_saved_state passed by the previous kernel, until first open */
+	struct pci_saved_state	*liveupdate_saved_state;
 	struct pci_saved_state	*pm_save;
 	int			ioeventfds_nr;
 	struct vfio_pci_eventfd __rcu *err_trigger;

@@ -42,6 +42,38 @@
  * pci_saved_state_ser), so that closing the device after the Live Update
  * behaves exactly as it would have without one.
  *
+ * Everything else is re-derived when userspace first opens the device in the
+ * next kernel, without resetting the device or writing to it:
+ *
+ *  * Whether resetting the device works, which vfio-pci normally finds out by
+ *    resetting the device when userspace first opens it, is assumed if the
+ *    device supports a reset method (pci_reset_supported()). This decides
+ *    whether ``VFIO_DEVICE_RESET`` is allowed and whether
+ *    ``VFIO_DEVICE_FLAGS_RESET`` is reported by ``VFIO_DEVICE_GET_INFO``,
+ *    which can therefore change across a Live Update if resetting the device
+ *    failed in the previous kernel even though it supports a reset method.
+ *
+ *  * The virtual configuration space that vfio-pci presents to userspace,
+ *    its map of capabilities, and the BAR values vfio-pci restores after a
+ *    reset are rebuilt from the device, like for any first open. The device
+ *    is not reset and the PCI core keeps its BARs, so these match the
+ *    previous kernel's, except for values userspace wrote to registers that
+ *    vfio-pci only emulates and does not write to the device, e.g. the BARs
+ *    (as written to size them), Interrupt Line, and the emulated INTx Disable
+ *    bit. Userspace must not rely on those across Live Update.
+ *
+ *  * Interrupts must be disabled before kexec (see Freezing below), and
+ *    userspace sets them up again after retrieving the device's file, along
+ *    with everything else it sets up through the file (e.g. eventfds,
+ *    ioeventfds, BAR mappings, dma-bufs, and the iommufd binding).
+ *
+ * When userspace first opens the device in the next kernel, vfio-pci leaves
+ * the device as it is: unlike for a device that nobody used before, it does
+ * not clear the device's Bus Master Enable, reset it, save its state, or
+ * change its INTx Disable bit. After the device finishes participating in the
+ * Live Update, closing it restores the saved state passed by the previous
+ * kernel and resets it, like it would have without a Live Update.
+ *
  * Freezing
  * ========
  *
