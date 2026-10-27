@@ -395,8 +395,13 @@ const char *vfio_pci_get_cdev_path(const char *bdf)
 	VFIO_ASSERT_NOT_NULL(dir, "Failed to open directory %s\n", dir_path);
 
 	while ((entry = readdir(dir)) != NULL) {
-		/* Find the file that starts with "vfio" */
-		if (strncmp("vfio", entry->d_name, 4))
+		/*
+		 * Find the file that starts with "vfio", or "noiommu-vfio" if
+		 * the device is not behind an IOMMU.
+		 */
+		if (strncmp("vfio", entry->d_name, 4) &&
+		    strncmp(NOIOMMU_CDEV_PREFIX "vfio", entry->d_name,
+			    strlen(NOIOMMU_CDEV_PREFIX "vfio")))
 			continue;
 
 		snprintf_assert(cdev_path, PATH_MAX, "/dev/vfio/devices/%s", entry->d_name);
@@ -407,6 +412,23 @@ const char *vfio_pci_get_cdev_path(const char *bdf)
 	VFIO_ASSERT_EQ(closedir(dir), 0);
 
 	return cdev_path;
+}
+
+bool vfio_pci_cdev_is_noiommu(const char *bdf)
+{
+	const char *cdev_path = vfio_pci_get_cdev_path(bdf);
+	bool noiommu;
+
+	noiommu = !strncmp(basename((char *)cdev_path), NOIOMMU_CDEV_PREFIX,
+			   strlen(NOIOMMU_CDEV_PREFIX));
+	free((void *)cdev_path);
+
+	return noiommu;
+}
+
+const char *vfio_pci_default_iommu_mode(const char *bdf)
+{
+	return vfio_pci_cdev_is_noiommu(bdf) ? MODE_IOMMUFD_NOIOMMU : default_iommu_mode;
 }
 
 int __vfio_device_bind_iommufd(int device_fd, int iommufd, const char *vf_token)
@@ -459,6 +481,17 @@ void vfio_pci_cdev_open(struct vfio_pci_device *device, const char *bdf)
 static void vfio_pci_iommufd_setup(struct vfio_pci_device *device,
 				   const char *bdf, const char *vf_token)
 {
+	bool noiommu = vfio_pci_cdev_is_noiommu(bdf);
+
+	/*
+	 * Without an IOMMU the device DMAs to physical addresses, so using a
+	 * noiommu device in any other mode would let it DMA to whatever memory
+	 * is at the IOVAs given to it.
+	 */
+	VFIO_ASSERT_EQ(noiommu, device->iommu->mode->noiommu,
+		       "%s is %sa noiommu device, but IOMMU mode is %s\n", bdf,
+		       noiommu ? "" : "not ", device->iommu->mode->name);
+
 	vfio_pci_cdev_open(device, bdf);
 	vfio_device_bind_iommufd(device->fd, device->iommu->iommufd, vf_token);
 	vfio_device_attach_iommufd_pt(device->fd, device->iommu->ioas_id);

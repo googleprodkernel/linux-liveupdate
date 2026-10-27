@@ -47,6 +47,10 @@ static const struct iommu_mode iommu_modes[] = {
 	{
 		.name = MODE_IOMMUFD,
 	},
+	{
+		.name = MODE_IOMMUFD_NOIOMMU,
+		.noiommu = true,
+	},
 };
 
 static const struct iommu_mode *lookup_iommu_mode(const char *iommu_mode)
@@ -66,9 +70,48 @@ static const struct iommu_mode *lookup_iommu_mode(const char *iommu_mode)
 	VFIO_FAIL("Unrecognized IOMMU mode: %s\n", iommu_mode);
 }
 
+bool iommu_mode_is_noiommu(const char *iommu_mode)
+{
+	return lookup_iommu_mode(iommu_mode)->noiommu;
+}
+
+int __iommu_noiommu_get_pa(struct iommu *iommu, iova_t iova, u64 *pa, u64 *length)
+{
+	struct iommu_ioas_noiommu_get_pa args = {
+		.size = sizeof(args),
+		.ioas_id = iommu->ioas_id,
+		.iova = iova,
+		.length = *length,
+	};
+
+	VFIO_ASSERT_TRUE(iommu->mode->noiommu);
+
+	if (ioctl(iommu->iommufd, IOMMU_IOAS_NOIOMMU_GET_PA, &args))
+		return -errno;
+
+	*pa = args.out_phys;
+	*length = args.length;
+
+	return 0;
+}
+
+u64 iommu_noiommu_get_pa(struct iommu *iommu, iova_t iova, u64 *length)
+{
+	u64 pa;
+	int ret;
+
+	ret = __iommu_noiommu_get_pa(iommu, iova, &pa, length);
+	VFIO_ASSERT_EQ(ret, 0, "IOMMU_IOAS_NOIOMMU_GET_PA(0x%lx) failed\n", iova);
+
+	return pa;
+}
+
 int __iommu_hva2iova(struct iommu *iommu, void *vaddr, iova_t *iova)
 {
 	struct dma_region *region;
+	u64 offset, length;
+	iova_t pa;
+	int ret;
 
 	list_for_each_entry(region, &iommu->dma_regions, link) {
 		if (vaddr < region->vaddr)
@@ -77,8 +120,27 @@ int __iommu_hva2iova(struct iommu *iommu, void *vaddr, iova_t *iova)
 		if (vaddr >= region->vaddr + region->size)
 			continue;
 
+		offset = vaddr - region->vaddr;
+
+		/*
+		 * Without an IOMMU the device must be given the physical
+		 * address, which iommufd tracks for each mapped IOVA.
+		 */
+		if (iommu->mode->noiommu) {
+			length = region->size - offset;
+			ret = __iommu_noiommu_get_pa(iommu, region->iova + offset,
+						     &pa, &length);
+			if (ret)
+				return ret;
+
+			if (iova)
+				*iova = pa;
+
+			return 0;
+		}
+
 		if (iova)
-			*iova = region->iova + (vaddr - region->vaddr);
+			*iova = region->iova + offset;
 
 		return 0;
 	}

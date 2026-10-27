@@ -49,12 +49,32 @@ static void vfio_check_driver_op(struct vfio_pci_driver *driver, void *op,
 	vfio_check_driver_op(__driver, __driver->ops->_op, #_op);	\
 } while (0)
 
+/*
+ * Drivers lay out descriptor rings and other structures that the device
+ * accesses with DMA in driver->region and address them relative to the start
+ * of the region. Without an IOMMU that requires the region to be physically
+ * contiguous.
+ */
+static void vfio_pci_driver_check_region(struct vfio_pci_device *device)
+{
+	struct dma_region *region = &device->driver.region;
+	u64 length = region->size;
+
+	if (!device->iommu->mode->noiommu)
+		return;
+
+	iommu_noiommu_get_pa(device->iommu, region->iova, &length);
+	VFIO_ASSERT_EQ(length, region->size,
+		       "Driver region must be physically contiguous in noiommu mode\n");
+}
+
 void vfio_pci_driver_init(struct vfio_pci_device *device)
 {
 	struct vfio_pci_driver *driver = &device->driver;
 
 	VFIO_ASSERT_NOT_NULL(driver->region.vaddr);
 	VFIO_CHECK_DRIVER_OP(driver, init);
+	vfio_pci_driver_check_region(device);
 
 	driver->ops->init(device);
 
