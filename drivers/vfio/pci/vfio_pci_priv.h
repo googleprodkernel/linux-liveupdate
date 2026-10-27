@@ -88,6 +88,16 @@ static inline int vfio_pci_igd_init(struct vfio_pci_core_device *vdev)
 }
 #endif
 
+/*
+ * True while a device preserved across Live Update is frozen, i.e. about to be
+ * handed over to the next kernel, see vfio_pci_core_liveupdate_freeze().
+ */
+static inline bool vfio_pci_liveupdate_frozen(struct vfio_pci_core_device *vdev)
+{
+	return IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE) &&
+	       READ_ONCE(vdev->liveupdate_frozen);
+}
+
 #ifdef CONFIG_VFIO_PCI_LIVEUPDATE
 extern const struct vfio_device_ops vfio_pci_ops;
 

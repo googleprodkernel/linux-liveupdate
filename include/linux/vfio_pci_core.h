@@ -134,6 +134,8 @@ struct vfio_pci_core_device {
 	bool			pm_intx_masked;
 	bool			pm_runtime_engaged;
 	bool			sriov_active;
+	/* Preserved across Live Update and about to be handed over */
+	bool			liveupdate_frozen;
 	struct pci_saved_state	*pci_saved_state;
 	struct pci_saved_state	*pm_save;
 	int			ioeventfds_nr;
@@ -191,6 +193,10 @@ int vfio_pci_core_match(struct vfio_device *core_vdev, char *buf);
 int vfio_pci_core_match_token_uuid(struct vfio_device *core_vdev,
 				   const uuid_t *uuid);
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev);
+#if IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE)
+int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev);
+void vfio_pci_core_liveupdate_unfreeze(struct vfio_pci_core_device *vdev);
+#endif
 void vfio_pci_core_disable(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev);
 pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,

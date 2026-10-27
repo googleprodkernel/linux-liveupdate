@@ -41,6 +41,29 @@
  * passed to the next kernel in the format defined by the PCI core (struct
  * pci_saved_state_ser), so that closing the device after the Live Update
  * behaves exactly as it would have without one.
+ *
+ * Freezing
+ * ========
+ *
+ * Right before kexec, LUO freezes preserved files. Freezing a device file
+ * fails with -EBUSY unless userspace has disabled all of the device's
+ * interrupts (``VFIO_DEVICE_SET_IRQS``), since interrupts are not preserved,
+ * and unless the device is in D0 and not in a low power state entered with
+ * ``VFIO_DEVICE_FEATURE_LOW_POWER_ENTRY``.
+ *
+ * Freezing does not stop the device: unlike closing the device, it does not
+ * reset the device or clear its Bus Master Enable, so that the device can
+ * keep doing DMA. Userspace can keep accessing the device (e.g. its BARs)
+ * while it is frozen, but enabling interrupts fails with -EBUSY. If the Live
+ * Update is aborted, the device file is unfrozen.
+ *
+ * The only thing freezing changes is INTx Disable, which it sets: disabling
+ * MSI or MSI-X clears INTx Disable (see pci_intx_for_msi()), and nothing in
+ * the next kernel handles INTx until userspace sets up interrupts again, so
+ * an INTx asserted on a line shared with other devices would get the line
+ * disabled for all of them. INTx Disable stays set until userspace sets up
+ * interrupts again (in either kernel), which reprograms it. The emulated INTx
+ * Disable bit userspace sees is not changed.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -164,14 +187,24 @@ static void vfio_pci_liveupdate_unpreserve(struct liveupdate_file_op_args *args)
 static int vfio_pci_liveupdate_freeze(struct liveupdate_file_op_args *args)
 {
 	struct vfio_pci_core_device *vdev = vfio_pci_liveupdate_vdev(args->file);
+	int ret;
 
-	return pci_liveupdate_freeze(vdev->pdev);
+	ret = pci_liveupdate_freeze(vdev->pdev);
+	if (ret)
+		return ret;
+
+	ret = vfio_pci_core_liveupdate_freeze(vdev);
+	if (ret)
+		pci_liveupdate_unfreeze(vdev->pdev);
+
+	return ret;
 }
 
 static void vfio_pci_liveupdate_unfreeze(struct liveupdate_file_op_args *args)
 {
 	struct vfio_pci_core_device *vdev = vfio_pci_liveupdate_vdev(args->file);
 
+	vfio_pci_core_liveupdate_unfreeze(vdev);
 	pci_liveupdate_unfreeze(vdev->pdev);
 }
 

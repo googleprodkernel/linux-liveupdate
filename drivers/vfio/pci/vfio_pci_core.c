@@ -680,6 +680,90 @@ out_power:
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_enable);
 
+#if IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE)
+/**
+ * vfio_pci_core_liveupdate_freeze - Freeze a device preserved across Live Update
+ * @vdev: The device
+ *
+ * Called right before kexec to hand the device over to the next kernel. Check
+ * that the device can keep running across the kexec, and refuse what would
+ * break that (enabling interrupts) until the device is unfrozen.
+ *
+ * Unlike closing the device, freezing it does not stop, reset, or reconfigure
+ * it, so that the device can keep doing DMA, and userspace can keep accessing
+ * its BARs. It only sets INTx Disable, since nothing handles INTx in the next
+ * kernel.
+ *
+ * Return: 0 on success, or -EBUSY if the device has interrupts enabled or is
+ * not in D0.
+ */
+int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	int ret = 0;
+
+	/* igate serializes with SET_IRQS, memory_lock with power management. */
+	mutex_lock(&vdev->igate);
+	down_write(&vdev->memory_lock);
+
+	/*
+	 * Interrupts are not preserved, and the next kernel has no handler for
+	 * them (without interrupt remapping, a stale MSI is an arbitrary DMA
+	 * write), so userspace must disable them before kexec.
+	 */
+	if (vdev->irq_type != VFIO_PCI_NUM_IRQS) {
+		pci_err(pdev, "Can't freeze device with interrupts enabled\n");
+		ret = -EBUSY;
+		goto out;
+	}
+
+	/*
+	 * A device that is not in D0 can't keep running, and its power state
+	 * is not preserved.
+	 */
+	if (pdev->current_state != PCI_D0 || vdev->pm_runtime_engaged) {
+		pci_err(pdev, "Can't freeze device in a low power state\n");
+		ret = -EBUSY;
+		goto out;
+	}
+
+	/*
+	 * Disabling MSI or MSI-X clears INTx Disable (see pci_intx_for_msi()),
+	 * so the device can typically assert INTx at this point. Nothing
+	 * handles INTx in the next kernel until userspace sets up interrupts
+	 * again, and an unhandled INTx on a line shared with other devices
+	 * gets the line disabled for all of them. So mask INTx, and leave it
+	 * masked: the next kernel doesn't touch INTx Disable until userspace
+	 * sets up interrupts again, which reprograms it (vfio_intx_enable(),
+	 * or enabling MSI or MSI-X). This only writes to the device if INTx
+	 * Disable is clear, and doesn't change the emulated INTx Disable bit.
+	 */
+	pci_intx(pdev, 0);
+
+	WRITE_ONCE(vdev->liveupdate_frozen, true);
+out:
+	up_write(&vdev->memory_lock);
+	mutex_unlock(&vdev->igate);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_liveupdate_freeze);
+
+/**
+ * vfio_pci_core_liveupdate_unfreeze - Unfreeze a device preserved across Live Update
+ * @vdev: The device
+ *
+ * Called if the Live Update is aborted after vfio_pci_core_liveupdate_freeze()
+ * succeeded. INTx Disable is left set: setting up interrupts reprograms it.
+ */
+void vfio_pci_core_liveupdate_unfreeze(struct vfio_pci_core_device *vdev)
+{
+	mutex_lock(&vdev->igate);
+	WRITE_ONCE(vdev->liveupdate_frozen, false);
+	mutex_unlock(&vdev->igate);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_liveupdate_unfreeze);
+#endif
+
 void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *bridge;
@@ -1305,8 +1389,12 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 
 	mutex_lock(&vdev->igate);
 
-	ret = vfio_pci_set_irqs_ioctl(vdev, hdr.flags, hdr.index, hdr.start,
-				      hdr.count, data);
+	/* Synchronize with vfio_pci_core_liveupdate_freeze() */
+	if (vfio_pci_liveupdate_frozen(vdev))
+		ret = -EBUSY;
+	else
+		ret = vfio_pci_set_irqs_ioctl(vdev, hdr.flags, hdr.index,
+					      hdr.start, hdr.count, data);
 
 	mutex_unlock(&vdev->igate);
 	kfree(data);
