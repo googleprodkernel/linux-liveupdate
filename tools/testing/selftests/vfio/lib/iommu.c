@@ -194,6 +194,31 @@ static int iommufd_map(struct iommu *iommu, struct dma_region *region)
 	return 0;
 }
 
+int __iommu_map_file(struct iommu *iommu, struct dma_region *region, int fd,
+		     u64 offset)
+{
+	struct iommu_ioas_map_file args = {
+		.size = sizeof(args),
+		.flags = IOMMU_IOAS_MAP_READABLE |
+			 IOMMU_IOAS_MAP_WRITEABLE |
+			 IOMMU_IOAS_MAP_FIXED_IOVA,
+		.ioas_id = iommu->ioas_id,
+		.fd = fd,
+		.start = offset,
+		.length = region->size,
+		.iova = region->iova,
+	};
+
+	VFIO_ASSERT_GT(iommu->iommufd, 0, "IOMMU_IOAS_MAP_FILE requires iommufd\n");
+
+	if (ioctl(iommu->iommufd, IOMMU_IOAS_MAP_FILE, &args))
+		return -errno;
+
+	list_add(&region->link, &iommu->dma_regions);
+
+	return 0;
+}
+
 int __iommu_map(struct iommu *iommu, struct dma_region *region)
 {
 	int ret;

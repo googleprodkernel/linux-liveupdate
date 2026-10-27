@@ -47,6 +47,21 @@ static inline void iommu_map(struct iommu *iommu, struct dma_region *region)
 	VFIO_ASSERT_EQ(__iommu_map(iommu, region), 0);
 }
 
+/*
+ * Map @region->size bytes of the memfd @fd starting at @offset to
+ * @region->iova with IOMMU_IOAS_MAP_FILE. @region->vaddr must point to a
+ * mapping of the same part of @fd, so that it can be translated with
+ * iommu_hva2iova(). Requires an iommufd IOMMU mode.
+ */
+int __iommu_map_file(struct iommu *iommu, struct dma_region *region, int fd,
+		     u64 offset);
+
+static inline void iommu_map_file(struct iommu *iommu, struct dma_region *region,
+				  int fd, u64 offset)
+{
+	VFIO_ASSERT_EQ(__iommu_map_file(iommu, region, fd, offset), 0);
+}
+
 int __iommu_unmap(struct iommu *iommu, struct dma_region *region, u64 *unmapped);
 
 static inline void iommu_unmap(struct iommu *iommu, struct dma_region *region)
