@@ -203,6 +203,7 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev);
 #if IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE)
 int vfio_pci_core_liveupdate_freeze(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_liveupdate_unfreeze(struct vfio_pci_core_device *vdev);
+void vfio_pci_core_liveupdate_finish(struct vfio_pci_core_device *vdev);
 #endif
 void vfio_pci_core_disable(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev);

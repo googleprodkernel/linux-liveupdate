@@ -844,6 +844,39 @@ void vfio_pci_core_liveupdate_unfreeze(struct vfio_pci_core_device *vdev)
 	mutex_unlock(&vdev->igate);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_liveupdate_unfreeze);
+
+/**
+ * vfio_pci_core_liveupdate_finish - Finish Live Update of an incoming device
+ * @vdev: The device, preserved across Live Update by the previous kernel
+ *
+ * Called when the device finishes participating in the Live Update, after
+ * userspace took it over. From then on, the device is handled like any other:
+ * e.g. it can be opened through its cdev, closing it restores its saved state
+ * and resets it, and it runtime suspends while idle.
+ */
+void vfio_pci_core_liveupdate_finish(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+
+	lockdep_assert_held(&vdev->vdev.dev_set->lock);
+
+	WRITE_ONCE(vdev->vdev.liveupdate_incoming, false);
+
+	/*
+	 * The device is normally open at this point, so vfio-pci holds no
+	 * enable or runtime PM reference of its own on it: the open does.
+	 */
+	if (vdev->liveupdate_enabled) {
+		vdev->liveupdate_enabled = false;
+		pci_disable_device(pdev);
+	}
+
+	if (vdev->liveupdate_pm_held) {
+		vdev->liveupdate_pm_held = false;
+		pm_runtime_put(&pdev->dev);
+	}
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_liveupdate_finish);
 #endif
 
 void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)

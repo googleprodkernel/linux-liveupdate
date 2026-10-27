@@ -144,6 +144,26 @@
  * ``vfio.enable_unsafe_noiommu_mode=1`` is set when it probes them (e.g. on the
  * kernel command line), and VFs are only enumerated once their PF adopts them
  * (e.g. when userspace writes the PF's ``sriov_numvfs`` sysfs attribute).
+ *
+ * Finishing
+ * =========
+ *
+ * ``ioctl(LIVEUPDATE_SESSION_FINISH)`` fails with -EBUSY until userspace has
+ * retrieved the files of all devices preserved in the session and bound them
+ * to an iommufd, i.e. taken the devices over, and until all of the preserved
+ * VFs of a preserved PF have finished. There is no way around this: if
+ * retrieving a file fails (LUO does not retry it), or userspace never binds a
+ * retrieved file, the session can't be finished (and closing it fails), and
+ * the device stays preserved, i.e. it can't be opened otherwise, reset, or
+ * unbound from vfio-pci, until the next reboot.
+ *
+ * Once a device finishes participating in the Live Update, vfio-pci handles it
+ * like any other device: it can be opened through its character device again
+ * (though it is still open through the retrieved file), and it can enter low
+ * power states and be reset. Closing it (when both userspace and LUO have
+ * released the retrieved file) restores the saved state passed by the
+ * previous kernel and resets the device, exactly as it would have without a
+ * Live Update.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -396,12 +416,35 @@ out_free:
 
 static bool vfio_pci_liveupdate_can_finish(struct liveupdate_file_op_args *args)
 {
-	/* Finishing preserved devices is not supported yet. */
-	return false;
+	struct vfio_pci_core_device *vdev;
+
+	/*
+	 * The device can't finish until userspace takes it over, i.e. retrieves
+	 * its file and binds it to an iommufd. The PCI core doesn't let a PF
+	 * finish before its VFs.
+	 */
+	if (args->retrieve_status <= 0 ||
+	    !vfio_device_cdev_file_is_bound(args->file))
+		return false;
+
+	vdev = vfio_pci_liveupdate_vdev(args->file);
+	return pci_liveupdate_can_finish(vdev->pdev);
 }
 
 static void vfio_pci_liveupdate_finish(struct liveupdate_file_op_args *args)
 {
+	struct vfio_pci_core_device *vdev;
+
+	/* Ensured by vfio_pci_liveupdate_can_finish() */
+	if (WARN_ON_ONCE(args->retrieve_status <= 0))
+		return;
+
+	vdev = vfio_pci_liveupdate_vdev(args->file);
+
+	scoped_guard(mutex, &vdev->vdev.dev_set->lock)
+		vfio_pci_core_liveupdate_finish(vdev);
+
+	pci_liveupdate_finish(vdev->pdev);
 }
 
 static const struct liveupdate_file_ops vfio_pci_liveupdate_file_ops = {
