@@ -122,6 +122,28 @@
  * which also keeps the bridges above it active. While the device is open, the
  * reference vfio-pci takes for opening it does the same. After the device
  * finishes, the usual rules apply.
+ *
+ * Retrieving
+ * ==========
+ *
+ * After kexec, the PCI core binds each preserved device to vfio-pci again.
+ * Userspace then retrieves a file for the device from its Live Update session
+ * with ``ioctl(LIVEUPDATE_SESSION_RETRIEVE_FD)``. The retrieved file is in the
+ * same state as a file just opened through the device's character device:
+ * userspace must bind it to an iommufd with ``VFIO_DEVICE_BIND_IOMMUFD`` (a
+ * new one, since iommufds are not preserved), and then sets the device up
+ * again, e.g. its interrupts and DMA mappings.
+ *
+ * Until the device finishes participating in the Live Update, it can only be
+ * opened through the retrieved file: opening it through its character device
+ * or with ``VFIO_GROUP_GET_DEVICE_FD`` fails with -EBUSY.
+ *
+ * Retrieving a file fails if its device is not bound to vfio-pci, and LUO
+ * remembers the failure, so userspace must make sure the device is bound
+ * first. In particular, vfio-pci only binds to devices without an IOMMU if
+ * ``vfio.enable_unsafe_noiommu_mode=1`` is set when it probes them (e.g. on the
+ * kernel command line), and VFs are only enumerated once their PF adopts them
+ * (e.g. when userspace writes the PF's ``sriov_numvfs`` sysfs attribute).
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -129,6 +151,7 @@
 #include <linux/kexec_handover.h>
 #include <linux/kho/abi/vfio_pci.h>
 #include <linux/liveupdate.h>
+#include <linux/mm.h>
 #include <linux/pci.h>
 #include <linux/vfio.h>
 #include <linux/vfio_pci_core.h>
@@ -268,12 +291,112 @@ static void vfio_pci_liveupdate_unfreeze(struct liveupdate_file_op_args *args)
 
 static int vfio_pci_liveupdate_retrieve(struct liveupdate_file_op_args *args)
 {
-	return -EOPNOTSUPP;
+	struct folio *folio, *saved_state_folio = NULL;
+	struct pci_saved_state *saved_state = NULL;
+	struct vfio_pci_core_device_ser *ser;
+	struct vfio_pci_core_device *vdev;
+	struct vfio_device *device = NULL;
+	struct pci_dev *pdev = NULL;
+	struct file *file;
+	int ret;
+
+	/*
+	 * The preserved state is freed whether retrieving succeeds or not:
+	 * LUO does not retry a failed retrieve. Restore all of it before
+	 * validating it, so that none of it leaks if it is invalid.
+	 */
+	folio = kho_restore_folio(args->serialized_data);
+	if (!folio) {
+		pr_err("Failed to restore preserved state\n");
+		return -ENOENT;
+	}
+
+	/* A folio is always large enough for the fields read below. */
+	ser = folio_address(folio);
+	if (ser->saved_state)
+		saved_state_folio = kho_restore_folio(ser->saved_state);
+
+	if (ser->size < sizeof(*ser) || ser->size > folio_size(folio) ||
+	    ser->flags || ser->reserved) {
+		pr_err("Invalid preserved state for %04x:%02x:%02x.%d\n",
+		       ser->domain, PCI_BUS_NUM(ser->bdf),
+		       PCI_SLOT(ser->bdf & 0xff), PCI_FUNC(ser->bdf & 0xff));
+		ret = -EINVAL;
+		goto out_free;
+	}
+
+	if (ser->saved_state && !saved_state_folio) {
+		pr_err("Failed to restore saved state\n");
+		ret = -ENOENT;
+		goto out_free;
+	}
+
+	pdev = pci_get_domain_bus_and_slot(ser->domain, PCI_BUS_NUM(ser->bdf),
+					   ser->bdf & 0xff);
+	if (!pdev) {
+		pr_err("Preserved device %04x:%02x:%02x.%d not found\n",
+		       ser->domain, PCI_BUS_NUM(ser->bdf),
+		       PCI_SLOT(ser->bdf & 0xff), PCI_FUNC(ser->bdf & 0xff));
+		ret = -ENODEV;
+		goto out_free;
+	}
+
+	device = vfio_find_device(&pdev->dev);
+	if (!device || device->ops != &vfio_pci_ops) {
+		pci_err(pdev, "Preserved device not bound to vfio-pci\n");
+		ret = -ENODEV;
+		goto out_put;
+	}
+
+	if (saved_state_folio) {
+		saved_state = pci_saved_state_deserialize(pdev,
+							  folio_address(saved_state_folio),
+							  folio_size(saved_state_folio));
+		if (IS_ERR(saved_state)) {
+			ret = PTR_ERR(saved_state);
+			goto out_put;
+		}
+	}
+
+	/*
+	 * Hand the saved state to the first open of the device, which can only
+	 * happen through the retrieved file.
+	 */
+	vdev = container_of(device, struct vfio_pci_core_device, vdev);
+	scoped_guard(mutex, &device->dev_set->lock) {
+		if (!device->liveupdate_incoming || device->open_count) {
+			pci_err(pdev, "Device is not preserved by the previous kernel\n");
+			kfree(saved_state);
+			ret = -EINVAL;
+			goto out_put;
+		}
+
+		kfree(vdev->liveupdate_saved_state);
+		vdev->liveupdate_saved_state = saved_state;
+	}
+
+	file = vfio_device_cdev_open_file(device);
+	if (IS_ERR(file)) {
+		ret = PTR_ERR(file);
+		goto out_put;
+	}
+
+	args->file = file;
+	ret = 0;
+out_put:
+	if (device)
+		vfio_device_put_registration(device);
+	pci_dev_put(pdev);
+out_free:
+	if (saved_state_folio)
+		folio_put(saved_state_folio);
+	folio_put(folio);
+	return ret;
 }
 
 static bool vfio_pci_liveupdate_can_finish(struct liveupdate_file_op_args *args)
 {
-	/* Preserved devices can't be retrieved yet, and thus can't finish. */
+	/* Finishing preserved devices is not supported yet. */
 	return false;
 }
 
