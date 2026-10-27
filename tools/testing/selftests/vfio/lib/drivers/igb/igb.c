@@ -400,6 +400,45 @@ static void igb_init(struct vfio_pci_device *device)
 	igb_hw_init(device);
 }
 
+/*
+ * Take over a device that igb_init() set up in a previous kernel, before a
+ * Live Update. The device is left untouched: struct igb (including the rings
+ * and the ring tails) is in driver->region, which must be mapped at the same
+ * device address as before, and the device must still be programmed exactly
+ * as igb_init() and the other ops left it. Verify the latter, as it's an
+ * easy way to detect that the device was reset across the Live Update.
+ *
+ * Interrupts are expected to be disabled (VFIO does not preserve them), so
+ * MSI-X must be re-enabled through VFIO before using send_msi().
+ */
+static void igb_resume(struct vfio_pci_device *device)
+{
+	struct igb *igb = to_igb_state(device);
+	u64 iova_tx, iova_rx;
+
+	VFIO_ASSERT_GE(device->driver.region.size, sizeof(struct igb));
+
+	igb->bar0 = device->bars[0].vaddr;
+
+	iova_tx = to_iova(device, igb->tx_ring);
+	iova_rx = to_iova(device, igb->rx_ring);
+
+	VFIO_ASSERT_EQ(igb_read32(igb, E1000_TDBAL(0)), (u32)iova_tx);
+	VFIO_ASSERT_EQ(igb_read32(igb, E1000_TDBAH(0)), (u32)(iova_tx >> 32));
+	VFIO_ASSERT_EQ(igb_read32(igb, E1000_RDBAL(0)), (u32)iova_rx);
+	VFIO_ASSERT_EQ(igb_read32(igb, E1000_RDBAH(0)), (u32)(iova_rx >> 32));
+	VFIO_ASSERT_EQ(igb_read32(igb, E1000_TDT(0)), igb->tx_tail);
+	VFIO_ASSERT_EQ(igb_read32(igb, E1000_RDT(0)), igb->rx_tail);
+	VFIO_ASSERT_TRUE(igb_read32(igb, E1000_TCTL) & E1000_TCTL_EN);
+	VFIO_ASSERT_TRUE(igb_read32(igb, E1000_RCTL) & E1000_RCTL_EN);
+	VFIO_ASSERT_TRUE(igb_read32(igb, E1000_TXDCTL(0)) & E1000_TXDCTL_QUEUE_ENABLE);
+	VFIO_ASSERT_TRUE(igb_read32(igb, E1000_RXDCTL(0)) & E1000_RXDCTL_QUEUE_ENABLE);
+
+	device->driver.max_memcpy_size = IGB_MAX_CHUNK_SIZE;
+	device->driver.max_memcpy_count = RING_SIZE - 1;
+	device->driver.msi = MSIX_VECTOR;
+}
+
 static void igb_remove(struct vfio_pci_device *device)
 {
 	struct igb *igb = to_igb_state(device);
@@ -578,6 +617,7 @@ const struct vfio_pci_driver_ops igb_ops = {
 	.name = "igb",
 	.probe = igb_probe,
 	.init = igb_init,
+	.resume = igb_resume,
 	.remove = igb_remove,
 	.memcpy_start = igb_memcpy_start,
 	.memcpy_wait = igb_memcpy_wait,
