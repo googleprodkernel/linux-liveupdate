@@ -2,6 +2,7 @@
 /*
  * Copyright (c) 2023 Intel Corporation.
  */
+#include <linux/anon_inodes.h>
 #include <linux/vfio.h>
 #include <linux/iommufd.h>
 
@@ -21,19 +22,18 @@ void vfio_init_device_cdev(struct vfio_device *device)
 }
 
 /*
- * device access via the fd opened by this function is blocked until
- * .open_device() is called successfully during BIND_IOMMUFD.
+ * Allocate the vfio_device_file of a new cdev file for @device. Paired with
+ * vfio_device_fops_release().
  */
-int vfio_device_fops_cdev_open(struct inode *inode, struct file *filep)
+static struct vfio_device_file *
+vfio_device_cdev_alloc_file(struct vfio_device *device)
 {
-	struct vfio_device *device = container_of(inode->i_cdev,
-						  struct vfio_device, cdev);
 	struct vfio_device_file *df;
 	int ret;
 
 	/* Paired with the put in vfio_device_fops_release() */
 	if (!vfio_device_try_get_registration(device))
-		return -ENODEV;
+		return ERR_PTR(-ENODEV);
 
 	if (vfio_device_is_noiommu(device) && !capable(CAP_SYS_RAWIO)) {
 		ret = -EPERM;
@@ -46,6 +46,27 @@ int vfio_device_fops_cdev_open(struct inode *inode, struct file *filep)
 		goto err_put_registration;
 	}
 
+	return df;
+
+err_put_registration:
+	vfio_device_put_registration(device);
+	return ERR_PTR(ret);
+}
+
+/*
+ * device access via the fd opened by this function is blocked until
+ * .open_device() is called successfully during BIND_IOMMUFD.
+ */
+int vfio_device_fops_cdev_open(struct inode *inode, struct file *filep)
+{
+	struct vfio_device *device = container_of(inode->i_cdev,
+						  struct vfio_device, cdev);
+	struct vfio_device_file *df;
+
+	df = vfio_device_cdev_alloc_file(device);
+	if (IS_ERR(df))
+		return PTR_ERR(df);
+
 	filep->private_data = df;
 
 	/*
@@ -56,11 +77,93 @@ int vfio_device_fops_cdev_open(struct inode *inode, struct file *filep)
 	filep->f_mapping = device->inode->i_mapping;
 
 	return 0;
-
-err_put_registration:
-	vfio_device_put_registration(device);
-	return ret;
 }
+
+/**
+ * vfio_device_cdev_open_file - Open a new cdev file for a device
+ * @device: The device
+ *
+ * Open a new file for @device that behaves exactly like one opened through
+ * the device's character device (/dev/vfio/devices/vfioX): it starts out
+ * unbound, and userspace must bind it to an iommufd with
+ * VFIO_DEVICE_BIND_IOMMUFD before it can access the device. This lets kernel
+ * code hand userspace a file for a device, e.g. after a Live Update, when
+ * userspace retrieves the file of a device preserved by the previous kernel.
+ *
+ * Like opening the character device, this requires CAP_SYS_RAWIO for no-IOMMU
+ * devices.
+ *
+ * Context: Process context, on behalf of the process the file is opened for.
+ * Return: The new file, or an ERR_PTR() on failure.
+ */
+struct file *vfio_device_cdev_open_file(struct vfio_device *device)
+{
+	struct vfio_device_file *df;
+	struct file *filep;
+
+	df = vfio_device_cdev_alloc_file(device);
+	if (IS_ERR(df))
+		return ERR_CAST(df);
+
+	filep = anon_inode_getfile_fmode("[vfio-device]", &vfio_device_fops,
+					 df, O_RDWR, FMODE_PREAD | FMODE_PWRITE);
+	if (IS_ERR(filep)) {
+		kfree(df);
+		vfio_device_put_registration(device);
+		return filep;
+	}
+
+	/* See vfio_device_fops_cdev_open() */
+	filep->f_mapping = device->inode->i_mapping;
+
+	return filep;
+}
+EXPORT_SYMBOL_GPL(vfio_device_cdev_open_file);
+
+/**
+ * vfio_device_cdev_file_device - Get the device of a VFIO device cdev file
+ * @file: The file
+ *
+ * The caller must hold a reference on @file, which keeps the device
+ * registered.
+ *
+ * Return: The device @file was opened for, if @file is a VFIO device file
+ * opened through the device's character device or with
+ * vfio_device_cdev_open_file(), NULL otherwise (including for device files
+ * opened through a VFIO group).
+ */
+struct vfio_device *vfio_device_cdev_file_device(struct file *file)
+{
+	struct vfio_device_file *df = file->private_data;
+
+	if (file->f_op != &vfio_device_fops || df->group)
+		return NULL;
+
+	return df->device;
+}
+EXPORT_SYMBOL_GPL(vfio_device_cdev_file_device);
+
+/**
+ * vfio_device_cdev_file_is_bound - Check if a VFIO device cdev file is bound
+ * @file: The file
+ *
+ * Return: True if @file is a VFIO device cdev file (see
+ * vfio_device_cdev_file_device()) that userspace bound to an iommufd with
+ * VFIO_DEVICE_BIND_IOMMUFD, i.e. through which userspace can access the
+ * device, false otherwise. Once true, this stays true for the lifetime of
+ * @file.
+ */
+bool vfio_device_cdev_file_is_bound(struct file *file)
+{
+	struct vfio_device_file *df = file->private_data;
+
+	if (!vfio_device_cdev_file_device(file))
+		return false;
+
+	/* Paired with smp_store_release() in vfio_df_ioctl_bind_iommufd() */
+	return smp_load_acquire(&df->access_granted);
+}
+EXPORT_SYMBOL_GPL(vfio_device_cdev_file_is_bound);
 
 static void vfio_df_get_kvm_safe(struct vfio_device_file *df)
 {

@@ -344,6 +344,12 @@ bool vfio_device_try_get_registration(struct vfio_device *device);
 void vfio_device_put_registration(struct vfio_device *device);
 struct vfio_device *vfio_find_device(struct device *dev);
 
+#if IS_ENABLED(CONFIG_VFIO_DEVICE_CDEV)
+struct file *vfio_device_cdev_open_file(struct vfio_device *device);
+struct vfio_device *vfio_device_cdev_file_device(struct file *file);
+bool vfio_device_cdev_file_is_bound(struct file *file);
+#endif
+
 int vfio_assign_device_set(struct vfio_device *device, void *set_id);
 unsigned int vfio_device_set_open_count(struct vfio_device_set *dev_set);
 struct vfio_device *
