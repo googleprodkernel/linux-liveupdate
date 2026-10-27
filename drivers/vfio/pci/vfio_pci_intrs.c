@@ -569,9 +569,12 @@ static void vfio_msi_disable(struct vfio_pci_core_device *vdev, bool msix)
 
 	/*
 	 * Both disable paths above use pci_intx_for_msi() to clear DisINTx
-	 * via their shutdown paths.  Restore for NoINTx devices.
+	 * via their shutdown paths.  Restore for NoINTx devices, and for
+	 * devices preserved across Live Update: userspace disables their
+	 * interrupts before kexec, and nothing would handle INTx from then on
+	 * (see vfio_pci_core_liveupdate_freeze()).
 	 */
-	if (vdev->nointx)
+	if (vdev->nointx || vfio_pci_liveupdate_preserved(vdev))
 		pci_intx(pdev, 0);
 
 	vdev->irq_type = VFIO_PCI_NUM_IRQS;

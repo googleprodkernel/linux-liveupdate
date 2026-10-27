@@ -63,7 +63,10 @@
  * an INTx asserted on a line shared with other devices would get the line
  * disabled for all of them. INTx Disable stays set until userspace sets up
  * interrupts again (in either kernel), which reprograms it. The emulated INTx
- * Disable bit userspace sees is not changed.
+ * Disable bit userspace sees is not changed. For the same reason, disabling
+ * MSI or MSI-X of a preserved device (as userspace must before kexec) sets
+ * INTx Disable right away, so that INTx is not left unmasked and unhandled
+ * between disabling interrupts and freezing.
  *
  * Power Management
  * ================
