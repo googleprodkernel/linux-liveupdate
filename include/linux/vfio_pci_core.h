@@ -129,6 +129,7 @@ struct vfio_pci_core_device {
 	bool			disable_idle_d3:1;
 	bool			nointxmask:1;
 	bool			disable_vga:1;
+	bool			liveupdate:1;
 	/* Flags modified at runtime - dedicated storage unit */
 	bool			needs_reset;
 	bool			pm_intx_masked;
@@ -136,6 +137,8 @@ struct vfio_pci_core_device {
 	bool			sriov_active;
 	/* Preserved across Live Update and about to be handed over */
 	bool			liveupdate_frozen;
+	/* Runtime PM reference held while incoming and not open */
+	bool			liveupdate_pm_held;
 	struct pci_saved_state	*pci_saved_state;
 	struct pci_saved_state	*pm_save;
 	int			ioeventfds_nr;

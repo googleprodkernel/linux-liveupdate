@@ -81,6 +81,15 @@
  * Function Level Resets written to the PCI Express or Advanced Features
  * capability with -EBUSY (the PCI core refuses to reset preserved devices
  * anyway).
+ *
+ * In the next kernel, vfio-pci normally lets an idle device (i.e. one that
+ * userspace has not opened) runtime suspend to D3 right after binding to it.
+ * Instead, vfio-pci keeps an incoming preserved device runtime active (by
+ * holding the runtime PM reference taken for probe) whenever it is not open,
+ * from binding to it until it finishes participating in the Live Update,
+ * which also keeps the bridges above it active. While the device is open, the
+ * reference vfio-pci takes for opening it does the same. After the device
+ * finishes, the usual rules apply.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt

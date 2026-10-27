@@ -142,6 +142,11 @@ static int vfio_pci_init_dev(struct vfio_device *core_vdev)
 #ifdef CONFIG_VFIO_PCI_VGA
 	vdev->disable_vga = disable_vga;
 #endif
+	/*
+	 * Only vfio-pci itself supports Live Update, i.e. preserving devices
+	 * and taking over devices preserved by the previous kernel.
+	 */
+	vdev->liveupdate = IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE);
 
 	return vfio_pci_core_init_dev(core_vdev);
 }

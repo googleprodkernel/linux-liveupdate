@@ -2327,6 +2327,24 @@ void vfio_pci_core_release_dev(struct vfio_device *core_vdev)
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_release_dev);
 
+/* Undo the runtime PM setup of vfio_pci_core_register_device() */
+static void vfio_pci_core_pm_unregister(struct vfio_pci_core_device *vdev)
+{
+	struct device *dev = &vdev->pdev->dev;
+
+	/*
+	 * Nothing else can drop the reference held for an incoming preserved
+	 * device at this point: finishing the device requires a file for it,
+	 * which keeps the device registered.
+	 */
+	if (vdev->liveupdate_pm_held)
+		vdev->liveupdate_pm_held = false;
+	else if (!vdev->disable_idle_d3)
+		pm_runtime_get_noresume(dev);
+
+	pm_runtime_forbid(dev);
+}
+
 int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -2394,6 +2412,16 @@ int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)
 	vfio_pci_probe_power_state(vdev);
 
 	/*
+	 * A device preserved across Live Update by the previous kernel is
+	 * still running and must be left alone until it finishes participating
+	 * in the Live Update. Userspace must retrieve its file from its Live
+	 * Update session to open it. Set before registering the device, so
+	 * that it can't be opened otherwise.
+	 */
+	WRITE_ONCE(vdev->vdev.liveupdate_incoming,
+		   vdev->liveupdate && pci_liveupdate_is_incoming(pdev));
+
+	/*
 	 * pci-core sets the device power state to an unknown value at
 	 * bootup and after being removed from a driver.  The only
 	 * transition it allows from this unknown state is to D0, which
@@ -2406,8 +2434,19 @@ int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)
 
 	dev->driver->pm = &vfio_pci_core_pm_ops;
 	pm_runtime_allow(dev);
-	if (!vdev->disable_idle_d3)
-		pm_runtime_put(dev);
+	if (!vdev->disable_idle_d3) {
+		/*
+		 * Keep the reference taken for probe on incoming preserved
+		 * devices for as long as they are not open, until they finish
+		 * participating in the Live Update, so that they (and the
+		 * bridges above them) don't runtime suspend while idle, which
+		 * would stop them. An open device holds its own reference.
+		 */
+		if (vdev->vdev.liveupdate_incoming)
+			vdev->liveupdate_pm_held = true;
+		else
+			pm_runtime_put(dev);
+	}
 
 	ret = vfio_register_group_dev(&vdev->vdev);
 	if (ret)
@@ -2418,10 +2457,7 @@ int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)
 	return 0;
 
 out_power:
-	if (!vdev->disable_idle_d3)
-		pm_runtime_get_noresume(dev);
-
-	pm_runtime_forbid(dev);
+	vfio_pci_core_pm_unregister(vdev);
 	vfio_pci_vga_uninit(vdev);
 out_vf:
 	vfio_pci_vf_uninit(vdev);
@@ -2438,10 +2474,7 @@ void vfio_pci_core_unregister_device(struct vfio_pci_core_device *vdev)
 	vfio_pci_vf_uninit(vdev);
 	vfio_pci_vga_uninit(vdev);
 
-	if (!vdev->disable_idle_d3)
-		pm_runtime_get_noresume(&vdev->pdev->dev);
-
-	pm_runtime_forbid(&vdev->pdev->dev);
+	vfio_pci_core_pm_unregister(vdev);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_device);
 
