@@ -147,3 +147,26 @@ char *sysfs_driver_get(const char *bdf)
 
 	return out_driver;
 }
+
+/*
+ * Bind @bdf to @driver, unbinding it from its current driver first. Sets
+ * driver_override so that the device stays bound to @driver if it gets probed
+ * again.
+ */
+void sysfs_driver_bind(const char *bdf, const char *driver)
+{
+	char *current = sysfs_driver_get(bdf);
+
+	if (current && !strcmp(current, driver)) {
+		free(current);
+		return;
+	}
+
+	if (current) {
+		sysfs_val_set("drivers", current, "unbind", bdf);
+		free(current);
+	}
+
+	sysfs_device_val_set(bdf, "driver_override", driver);
+	sysfs_val_set("drivers", driver, "bind", bdf);
+}
