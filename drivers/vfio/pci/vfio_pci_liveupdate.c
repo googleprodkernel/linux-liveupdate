@@ -64,6 +64,20 @@
  * disabled for all of them. INTx Disable stays set until userspace sets up
  * interrupts again (in either kernel), which reprograms it. The emulated INTx
  * Disable bit userspace sees is not changed.
+ *
+ * Power Management
+ * ================
+ *
+ * A preserved device must stay in D0 to keep running. While a device is
+ * preserved (from preserving its file until unpreserving it, and in the next
+ * kernel until it finishes participating in the Live Update), vfio-pci refuses
+ * ``VFIO_DEVICE_FEATURE_LOW_POWER_ENTRY`` and
+ * ``VFIO_DEVICE_FEATURE_LOW_POWER_ENTRY_WITH_WAKEUP`` and writes to the PM
+ * Control/Status register that would move the device out of D0 with -EBUSY.
+ * It also refuses ``VFIO_DEVICE_RESET``, ``VFIO_DEVICE_PCI_HOT_RESET``, and
+ * Function Level Resets written to the PCI Express or Advanced Features
+ * capability with -EBUSY (the PCI core refuses to reset preserved devices
+ * anyway).
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt

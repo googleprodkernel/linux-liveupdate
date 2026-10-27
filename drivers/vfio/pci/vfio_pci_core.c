@@ -373,6 +373,14 @@ static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
 				     struct eventfd_ctx *efdctx)
 {
 	/*
+	 * Runtime suspending a device preserved across Live Update would stop
+	 * it. Freezing the device for kexec checks that the device is not in a
+	 * low power state, in case it gets preserved after this check.
+	 */
+	if (vfio_pci_liveupdate_preserved(vdev))
+		return -EBUSY;
+
+	/*
 	 * The vdev power related flags are protected with 'memory_lock'
 	 * semaphore.
 	 */
@@ -1407,6 +1415,13 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 {
 	int ret;
 
+	/*
+	 * The PCI core refuses to reset devices preserved across Live Update,
+	 * but refuse before revoking BAR mappings and dma-bufs.
+	 */
+	if (vfio_pci_liveupdate_preserved(vdev))
+		return -EBUSY;
+
 	if (!vdev->reset_works)
 		return -EINVAL;
 
@@ -1603,6 +1618,13 @@ static int vfio_pci_ioctl_pci_hot_reset(struct vfio_pci_core_device *vdev,
 	/* zero-length array is only for cdev opened devices */
 	if (!!hdr.count == vfio_device_cdev_opened(&vdev->vdev))
 		return -EINVAL;
+
+	/*
+	 * The PCI core refuses to reset devices preserved across Live Update,
+	 * which would fail the probes below with -ENODEV. Be explicit.
+	 */
+	if (vfio_pci_liveupdate_preserved(vdev))
+		return -EBUSY;
 
 	/* Can we do a slot or bus reset or neither? */
 	if (!pci_probe_reset_slot(vdev->pdev->slot))

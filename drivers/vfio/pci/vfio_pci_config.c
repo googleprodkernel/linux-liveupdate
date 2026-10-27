@@ -729,6 +729,12 @@ static int vfio_pm_config_write(struct vfio_pci_core_device *vdev, int pos,
 				int count, struct perm_bits *perm,
 				int offset, __le32 val)
 {
+	/* Devices preserved across Live Update must stay in D0. */
+	if (offset == PCI_PM_CTRL &&
+	    (le32_to_cpu(val) & PCI_PM_CTRL_STATE_MASK) &&
+	    vfio_pci_liveupdate_preserved(vdev))
+		return -EBUSY;
+
 	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
 	if (count < 0)
 		return count;
@@ -879,6 +885,19 @@ static int __init init_pci_cap_pcix_perm(struct perm_bits *perm)
 	return 0;
 }
 
+/*
+ * Return true if a write of @count bytes of @val at @offset in a capability
+ * sets any of the bits in @mask of the byte at @byte in the capability.
+ */
+static bool vfio_config_write_sets(int offset, int count, __le32 val,
+				   int byte, u8 mask)
+{
+	if (byte < offset || byte >= offset + count)
+		return false;
+
+	return (le32_to_cpu(val) >> (8 * (byte - offset))) & mask;
+}
+
 static int vfio_exp_config_write(struct vfio_pci_core_device *vdev, int pos,
 				 int count, struct perm_bits *perm,
 				 int offset, __le32 val)
@@ -886,6 +905,12 @@ static int vfio_exp_config_write(struct vfio_pci_core_device *vdev, int pos,
 	__le16 *ctrl = (__le16 *)(vdev->vconfig + pos -
 				  offset + PCI_EXP_DEVCTL);
 	int readrq = le16_to_cpu(*ctrl) & PCI_EXP_DEVCTL_READRQ;
+
+	/* The PCI core refuses to reset devices preserved across Live Update. */
+	if (vfio_config_write_sets(offset, count, val, PCI_EXP_DEVCTL + 1,
+				   PCI_EXP_DEVCTL_BCR_FLR >> 8) &&
+	    vfio_pci_liveupdate_preserved(vdev))
+		return -EBUSY;
 
 	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
 	if (count < 0)
@@ -971,6 +996,12 @@ static int vfio_af_config_write(struct vfio_pci_core_device *vdev, int pos,
 				int offset, __le32 val)
 {
 	u8 *ctrl = vdev->vconfig + pos - offset + PCI_AF_CTRL;
+
+	/* The PCI core refuses to reset devices preserved across Live Update. */
+	if (vfio_config_write_sets(offset, count, val, PCI_AF_CTRL,
+				   PCI_AF_CTRL_FLR) &&
+	    vfio_pci_liveupdate_preserved(vdev))
+		return -EBUSY;
 
 	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
 	if (count < 0)

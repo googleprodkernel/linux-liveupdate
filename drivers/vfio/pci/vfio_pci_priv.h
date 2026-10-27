@@ -98,6 +98,17 @@ static inline bool vfio_pci_liveupdate_frozen(struct vfio_pci_core_device *vdev)
 	       READ_ONCE(vdev->liveupdate_frozen);
 }
 
+/*
+ * True if the device is preserved across Live Update, i.e. preserved for the
+ * next kernel or preserved by the previous kernel and not finished yet. A
+ * preserved device must stay in D0, so that it keeps running.
+ */
+static inline bool vfio_pci_liveupdate_preserved(struct vfio_pci_core_device *vdev)
+{
+	return IS_ENABLED(CONFIG_VFIO_PCI_LIVEUPDATE) &&
+	       pci_liveupdate_is_preserved(vdev->pdev);
+}
+
 #ifdef CONFIG_VFIO_PCI_LIVEUPDATE
 extern const struct vfio_device_ops vfio_pci_ops;
 
