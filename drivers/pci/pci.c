@@ -1964,20 +1964,6 @@ void pci_restore_state(struct pci_dev *dev)
 EXPORT_SYMBOL(pci_restore_state);
 
 /**
- * struct pci_saved_state - a device's saved configuration space
- * @dword_map: one bit per DWORD of configuration space, set if that DWORD
- *	       was saved
- * @dword_val: saved values, in ascending configuration space offset order
- *
- * Laid out so that the position of every value is described by the device's
- * configuration space rather than by the kernel.
- */
-struct pci_saved_state {
-	unsigned long	dword_map[BITS_TO_LONGS(PCI_CFG_SPACE_EXP_DWORDS)];
-	u32		dword_val[];
-};
-
-/**
  * pci_store_saved_state - Allocate and return an opaque struct containing
  *			   the device saved state.
  * @dev: PCI device that we're dealing with
