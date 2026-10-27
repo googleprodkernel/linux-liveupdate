@@ -5472,8 +5472,11 @@ int pci_try_reset_function(struct pci_dev *dev)
 }
 EXPORT_SYMBOL_GPL(pci_try_reset_function);
 
-/* Do any devices on or below this bus prevent a bus reset? */
-static bool pci_bus_resettable(struct pci_bus *bus)
+/*
+ * Do any devices on or below this bus prevent a bus reset? Devices preserved
+ * across Live Update only do if @liveupdate.
+ */
+static bool __pci_bus_resettable(struct pci_bus *bus, bool liveupdate)
 {
 	struct pci_dev *dev;
 
@@ -5483,12 +5486,18 @@ static bool pci_bus_resettable(struct pci_bus *bus)
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
 		if (dev->dev_flags & PCI_DEV_FLAGS_NO_BUS_RESET ||
-		    pci_liveupdate_reset_refused(dev) ||
-		    (dev->subordinate && !pci_bus_resettable(dev->subordinate)))
+		    (liveupdate && pci_liveupdate_reset_refused(dev)) ||
+		    (dev->subordinate &&
+		     !__pci_bus_resettable(dev->subordinate, liveupdate)))
 			return false;
 	}
 
 	return true;
+}
+
+static bool pci_bus_resettable(struct pci_bus *bus)
+{
+	return __pci_bus_resettable(bus, true);
 }
 
 static void pci_bus_lock(struct pci_bus *bus);
@@ -5583,8 +5592,11 @@ static int pci_bus_trylock(struct pci_bus *bus)
 	return __pci_bus_trylock(bus, NULL);
 }
 
-/* Do any devices on or below this slot prevent a bus reset? */
-static bool pci_slot_resettable(struct pci_slot *slot)
+/*
+ * Do any devices on or below this slot prevent a bus reset? Devices preserved
+ * across Live Update only do if @liveupdate.
+ */
+static bool __pci_slot_resettable(struct pci_slot *slot, bool liveupdate)
 {
 	struct pci_dev *dev, *bridge = slot->bus->self;
 
@@ -5595,12 +5607,18 @@ static bool pci_slot_resettable(struct pci_slot *slot)
 		if (!dev->slot || dev->slot != slot)
 			continue;
 		if (dev->dev_flags & PCI_DEV_FLAGS_NO_BUS_RESET ||
-		    pci_liveupdate_reset_refused(dev) ||
-		    (dev->subordinate && !pci_bus_resettable(dev->subordinate)))
+		    (liveupdate && pci_liveupdate_reset_refused(dev)) ||
+		    (dev->subordinate &&
+		     !__pci_bus_resettable(dev->subordinate, liveupdate)))
 			return false;
 	}
 
 	return true;
+}
+
+static bool pci_slot_resettable(struct pci_slot *slot)
+{
+	return __pci_slot_resettable(slot, true);
 }
 
 /* Lock devices from the top of the tree down */
@@ -5722,6 +5740,27 @@ int pci_probe_reset_slot(struct pci_slot *slot)
 	return pci_slot_reset(slot, PCI_RESET_PROBE);
 }
 EXPORT_SYMBOL_GPL(pci_probe_reset_slot);
+
+/**
+ * pci_slot_reset_supported - check whether a PCI slot supports being reset
+ * @slot: PCI slot to check
+ *
+ * Unlike pci_probe_reset_slot(), which checks whether @slot can be reset now,
+ * this ignores devices preserved across Live Update, which can't be reset
+ * until they finish participating in the Live Update. This lets drivers that
+ * group devices by how they can be reset (e.g. vfio-pci) make the same
+ * decision for a preserved device as they would without Live Update.
+ *
+ * Return: true if @slot supports being reset, false otherwise.
+ */
+bool pci_slot_reset_supported(struct pci_slot *slot)
+{
+	if (!slot || !__pci_slot_resettable(slot, false))
+		return false;
+
+	return !pci_reset_hotplug_slot(slot->hotplug, PCI_RESET_PROBE);
+}
+EXPORT_SYMBOL_GPL(pci_slot_reset_supported);
 
 /* Call @cb on every device a slot or bus reset affects, stopping on error. */
 static int pci_walk_reset_check(struct pci_bus *bus, struct pci_slot *slot,
